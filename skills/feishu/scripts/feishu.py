@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""feishu — 用网页版会话 cookie 接管飞书个人账号（读为主）。
+
+数据走 stdout（markdown/JSON/JSONL），进度走 stderr。
+退出码：0 正常 / 1 失败 / 2 会话失效 / 3 发送被闸门拦下 / 4 接口未适配 / 5 策略拦截。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FEISHU_HOME = os.environ.get("FEISHU_HOME", os.path.expanduser("~/.local/share/feishu"))
+VENV_PY = os.path.join(FEISHU_HOME, "venv", "bin", "python")
+
+# PEP 668: system python can't pip-install; hop into our own venv which has
+# protobuf/httpx/websockets/playwright. Recreate it if the deps are missing.
+def _in_venv() -> bool:
+    # realpath resolves the venv's python symlink to the system interpreter,
+    # so compare the un-resolved argv0 path instead.
+    return os.path.abspath(sys.executable) == os.path.abspath(VENV_PY)
+
+
+def _bootstrap() -> None:
+    import subprocess
+    import venv
+
+    if not os.path.exists(VENV_PY):
+        if os.environ.get("FEISHU_NO_BOOTSTRAP"):
+            return
+        print(f"创建 venv：{os.path.dirname(VENV_PY)}", file=sys.stderr)
+        try:
+            venv.EnvBuilder(with_pip=True).create(os.path.dirname(VENV_PY))
+        except Exception:
+            print("缺 python3-venv，请先执行：\n  sudo apt install python3-venv", file=sys.stderr)
+            raise SystemExit(1)
+        pip = [os.path.join(os.path.dirname(VENV_PY), "pip"), "install", "-q",
+               "playwright==1.62.0", "protobuf", "httpx", "websockets",
+               "keyring>=25,<27", "secretstorage>=3.3", "cryptography>=43,<47"]
+        # 内网机器拉 pypi 常要走代理；浏览器流量绝不走（见 auth.py）
+        env = dict(os.environ)
+        if subprocess.run(pip, env=env).returncode != 0 and os.path.exists("/etc/apt"):
+            env["https_proxy"] = env.get("https_proxy", "http://127.0.0.1:7890")
+            subprocess.run(pip, env=env, check=True)
+    os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+if not _in_venv():
+    if os.path.exists(VENV_PY):
+        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+    else:
+        # --help must never trigger a 500MB download
+        if any(a in ("-h", "--help") for a in sys.argv[1:]):
+            pass  # fall through with system python; deps import lazily
+        else:
+            _bootstrap()
+
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "vendor"))
+
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import json  # noqa: E402
+
+
+def _apply_process_limit(command: str) -> None:
+    """Cap heavy CLI processes so a broken endpoint cannot exhaust the host."""
+    # Playwright starts a Node driver and Chromium children; an inherited
+    # RLIMIT_AS of 1 GiB prevents Node from reserving its normal CodeRange.
+    # Browser providers have their own bounded DOM/request behavior and remain
+    # serialized by query_lock. Pure HTTP-heavy queries get the process cap.
+    if command not in {"history", "mentions", "thread", "doc"}:
+        return
+    try:
+        import resource
+
+        max_bytes = int(os.environ.get("FEISHU_PROCESS_MEMORY_MAX_MB", "1024")) * 1024 * 1024
+        max_bytes = min(max(max_bytes, 256 * 1024 * 1024), 4 * 1024 * 1024 * 1024)
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        target = max_bytes if hard == resource.RLIM_INFINITY else min(max_bytes, hard)
+        if soft == resource.RLIM_INFINITY or soft > target:
+            resource.setrlimit(resource.RLIMIT_AS, (target, target if hard == resource.RLIM_INFINITY else hard))
+    except (ImportError, OSError, ValueError):
+        # systemd still protects the daemon; this is best-effort for a CLI
+        # launched on a platform without RLIMIT_AS.
+        pass
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--format", choices=["markdown", "json", "jsonl"], default="markdown")
+    p.add_argument("--json", action="store_true", help="同 --format json")
+    p.add_argument("--unattended", action="store_true", help="cron 模式：会话过期不等人，notify-send 后退出码 2")
+    p.add_argument("--headed", action="store_true", help="login 时显示浏览器（默认就是 headed，此旗为文档性）")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="feishu.py",
+        description="飞书个人账号接管（cookie 会话，读为主）",
+        epilog="""环境变量：
+  FEISHU_HOME          数据目录（venv/profile/cookie/事件池），默认 ~/.local/share/feishu
+  FEISHU_DOMAIN        租户域名，默认 www.feishu.cn（会话 cookie 是 .feishu.cn 域，一般不用改）
+  FEISHU_CA_BUNDLE     企业 CA 证书路径（默认严格系统 TLS，绝不关校验）
+  FEISHU_ALLOW_SEND=1  发送双重闸门之一（另一道是 send --confirm-send <指纹>）
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common(ap)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("login", help="扫码登录（默认）或 --manual 粘贴 cookie")
+    p.add_argument("--manual", action="store_true", help="从 DevTools 粘贴 cookie（隐藏输入）")
+
+    sub.add_parser("whoami", help="探活并显示当前账号")
+
+    p = sub.add_parser("chats", help="列 Messenger 会话（网页 DOM；--from-events 是事件降级视图）")
+    p.add_argument("--from-events", action="store_true", help="从守护进程见过的事件聚合")
+
+    p = sub.add_parser("history", help="读群聊历史")
+    p.add_argument("chat_id")
+    p.add_argument("--since", default="24h", help="30m/2h/7d、ISO 日期或 epoch")
+    p.add_argument("--until", default="")
+    p.add_argument("--limit", type=int, default=30)
+
+    p = sub.add_parser("mentions", help="谁 @ 了我（历史检索；实时用 daemon+events）")
+    p.add_argument("--since", default="24h")
+    p.add_argument("--until", default="")
+    p.add_argument("--chat-id", action="append", default=[], help="限定群，可多次；不给则查 daemon 见过的群")
+    p.add_argument("--limit", type=int, default=15, help="每群上限")
+
+    p = sub.add_parser("thread", help="还原一条消息的话题串和前后文")
+    p.add_argument("msg_id")
+    p.add_argument("--window", type=int, default=15, help="前后时间窗（分钟）")
+    p.add_argument("--limit", type=int, default=60)
+
+    p = sub.add_parser("doc", help="读/导出文档，或 --list/--walk 云空间")
+    p.add_argument("ref", nargs="?", help="docx/wiki/sheets 链接或裸 token")
+    p.add_argument("--export", dest="fmt", default="markdown",
+                   choices=["markdown", "docx", "pdf", "xlsx"])
+    p.add_argument("--out", default="", help="二进制导出必须写文件；markdown 默认 stdout")
+    p.add_argument("--list", action="store_true", help="列我的空间+共享空间根节点")
+    p.add_argument("--walk", action="store_true", help="遍历全部可见文档建索引（docs-index.jsonl）")
+    p.add_argument("--max-nodes", type=int, default=5000)
+
+    p = sub.add_parser("docs-search", help="搜文档（远程网页搜索；--local 搜本地索引/缓存）")
+    p.add_argument("keyword")
+    p.add_argument("--local", action="store_true")
+    p.add_argument("--limit", type=int, default=30)
+
+    p = sub.add_parser("probe", help="安全抓取 Messenger/搜索接口元数据（不保存正文或凭证）")
+    p.add_argument("--scope", choices=["chats", "docs-search", "all"], default="all")
+    p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
+    p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
+
+    p = sub.add_parser("send", help="默认只产草稿；--confirm-send 或用户明确指定 --direct 才真发")
+    p.add_argument("--chat-id", required=True)
+    p.add_argument("--text", default="", help="正文（慎用，会进 shell history；优先 --text-file）")
+    p.add_argument("--text-file", default="", help="从文件读正文（- 表示 stdin）")
+    p.add_argument("--reply-to", default="", help="被回复消息的 msg_id")
+    p.add_argument("--at-user-id", action="append", default=[])
+    p.add_argument("--confirm-send", default="", metavar="FINGERPRINT")
+    p.add_argument("--direct", action="store_true",
+                   help="用户已明确授权时直接发送一条；仍会探活、单次放行且不自动重试")
+
+    p = sub.add_parser("daemon", help="WebSocket 守护进程：start|stop|status|tail|run")
+    p.add_argument("action", choices=["start", "stop", "status", "tail", "run"])
+    p.add_argument("-n", "--lines", type=int, default=50, help="tail 行数")
+
+    p = sub.add_parser("events", help="查本地事件池（daemon 落盘的消息）")
+    p.add_argument("action", nargs="?", choices=["read", "status", "migrate", "purge"], default="read",
+                   help="read（默认）、status、migrate 或 purge")
+    p.add_argument("--since", default="")
+    p.add_argument("--until", default="")
+    p.add_argument("--chat-id", default="")
+    p.add_argument("--mentions-only", action="store_true")
+    p.add_argument("--include-mine", action="store_true")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--before", default="", help="purge 截止时间（如 30d 或 ISO 日期）")
+    p.add_argument("--confirm-purge", action="store_true", help="确认执行可恢复的本地事件清理")
+    return ap
+
+
+async def _run(args) -> int:
+    from _feishu import auth, chats, context, daemon, docs_search, documents, mentions, messages, probe, send, transport
+    from _feishu.errors import AuthRequired, SendBlocked
+    from _feishu import config, event_store
+    from _feishu.output import emit, emit_json, emit_jsonl, fmt_ts, note, parse_when
+    from _feishu import query_lock
+    fmt = "json" if args.json else args.format
+
+    if args.cmd == "probe":
+        with query_lock.acquire("probe"):
+            result = await asyncio.wait_for(
+                probe.run(args.scope, args.keyword, headed=args.headed),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        if args.out:
+            probe.save(result, args.out)
+            note(f"✓ 已写入脱敏 probe 摘要：{args.out}")
+        emit_json(result) if fmt == "json" else emit(
+            f"probe scope={result['scope']} requests={len(result['requests'])} "
+            f"bodies={result['contains_bodies']} credentials={result['contains_credentials']}"
+        )
+        return 0
+
+    transport.configure()
+    if args.cmd == "login":
+        me = await (auth.login_manual() if args.manual else auth.login_playwright())
+        if fmt == "json":
+            emit_json(me)
+        return 0
+
+    if args.cmd == "daemon":
+        if args.action == "run":
+            # _run itself is already inside asyncio.run() (see main).  Calling
+            # daemon.run() here would nest asyncio.run() and crash under both
+            # systemd and the nohup fallback.
+            await daemon.run_async()  # foreground; called by systemd/nohup
+        elif args.action == "start":
+            daemon.start()
+        elif args.action == "stop":
+            daemon.stop()
+        elif args.action == "status":
+            st = daemon.status()
+            emit_json(st) if fmt == "json" else emit(
+                f"管理器: {st.get('manager')}｜运行中: {st.get('running')}\n"
+                f"账号: {st.get('my_name') or '?'}｜事件数: {st.get('events_written', 0)}"
+                f"｜最近事件: {st.get('last_event_at', '-')}"
+            )
+        elif args.action == "tail":
+            daemon.tail(args.lines)
+        return 0
+
+    if args.cmd == "events":
+        if args.action == "status":
+            status = event_store.storage_status()
+            if fmt == "json":
+                emit_json(status)
+            else:
+                emit(
+                    f"存储模式: {status['mode']}｜加密: {status['encrypted']}｜"
+                    f"文件: {status['active_file']}｜占用: {status['bytes']} / {status['quota_bytes']} 字节"
+                )
+            return 0
+        if args.action == "migrate":
+            with query_lock.acquire("events-migrate"):
+                result = event_store.prepare_storage()
+            emit_json(result) if fmt == "json" else emit(
+                f"存储模式: {result['mode']}｜迁移记录: {result.get('migrated', 0)}｜"
+                f"旧文件归档: {result.get('archive') or '-'}"
+            )
+            return 0
+        if args.action == "purge":
+            if not args.confirm_purge:
+                raise SendBlocked(
+                    "清理事件池需要 --confirm-purge；旧文件只会移动到可恢复归档目录",
+                    hint="例如：events purge --before 30d --confirm-purge",
+                )
+            before = parse_when(args.before)
+            if not before:
+                raise ValueError("events purge 需要 --before")
+            with query_lock.acquire("events-purge"):
+                result = event_store.purge_before(before)
+            emit_json(result) if fmt == "json" else emit(
+                f"保留 {result['kept']} 条，归档 {result['removed']} 条：{result['moved_to']}"
+            )
+            return 0
+        evs = event_store.read_events(
+            since_ms=parse_when(args.since) or 0,
+            until_ms=parse_when(args.until) or 0,
+            chat_id=args.chat_id,
+            mentions_only=args.mentions_only,
+            include_mine=args.include_mine,
+            limit=args.limit,
+        )
+        if fmt == "jsonl":
+            emit_jsonl(evs)
+        elif fmt == "json":
+            emit_json(evs)
+        else:
+            emit(messages.render_markdown(evs, title="事件池") if evs
+                 else "（事件池为空——先 feishu.py daemon start 攒消息）")
+        return 0
+
+    if args.cmd == "docs-search" and args.local:
+        res = await docs_search.search(args.keyword, local=True, limit=args.limit)
+        if fmt == "json":
+            emit_json(res)
+        else:
+            for h in res["hits"]:
+                emit(f"- [{h.get('type','?')}] {h.get('name','?')} {h.get('url') or h.get('path','')}")
+            note(res.get("note", ""))
+        return 0
+
+    if args.cmd == "send":
+        # Draft is a local operation — no session needed. Cookies are only
+        # loaded inside send.send() once the confirmation gates are satisfied.
+        text = args.text
+        if args.text_file:
+            text = (sys.stdin.read() if args.text_file == "-"
+                    else open(args.text_file, encoding="utf-8").read())
+        if not text.strip():
+            note("正文为空，拒绝（空消息没有草稿价值）")
+            return 1
+        result = await send.send(
+            args.chat_id, text, reply_id=args.reply_to,
+            at_user_ids=args.at_user_id, confirm=args.confirm_send, direct=args.direct,
+        )
+        emit_json(result)
+        return 0
+
+    # everything below needs a live session
+    try:
+        me = await auth.prepare()
+    except AuthRequired as e:
+        if args.unattended:
+            import shutil
+            import subprocess
+            if shutil.which("notify-send"):
+                subprocess.run(["notify-send", "飞书 feishu skill", f"会话失效：{e}"], check=False)
+            raise
+        note(f"会话不可用：{e}。{e.hint or '跑 feishu.py login 重新登录'}")
+        raise
+
+    if args.cmd == "whoami":
+        if fmt == "json":
+            emit_json(me)
+        else:
+            emit(f"{me['name']}（user_id: {me['user_id']}）")
+        return 0
+
+    if args.cmd == "chats":
+        with query_lock.acquire("chats"):
+            lst = await asyncio.wait_for(
+                chats.list_chats(from_events=args.from_events),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        if fmt == "json":
+            emit_json(lst)
+        else:
+            lines = []
+            for c in lst:
+                lines.append(
+                    f"- `{c['chat_id']}` {c.get('name') or '（群名未取到）'}"
+                    f" [{c.get('chat_type','?')}] 最近: {fmt_ts(c.get('last_time'))} {c.get('last_text','')}"
+                )
+            emit("\n".join(lines) or "（空）")
+        return 0
+
+    if args.cmd == "history":
+        with query_lock.acquire("history"):
+            res = await asyncio.wait_for(
+                messages.history(
+                    args.chat_id,
+                    parse_when(args.since) // 1000 if parse_when(args.since) else 0,
+                    parse_when(args.until) // 1000 if parse_when(args.until) else 0,
+                    limit=args.limit,
+                ),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        if fmt == "json":
+            emit_json({"messages": messages.render_json(res["messages"]), "has_more": res["has_more"]})
+        else:
+            emit(messages.render_markdown(res["messages"], title=f"群 {args.chat_id} 历史"))
+            if res["has_more"]:
+                note("（还有更多，调大 --limit 或收窄时间窗）")
+        return 0
+
+    if args.cmd == "mentions":
+        chat_ids = args.chat_id or await chats.known_chat_ids()
+        if not chat_ids:
+            note("还没有 daemon 事件可推断群列表；先 daemon start，或用 --chat-id 指定")
+            return 1
+        with query_lock.acquire("mentions"):
+            res = await asyncio.wait_for(
+                mentions.find_mentions(
+                    me["user_id"], chat_ids,
+                    parse_when(args.since) // 1000 if parse_when(args.since) else 0,
+                    parse_when(args.until) // 1000 if parse_when(args.until) else 0,
+                    limit_per_chat=args.limit,
+                ),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        if fmt == "json":
+            emit_json(res)
+        else:
+            emit(messages.render_markdown(res["mentions"], title="@我 的消息"))
+            note(f"检索了 {res['chats_searched']} 个群"
+                 + (f"，{len(res['chats_failed'])} 个失败" if res["chats_failed"] else ""))
+        return 0
+
+    if args.cmd == "thread":
+        with query_lock.acquire("thread"):
+            ctx = await asyncio.wait_for(
+                context.thread_context(args.msg_id, window_min=args.window, limit=args.limit),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        emit_json(ctx) if fmt == "json" else emit(context.render_markdown(ctx))
+        return 0
+
+    if args.cmd == "doc":
+        if args.list:
+            with query_lock.acquire("doc-list"):
+                spaces = await asyncio.wait_for(
+                    documents.list_spaces(), timeout=config.QUERY_TIMEOUT_SECONDS
+                )
+            if fmt == "json":
+                emit_json(spaces)
+            else:
+                for label, key in (("我的空间", "my_space"), ("共享空间", "shared_space")):
+                    emit(f"\n## {label}")
+                    for n in spaces[key]:
+                        emit(f"- [{n['type']}] {n['name']} `{n['token']}` {n.get('url','')}")
+            return 0
+        if args.walk:
+            note("遍历云空间（进度在 stderr）…")
+            with query_lock.acquire("doc-walk"):
+                res = await asyncio.wait_for(
+                    documents.walk(max_nodes=args.max_nodes),
+                    timeout=config.WALK_TIMEOUT_SECONDS,
+                )
+            note(f"节点 {len(res['nodes'])}，失败 {len(res['errors'])}，"
+                 f"{'完整' if res['complete'] else '不完整'}")
+            if fmt == "json":
+                emit_json(res)
+            else:
+                for n in res["nodes"]:
+                    emit(f"- [{n['type']}] {n['path']} `{n['token']}`")
+            return 0 if res["complete"] else 1
+        if not args.ref:
+            note("doc 需要一个文档链接/token，或 --list / --walk")
+            return 2
+        with query_lock.acquire("doc-export"):
+            data = await asyncio.wait_for(
+                documents.export_document(args.ref, args.fmt),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+        if args.fmt == "markdown" and not args.out:
+            emit(data.decode("utf-8", errors="replace"))
+        else:
+            if args.out:
+                out = args.out
+            else:
+                import hashlib
+                safe_ref = hashlib.sha256(args.ref.encode()).hexdigest()[:24]
+                out = f"feishu-{safe_ref}.{args.fmt}"
+            with open(out, "wb") as f:
+                f.write(data)
+            note(f"✓ 已写入 {out}（{len(data)} 字节）")
+        return 0
+
+    if args.cmd == "docs-search":
+        if args.local:
+            res = await docs_search.search(args.keyword, local=True, limit=args.limit)
+        else:
+            with query_lock.acquire("docs-search"):
+                res = await asyncio.wait_for(
+                    docs_search.search(args.keyword, local=False, limit=args.limit),
+                    timeout=60,
+                )
+        if fmt == "json":
+            emit_json(res)
+        else:
+            for h in res["hits"]:
+                emit(f"- [{h.get('type','?')}] {h.get('name','?')} {h.get('url') or h.get('path','')}")
+            note(res.get("note", ""))
+        return 0
+
+    return 1
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    _apply_process_limit(args.cmd)
+    try:
+        return asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        from _feishu.errors import FeishuError, SendBlocked
+        from _feishu.output import scrub, scrubbed_exc
+
+        if isinstance(e, SendBlocked) and e.hint:
+            # draft path: the draft JSON is data → stdout
+            print(e.hint)
+        msg = scrubbed_exc(e) if not isinstance(e, FeishuError) else scrub(str(e))
+        print(f"✗ {msg}", file=sys.stderr)
+        if isinstance(e, FeishuError) and e.hint and not isinstance(e, SendBlocked):
+            print(f"  提示：{scrub(e.hint)}", file=sys.stderr)
+        return e.exit_code if isinstance(e, FeishuError) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

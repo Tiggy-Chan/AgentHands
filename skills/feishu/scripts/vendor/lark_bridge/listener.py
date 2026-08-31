@@ -1,0 +1,211 @@
+"""Feishu WebSocket listener - yields Message dicts."""
+
+import asyncio
+import hashlib
+import logging
+import time
+from collections.abc import AsyncGenerator
+from typing import TypedDict
+from urllib.parse import urlencode
+
+import websockets
+
+from lark_bridge import _http
+from lark_bridge.proto import proto_pb2 as pb
+from lark_bridge.decoder import decode_text
+from lark_bridge._urls import WS_FRONTIER, LOGIN_HOST, USER_AGENT, APP_KEY
+from lark_bridge._proto_utils import proto_to_dict
+
+logger = logging.getLogger(__name__)
+
+
+class Message(TypedDict):
+    msg_id: str
+    chat_id: str
+    from_id: str
+    type: int
+    chat_type: int
+    text: str
+    parent_id: str
+    root_id: str
+    create_time: int
+    # agenthands patch: @me evidence and thread/removal metadata that upstream
+    # parsed into the proto but never surfaced.
+    at_me: bool
+    at_out_chatter_ids: list
+    thread_id: str
+    is_removed: bool
+    is_truncated: bool
+    raw: dict
+
+
+async def listen(
+    cookie: str,
+    cookies: dict[str, str],
+    watch_chats: list[str] | None = None,
+    domain: str = "",
+    app_key: str = "",
+) -> AsyncGenerator[Message, None]:
+    """Connect to Feishu WebSocket and yield Message dicts.
+
+    Reconnects automatically on disconnect.
+    """
+    while True:
+        try:
+            params = await build_ws_params(cookie, cookies, domain, app_key)
+            if not params:
+                logger.error("Failed to build WS params, retrying in 30s")
+                await asyncio.sleep(30)
+                continue
+
+            url = f"{WS_FRONTIER}/ws/v2?{urlencode(params)}"
+            logger.info("Connecting to Feishu WebSocket...")
+
+            async with websockets.connect(url) as ws:
+                logger.info("WebSocket connected")
+                async for data in ws:
+                    try:
+                        sid, msgs = _handle_frame(data, watch_chats)
+                        # agenthands patch: ACK only after the consumer has
+                        # processed every message of the frame, so an event
+                        # is never acked before it is durably stored. The ack
+                        # runs when the consumer requests the next item.
+                        for msg in msgs:
+                            yield msg
+                        if sid:
+                            await ws.send(_build_ack(sid))
+                    except Exception as e:
+                        logger.debug(f"Frame error: {e}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"WebSocket disconnected: {e}, reconnecting in 5s")
+            await asyncio.sleep(5)
+
+
+def _handle_frame(data: bytes, watch_chats: list[str] | None) -> tuple[int, list[Message]]:
+    """Decode a WebSocket frame. Returns (sid, list of Message dicts)."""
+    frame = pb.Frame()
+    frame.ParseFromString(data)
+    frame_dict = proto_to_dict(frame)
+
+    payload = frame_dict.get("payload")
+    if not payload:
+        return 0, []
+
+    packet = pb.Packet()
+    packet.ParseFromString(payload)
+    packet_dict = proto_to_dict(packet)
+    sid = packet_dict.get("sid", 0)
+
+    if packet_dict.get("cmd") != 6:
+        return sid, []
+
+    inner = packet_dict.get("payload")
+    if not inner:
+        return sid, []
+
+    try:
+        push = pb.PushMessagesRequest()
+        push.ParseFromString(inner)
+        push_dict = proto_to_dict(push)
+    except Exception:
+        return sid, []
+
+    # agenthands patch: the server tells us directly which messages @me.
+    at_me_map = push_dict.get("messagesAtMe", {})
+
+    messages: list[Message] = []
+    for msg_id, msg in push_dict.get("messages", {}).items():
+        chat_id = msg.get("chatId", "")
+        if watch_chats and chat_id not in watch_chats:
+            continue
+        messages.append(
+            Message(
+                msg_id=msg_id,
+                chat_id=chat_id,
+                from_id=msg.get("fromId", ""),
+                type=msg.get("type", 0),
+                chat_type=msg.get("chatType", 0),
+                text=decode_text(msg),
+                parent_id=msg.get("parentId", ""),
+                root_id=msg.get("rootId", ""),
+                create_time=msg.get("createTime", 0),
+                at_me=bool(at_me_map.get(msg_id, False)),
+                at_out_chatter_ids=list(msg.get("atOutChatterIds", [])),
+                thread_id=msg.get("threadId", ""),
+                is_removed=bool(msg.get("isRemoved", False)),
+                is_truncated=bool(msg.get("isTruncated", False)),
+                raw=msg,  # proto_to_dict of the message; lets callers do
+                          # structured decode (mentions) without re-parsing
+            )
+        )
+
+    return sid, messages
+
+
+def _build_ack(sid: int) -> bytes:
+    """Build ACK packet for a given sid."""
+    if not sid:
+        return b""
+    packet = pb.Packet()
+    packet.cmd = 1
+    packet.payloadType = 1
+    packet.sid = sid
+
+    frame = pb.Frame()
+    now_ms = int(time.time() * 1000)
+    frame.seqid = now_ms
+    frame.logid = now_ms
+    frame.service = 1
+    frame.method = 1
+    frame.payloadType = "pb"
+    frame.payload = packet.SerializeToString()
+
+    entry = pb.ExtendedEntry()
+    entry.key = "x-request-time"
+    entry.value = f"{now_ms}000"
+    frame.headers.append(entry)
+
+    return frame.SerializeToString()
+
+
+async def build_ws_params(cookie: str, cookies: dict[str, str], domain: str = "", app_key: str = "") -> dict | None:
+    """Build WebSocket connection parameters."""
+    try:
+        device_id = cookies.get("passport_web_did", "")
+        if not device_id:
+            logger.error("No passport_web_did in cookies")
+            return None
+
+        # Use provided app_key, or fall back to constant
+        resolved_key = app_key or APP_KEY
+
+        headers = {
+            "Cookie": cookie,
+            "user-agent": USER_AGENT,
+        }
+
+        access_key = hashlib.md5(f"2{resolved_key}{device_id}f8a69f1719916z".encode()).hexdigest()
+
+        async with _http.make_client(timeout=15, headers=headers) as client:
+            # Get ticket
+            resp = await client.get(
+                f"{LOGIN_HOST}/suite/passport/frontier_ticket/",
+                params={"local_device_id": device_id},
+            )
+            ticket = resp.json().get("ticket", "")
+
+            return {
+                "access_key": access_key,
+                "aid": "1",
+                "ticket": ticket,
+                "device_id": device_id,
+                "fpid": "2",
+                "accept_encoding": "gzip",
+                "request_id": hashlib.md5(str(time.time()).encode()).hexdigest()[:10],
+            }
+    except Exception as e:
+        logger.error(f"Build WS params failed: {e}")
+        return None
