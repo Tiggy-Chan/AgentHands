@@ -1,6 +1,6 @@
 ---
 name: feishu
-description: 用网页版会话 cookie 接管飞书（Feishu/Lark）个人账号——读群聊消息、查「谁@我」、还原话题上下文、读账号可见的文档（docx/wiki 导出 markdown、云空间遍历），以及经用户逐条确认后回复消息。带 WebSocket 守护进程：实时消息落本地事件池，随问随查。触发词：「飞书」「谁@我」「群里有人问我」「@我」「同事问」「飞书文档」「帮我在群里回」。适用场景：公司租户拿不到开放平台 app 权限（没有 app_id/app_secret），官方飞书 skill 用不了。
+description: 用网页版会话 cookie 接管飞书（Feishu/Lark）个人账号——读群聊消息、查「谁@我」、还原话题上下文、读账号可见的文档（docx/wiki 导出 markdown、云空间遍历）、读邮件和日历会议，以及经用户逐条确认后回复消息。带 WebSocket 守护进程：实时消息落本地事件池，随问随查。触发词：「飞书」「谁@我」「群里有人问我」「@我」「同事问」「飞书文档」「飞书邮件」「飞书日历」「会议」「帮我在群里回」。适用场景：公司租户拿不到开放平台 app 权限（没有 app_id/app_secret），官方飞书 skill 用不了。
 ---
 
 # 飞书个人账号接管
@@ -30,7 +30,7 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `login` | Playwright 弹浏览器，**用户自己扫码**，cookie 落盘（0600） |
 | `login --manual` | 兜底：从 DevTools 粘贴 cookie（隐藏输入，不进 shell history） |
 | `whoami` | 探活 + 当前账号 id/名字 |
-| `daemon start/stop/status/tail` | WS 守护进程：systemd --user 优先，nohup+flock 兜底 |
+| `daemon start/stop/restart/status/tail` | WS 守护进程：systemd --user 优先，nohup+flock 兜底 |
 | `events [--mentions-only] [--since 15m] [--chat-id …]` | 查本地事件池（私聊入站和群聊 @消息；长期存储） |
 | `mentions [--since 2h] [--chat-id …]` | 历史 @我 检索（服务端 mention 过滤 + 本地解码交叉验证） |
 | `history <chat_id> [--since 24h] [--limit 30]` | 读群历史 |
@@ -39,11 +39,15 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
-| `probe --scope chats|docs-search|all` | 受控抓包，只输出脱敏请求元数据，不保存正文/凭证 |
+| `probe --scope chats|docs-search|mail|calendar|all` | 受控抓包，只输出脱敏请求元数据，不保存正文/凭证 |
+| `mail list|search|get` | 读邮件，结果来自稳定接口或受控 DOM，并带 source/complete |
+| `mail send|reply` | 默认只产邮件草稿；受控写接口确认后才可能执行 |
+| `calendar list|get` | 读会议和日历事件，默认不缓存正文 |
+| `calendar create|update` | 默认只产日程草稿；未适配写接口时失败关闭 |
 | `events status|migrate|purge` | 查看存储、迁移旧事件、显式可恢复清理 |
 | `send --chat-id … --text-file …` | **默认只产草稿**；常规真发见〈发送是双重闸门〉，用户明确要求免确认测试时可加 `--direct` |
 
-时间参数统一：`30m`/`2h`/`7d`、ISO 日期、epoch 秒/毫秒都行。
+时间参数统一：`30m`/`2h`/`7d` 表示过去，`+7d` 表示未来，另支持 ISO 日期和 epoch 秒/毫秒。
 
 ## 典型场景怎么做
 
@@ -63,7 +67,7 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 
 ### 「找一篇讲 XX 的文档」
 
-远程搜索当前通过短生命周期浏览器读取“云文档”结果卡片；可用的离线路径是：
+远程搜索当前通过受控 Browser Worker 读取“云文档”结果卡片；可用的离线路径是：
 `feishu.py doc --walk` 建本地索引（标题/路径级）→ `feishu.py docs-search XX --local`。
 导出过的文档正文也在缓存里能被搜到。别把消息搜索当文档搜索用。
 
@@ -76,6 +80,8 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
   跑着 daemon 的账号基本不会过期；过期了任何命令都会提示重新 `login`，
   `--unattended` 下退出码 2 + notify-send。
 - 判活不看 HTTP 200（未登录也可能 200），看 `accounts/web/user` 的业务数据。
+- 浏览器登录、会话列表、远程文档搜索、邮件和日历读取都由单任务 Browser Worker 承载，
+  默认使用 systemd cgroup（384M high / 512M max / 128 tasks）；无 cgroup 时失败关闭。
 - 事件和按需导出的 Markdown 正文优先使用 Secret Service/libsecret 中的 AES-256-GCM 密钥；
   keyring 不可用时退回 0600 文件，并由 `events status` 明确报告未加密。
 
@@ -90,6 +96,8 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 
 少任何一条都在网络层之前拦下。cmd=5 **不自动重试**（请求成功但响应丢了会发重）。
 daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）。
+邮件/日历写入另外要求 `FEISHU_ALLOW_WRITE=1` 和 `--confirm-write <指纹>`；本批不自动发送
+邮件或修改日程。
 
 如果用户在当前请求中明确要求「直接发、无需再次同意」来做一次测试，才允许使用
 `send --direct`。它仍然只发送当前这一条，先探活，transport 只放行一次，且不自动重试；
@@ -105,18 +113,18 @@ daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）
   名字是 wire-walk 启发式取的，**可能取到空串或错串**——输出里名字缺失是正常的，
   别编一个。
 - `chats` 当前通过短生命周期 Messenger 浏览器读取会话卡片；结果会标记
-  `source=browser_dom`、`completeness=ui_snapshot`。`complete` 只表示本次页面滚动未发现
-  更多卡片，不要把网页快照误称为永久全量。
+  `source=browser_dom`、`completeness=ui_snapshot` 且 `complete=false`。不要把网页快照
+  误称为永久全量。邮件/日历/远程文档搜索也遵循同样规则。
 - `probe` 只记录请求元数据；它可以发现新的 command，但不能把响应正文、Cookie、ticket
-  或 access key 写进 fixture。
+  或 access key 写进 fixture。不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
 - WS 重连可能重发消息：写入端按 msg_id 去重，读取端 `events` 再去一次。
   事件池只保存私聊入站和群聊 @消息，敏感，优先加密，权限降级时为 0600；轮转不覆盖旧代。
 - 事件池里 `at_me=null` 表示「这条消息编码没解开，判不出来」，不是「没@我」。
 - **查询有资源上限。** protobuf/JSON 控制响应默认最多 8 MiB，文件/文档下载最多 256 MiB；
   history 总超时、分页页数和 limit 都有限制。遇到「响应过大/超过页数」要报告并收窄查询，
   不能并行重试。
-- **不要并行启动同一条 history 查询。** 旧版联调曾因两个未结束的查询耗尽主机内存；
-  当前代码已有硬上限，但仍应让一个查询结束后再发下一条。
+- **不要并行启动同一条查询。** 旧版联调曾因多个未结束的查询耗尽主机内存；当前代码
+  用 query.lock 串行，浏览器还受 Browser Worker cgroup 保护。被拒绝后等待，不要绕过 CLI。
 - protobuf ≥5 运行时没有 `field.label`；vendor 的 `_proto_utils.py` 用的是
   `is_repeated`，升级 protobuf 前先跑 `./test.sh`。
 - 企业内网 CA：`FEISHU_CA_BUNDLE=/path/to/ca.pem`。**别设 verify=False**，

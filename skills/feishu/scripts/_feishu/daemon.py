@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from . import auth, config, event_store, transport
-from .errors import AuthRequired, FeishuError
+from .errors import AuthRequired, FeishuError, QueryBusy
 from .message_decode import decode_message
 from .output import note, register_secret, scrubbed_exc
 
@@ -118,14 +118,7 @@ async def _context_worker(queue: asyncio.Queue, stop: asyncio.Event, my_id: str)
         except asyncio.TimeoutError:
             continue
         try:
-            ctx = await asyncio.wait_for(
-                context.thread_context(
-                    trigger["msg_id"],
-                    window_min=min(15, config.MAX_THREAD_WINDOW_MINUTES),
-                    limit=config.CONTEXT_MAX_MESSAGES,
-                ),
-                timeout=config.CONTEXT_TIMEOUT_SECONDS,
-            )
+            ctx = await _context_with_query_lock(context, trigger)
             bundle = context.compact_context(ctx)
             event_store.append_event({
                 "schema": 1,
@@ -159,7 +152,35 @@ async def _context_worker(queue: asyncio.Queue, stop: asyncio.Event, my_id: str)
             queue.task_done()
 
 
-async def _keepalive(cookies: dict, stop: asyncio.Event) -> None:
+async def _context_with_query_lock(context, trigger: dict) -> dict:
+    """Run one context query without competing with a CLI query.
+
+    The listener remains independent of this worker, so waiting for the lock
+    cannot delay WebSocket ACKs.  A busy lock is retried only within the same
+    bounded context deadline; it is never allowed to queue unbounded work.
+    """
+    from . import query_lock
+
+    deadline = asyncio.get_running_loop().time() + config.CONTEXT_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("context query deadline exceeded while waiting for query lock")
+        try:
+            with query_lock.acquire("context"):
+                return await asyncio.wait_for(
+                    context.thread_context(
+                        trigger["msg_id"],
+                        window_min=min(15, config.MAX_THREAD_WINDOW_MINUTES),
+                        limit=config.CONTEXT_MAX_MESSAGES,
+                    ),
+                    timeout=remaining,
+                )
+        except QueryBusy:
+            await asyncio.sleep(min(0.5, remaining))
+
+
+async def _keepalive(cookies: dict, domain: str, stop: asyncio.Event) -> None:
     """Touch the account endpoint so the web session never idles out."""
     while not stop.is_set():
         try:
@@ -169,7 +190,7 @@ async def _keepalive(cookies: dict, stop: asyncio.Event) -> None:
         if stop.is_set():
             return
         try:
-            await auth.touch(cookies)
+            await auth.touch(cookies, domain)
             _write_state(keepalive_ok=True)
         except AuthRequired:
             raise
@@ -198,7 +219,10 @@ async def run_async() -> None:
     my_id = me["user_id"]
     storage = event_store.prepare_storage()
     if not storage.get("encrypted"):
-        note("  ! 事件池未启用密钥环加密，当前使用 0600 权限保护（可运行 events status 查看）")
+        if storage.get("encrypted_store_locked"):
+            note("  ! 加密事件池密钥不可用，daemon 将暂停事件写入（可运行 events status 查看）")
+        else:
+            note("  ! 事件池未启用密钥环加密，当前使用 0600 权限保护（可运行 events status 查看）")
     _write_state(pid=os.getpid(), my_user_id=my_id, my_name=me["name"], events_written=0)
 
     transport.configure()
@@ -212,7 +236,7 @@ async def run_async() -> None:
     stop = asyncio.Event()
     context_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
 
-    ka = asyncio.create_task(_keepalive(cookies, stop))
+    ka = asyncio.create_task(_keepalive(cookies, data.get("domain") or config.DOMAIN, stop))
     context_task = asyncio.create_task(_context_worker(context_queue, stop, my_id))
     try:
         async for m in listener.listen(
@@ -230,8 +254,15 @@ async def run_async() -> None:
                 continue
             ev = _build_event(m, my_id)
             if event_store.append_event(ev) is False:
-                _write_state(ws_connected=False, last_error="event storage quota reached")
-                _notify("飞书事件池已达到磁盘配额，daemon 暂停写入")
+                storage_state = event_store.storage_status()
+                if storage_state.get("encrypted_store_locked"):
+                    reason = "event encryption key unavailable"
+                    message = "飞书事件池密钥不可用，daemon 暂停写入"
+                else:
+                    reason = "event storage quota reached"
+                    message = "飞书事件池已达到磁盘配额，daemon 暂停写入"
+                _write_state(ws_connected=False, last_error=reason)
+                _notify(message)
                 raise SystemExit(3)
             written += 1
             _write_state(
@@ -309,6 +340,8 @@ RestartPreventExitStatus=2 3
 MemoryHigh=384M
 MemoryMax=512M
 TasksMax=128
+KillMode=control-group
+OOMPolicy=kill
 Environment=FEISHU_HOME={config.HOME}
 
 [Install]

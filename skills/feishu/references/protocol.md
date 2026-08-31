@@ -60,6 +60,31 @@ body 是 `Packet{cmd, payload, cid}` 序列化。
   `.search-doc-card-box` 卡片渲染。当前远程 `docs-search` 读取卡片标题、摘要、类型和
   修改信息；不保存正文或原始 URL，结果可能没有可复用 token。
 
+## 邮件 / 日历网页观察（2026-08-31）
+
+- 邮箱入口：`GET https://<tenant>.feishu.cn/mail`，页面标题为“飞书邮箱”；当前可见
+  邮件列表使用 `FeedItem-module__mailFeedItem` 等普通 DOM class，但没有稳定的
+  `message_id` data 属性。provider 因此返回 `id_kind=ui_fingerprint`，只能在相同可见
+  列表中定位详情，不把指纹冒充服务端邮件 id。
+- 邮箱页面加载后会产生 `cmd=3700/3601/3730/3791/3833` 等 protobuf 请求；字段语义和
+  写入 payload 尚未确认，transport 不登记这些 command 的读写含义。
+- 日历入口：`GET https://<tenant>.feishu.cn/calendar/`，最终页面为 `/calendar/week`；
+  会议项使用 `.event-instance` 和 `data-key`、`data-start-time` 等属性，当前 provider
+  可读取标题、时间、地点等可见字段，结果固定标记 `source=browser_dom`、`complete=false`。
+- 日历页面观察到的 gateway command 不能凭编号推断为读接口；创建/修改接口仍未登记。
+- mail/calendar provider 只读取有界 DOM 文本；邮件和日历正文不写入事件池或长期缓存。
+
+## 受控 Browser Worker
+
+- `chats`、远程 `docs-search`、`probe`、mail/calendar DOM 读取和扫码登录都通过一次性
+  `systemd-run --user` worker 执行，Python、Node 和 Chromium 子进程共用同一 cgroup。
+- 默认属性：`MemoryHigh=384M`、`MemoryMax=512M`、`TasksMax=128`、有限 RuntimeMax。
+  Chromium 使用禁 GPU、禁扩展、单 renderer/低 raster 线程参数，避免在 128 tasks 上限下
+  触发 fork 拒绝。worker 超时或父进程取消时会先 stop transient unit，再回收子进程。
+- probe 只保存 method/host/path/command/status、query key、响应长度和 DOM 结构摘要；不
+  读取或保存 Cookie、ticket、Authorization、正文、附件和 HAR。没有 systemd user/cgroup
+  时浏览器能力失败关闭，不退回无上限启动。
+
 ## 文档 / 云盘（REST，走 `{FEISHU_DOMAIN}`，默认 www.feishu.cn）
 
 | 用途 | 请求 |
@@ -79,14 +104,17 @@ REST 大多要带 `x-csrftoken: <_csrf_token cookie 值>`（注意：不是 swp_
 1. 完整会话列表的稳定 RPC schema（当前 DOM provider 可用，但不保证虚拟列表全量）。
 2. 文档搜索结果对应的稳定 token/URL 字段（当前网页 provider 能返回结果文本）。
 3. cmd=64/5023 的 UserInfo 字段语义；当前仍是 wire-walk 启发式。
-4. WS ticket/app_key 轮换和长时间断线恢复的更多样本。
+4. 邮件列表/详情的稳定 message id 和读 command 字段语义。
+5. 日历事件详情字段、分页语义和读 command 字段语义。
+6. 邮件发送/回复、日历创建/修改的精确写 endpoint 和 payload。
+7. WS ticket/app_key 轮换和长时间断线恢复的更多样本。
 
 抓包方法（别把凭证落盘）：
 
 ```
 1. feishu.py login 之后，FEISHU 浏览器 profile 已登录
-2. 用 playwright 开 https://www.feishu.cn/messenger/，挂 page.on("request")
-3. 只记录 method/host/path/x-command 头 —— 不记 Cookie、不存 HAR、
+2. 用 `feishu.py probe --scope chats|docs-search|mail|calendar`，不要直接启动 Playwright
+3. 只记录 method/host/path/x-command 头和结构摘要 —— 不记 Cookie、不存 HAR、
    WS URL 里的 ticket/access_key 不落盘
 4. 确认的端点写回本文件，实现进 _feishu/chats.py 或 docs_search.py
 ```

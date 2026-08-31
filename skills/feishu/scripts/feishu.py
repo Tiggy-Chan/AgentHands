@@ -66,11 +66,10 @@ import json  # noqa: E402
 
 def _apply_process_limit(command: str) -> None:
     """Cap heavy CLI processes so a broken endpoint cannot exhaust the host."""
-    # Playwright starts a Node driver and Chromium children; an inherited
-    # RLIMIT_AS of 1 GiB prevents Node from reserving its normal CodeRange.
-    # Browser providers have their own bounded DOM/request behavior and remain
-    # serialized by query_lock. Pure HTTP-heavy queries get the process cap.
-    if command not in {"history", "mentions", "thread", "doc"}:
+    # Playwright starts a Node driver and Chromium children.  Those commands
+    # are launched by browser_worker.py under a systemd cgroup instead of an
+    # inherited RLIMIT_AS (Node reserves a normal CodeRange at startup).
+    if command not in {"history", "mentions", "thread", "doc", "mail", "calendar"}:
         return
     try:
         import resource
@@ -102,7 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
   FEISHU_HOME          数据目录（venv/profile/cookie/事件池），默认 ~/.local/share/feishu
   FEISHU_DOMAIN        租户域名，默认 www.feishu.cn（会话 cookie 是 .feishu.cn 域，一般不用改）
   FEISHU_CA_BUNDLE     企业 CA 证书路径（默认严格系统 TLS，绝不关校验）
-  FEISHU_ALLOW_SEND=1  发送双重闸门之一（另一道是 send --confirm-send <指纹>）
+  FEISHU_ALLOW_SEND=1   聊天发送双重闸门之一
+  FEISHU_ALLOW_WRITE=1  邮件/日历写入双重闸门之一
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -148,8 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local", action="store_true")
     p.add_argument("--limit", type=int, default=30)
 
-    p = sub.add_parser("probe", help="安全抓取 Messenger/搜索接口元数据（不保存正文或凭证）")
-    p.add_argument("--scope", choices=["chats", "docs-search", "all"], default="all")
+    p = sub.add_parser("probe", help="安全抓取网页接口元数据（不保存正文或凭证）")
+    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "all"], default="all")
     p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
 
@@ -163,8 +163,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--direct", action="store_true",
                    help="用户已明确授权时直接发送一条；仍会探活、单次放行且不自动重试")
 
-    p = sub.add_parser("daemon", help="WebSocket 守护进程：start|stop|status|tail|run")
-    p.add_argument("action", choices=["start", "stop", "status", "tail", "run"])
+    p = sub.add_parser("daemon", help="WebSocket 守护进程：start|stop|restart|status|tail|run")
+    p.add_argument("action", choices=["start", "stop", "restart", "status", "tail", "run"])
     p.add_argument("-n", "--lines", type=int, default=50, help="tail 行数")
 
     p = sub.add_parser("events", help="查本地事件池（daemon 落盘的消息）")
@@ -178,11 +178,53 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--before", default="", help="purge 截止时间（如 30d 或 ISO 日期）")
     p.add_argument("--confirm-purge", action="store_true", help="确认执行可恢复的本地事件清理")
+
+    p = sub.add_parser("mail", help="读取邮件；写操作默认只产草稿")
+    mail_sub = p.add_subparsers(dest="mail_action", required=True)
+    q = mail_sub.add_parser("list", help="列邮件")
+    q.add_argument("--folder", default="inbox")
+    q.add_argument("--since", default="24h")
+    q.add_argument("--until", default="")
+    q.add_argument("--limit", type=int, default=30)
+    q = mail_sub.add_parser("search", help="搜索邮件")
+    q.add_argument("keyword")
+    q.add_argument("--limit", type=int, default=30)
+    q = mail_sub.add_parser("get", help="读取一封邮件")
+    q.add_argument("message_id")
+    q = mail_sub.add_parser("send", help="发邮件；默认只产草稿")
+    q.add_argument("--to", action="append", required=True)
+    q.add_argument("--subject", required=True)
+    q.add_argument("--text-file", required=True)
+    q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
+    q = mail_sub.add_parser("reply", help="回复邮件；默认只产草稿")
+    q.add_argument("--message-id", required=True)
+    q.add_argument("--text-file", required=True)
+    q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
+
+    p = sub.add_parser("calendar", help="读取日历；写操作默认只产草稿")
+    cal_sub = p.add_subparsers(dest="calendar_action", required=True)
+    q = cal_sub.add_parser("list", help="列会议")
+    q.add_argument("--since", default="24h")
+    q.add_argument("--until", default="+7d", help="截止时间；+7d 表示未来 7 天")
+    q.add_argument("--limit", type=int, default=50)
+    q = cal_sub.add_parser("get", help="读取会议详情")
+    q.add_argument("event_id")
+    q = cal_sub.add_parser("create", help="创建会议；默认只产草稿")
+    q.add_argument("--title", required=True)
+    q.add_argument("--start", required=True)
+    q.add_argument("--end", required=True)
+    q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
+    q = cal_sub.add_parser("update", help="修改会议；默认只产草稿")
+    q.add_argument("event_id")
+    q.add_argument("--title", default="")
+    q.add_argument("--start", default="")
+    q.add_argument("--end", default="")
+    q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
     return ap
 
 
 async def _run(args) -> int:
-    from _feishu import auth, chats, context, daemon, docs_search, documents, mentions, messages, probe, send, transport
+    from _feishu import auth, calendar_ops as calendar, chats, context, daemon, docs_search, documents, mail, mentions, messages, probe, send, transport
     from _feishu.errors import AuthRequired, SendBlocked
     from _feishu import config, event_store
     from _feishu.output import emit, emit_json, emit_jsonl, fmt_ts, note, parse_when
@@ -193,7 +235,7 @@ async def _run(args) -> int:
         with query_lock.acquire("probe"):
             result = await asyncio.wait_for(
                 probe.run(args.scope, args.keyword, headed=args.headed),
-                timeout=config.QUERY_TIMEOUT_SECONDS,
+                timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
             )
         if args.out:
             probe.save(result, args.out)
@@ -206,7 +248,8 @@ async def _run(args) -> int:
 
     transport.configure()
     if args.cmd == "login":
-        me = await (auth.login_manual() if args.manual else auth.login_playwright())
+        with query_lock.acquire("login"):
+            me = await (auth.login_manual() if args.manual else auth.login_playwright())
         if fmt == "json":
             emit_json(me)
         return 0
@@ -221,6 +264,9 @@ async def _run(args) -> int:
             daemon.start()
         elif args.action == "stop":
             daemon.stop()
+        elif args.action == "restart":
+            daemon.stop()
+            daemon.start()
         elif args.action == "status":
             st = daemon.status()
             emit_json(st) if fmt == "json" else emit(
@@ -250,7 +296,7 @@ async def _run(args) -> int:
                 f"存储模式: {result['mode']}｜迁移记录: {result.get('migrated', 0)}｜"
                 f"旧文件归档: {result.get('archive') or '-'}"
             )
-            return 0
+            return 0 if spaces.get("complete", False) else 1
         if args.action == "purge":
             if not args.confirm_purge:
                 raise SendBlocked(
@@ -266,6 +312,8 @@ async def _run(args) -> int:
                 f"保留 {result['kept']} 条，归档 {result['removed']} 条：{result['moved_to']}"
             )
             return 0
+        if not 1 <= args.limit <= config.MAX_EVENT_READ_LIMIT:
+            raise ValueError(f"events limit 必须在 1..{config.MAX_EVENT_READ_LIMIT} 之间")
         evs = event_store.read_events(
             since_ms=parse_when(args.since) or 0,
             until_ms=parse_when(args.until) or 0,
@@ -310,6 +358,32 @@ async def _run(args) -> int:
         emit_json(result)
         return 0
 
+    if args.cmd == "mail" and args.mail_action in {"send", "reply"}:
+        body = open(args.text_file, encoding="utf-8").read()
+        if args.mail_action == "send":
+            result = await mail.send_message(
+                args.to, args.subject, body, confirm_write=args.confirm_write
+            )
+        else:
+            result = await mail.reply_message(
+                args.message_id, body, confirm_write=args.confirm_write
+            )
+        emit_json(result)
+        return 0
+
+    if args.cmd == "calendar" and args.calendar_action in {"create", "update"}:
+        if args.calendar_action == "create":
+            result = await calendar.create_event(
+                args.title, args.start, args.end, confirm_write=args.confirm_write
+            )
+        else:
+            result = await calendar.update_event(
+                args.event_id, args.title, args.start, args.end,
+                confirm_write=args.confirm_write,
+            )
+        emit_json(result)
+        return 0
+
     # everything below needs a live session
     try:
         me = await auth.prepare()
@@ -330,14 +404,70 @@ async def _run(args) -> int:
             emit(f"{me['name']}（user_id: {me['user_id']}）")
         return 0
 
+    if args.cmd == "mail":
+        with query_lock.acquire(f"mail-{args.mail_action}"):
+            if args.mail_action == "list":
+                result = await asyncio.wait_for(
+                    mail.list_messages(
+                        folder=args.folder,
+                        start_time=parse_when(args.since) // 1000 if parse_when(args.since) else 0,
+                        end_time=parse_when(args.until) // 1000 if parse_when(args.until) else 0,
+                        limit=args.limit,
+                    ),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+            elif args.mail_action == "search":
+                result = await asyncio.wait_for(
+                    mail.search_messages(args.keyword, limit=args.limit),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    mail.get_message(args.message_id),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+        if fmt == "json":
+            emit_json(result)
+        elif fmt == "jsonl":
+            emit_jsonl(result.get("items", [result]))
+        else:
+            emit(mail.render_markdown(result))
+        return 0
+
+    if args.cmd == "calendar":
+        with query_lock.acquire(f"calendar-{args.calendar_action}"):
+            if args.calendar_action == "list":
+                result = await asyncio.wait_for(
+                    calendar.list_events(
+                        start_time=parse_when(args.since) // 1000 if parse_when(args.since) else 0,
+                        end_time=parse_when(args.until) // 1000 if parse_when(args.until) else 0,
+                        limit=args.limit,
+                    ),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    calendar.get_event(args.event_id),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+        if fmt == "json":
+            emit_json(result)
+        elif fmt == "jsonl":
+            emit_jsonl(result.get("items", [result]))
+        else:
+            emit(calendar.render_markdown(result))
+        return 0
+
     if args.cmd == "chats":
         with query_lock.acquire("chats"):
             lst = await asyncio.wait_for(
                 chats.list_chats(from_events=args.from_events),
-                timeout=config.QUERY_TIMEOUT_SECONDS,
+                timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
             )
         if fmt == "json":
             emit_json(lst)
+        elif fmt == "jsonl":
+            emit_jsonl(lst)
         else:
             lines = []
             for c in lst:
@@ -387,7 +517,8 @@ async def _run(args) -> int:
         else:
             emit(messages.render_markdown(res["mentions"], title="@我 的消息"))
             note(f"检索了 {res['chats_searched']} 个群"
-                 + (f"，{len(res['chats_failed'])} 个失败" if res["chats_failed"] else ""))
+                 + (f"，{len(res['chats_failed'])} 个失败" if res["chats_failed"] else "")
+                 + ("，群列表已截断" if res.get("chats_truncated") else ""))
         return 0
 
     if args.cmd == "thread":
@@ -412,7 +543,9 @@ async def _run(args) -> int:
                     emit(f"\n## {label}")
                     for n in spaces[key]:
                         emit(f"- [{n['type']}] {n['name']} `{n['token']}` {n.get('url','')}")
-            return 0
+                for error in spaces.get("errors", []):
+                    emit(f"- ⚠️ {error.get('space', '?')}：{error.get('error', 'unknown')}")
+            return 0 if spaces.get("complete", False) else 1
         if args.walk:
             note("遍历云空间（进度在 stderr）…")
             with query_lock.acquire("doc-walk"):
@@ -457,7 +590,7 @@ async def _run(args) -> int:
             with query_lock.acquire("docs-search"):
                 res = await asyncio.wait_for(
                     docs_search.search(args.keyword, local=False, limit=args.limit),
-                    timeout=60,
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
                 )
         if fmt == "json":
             emit_json(res)

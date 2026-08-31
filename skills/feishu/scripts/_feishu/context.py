@@ -17,6 +17,13 @@ from .output import fmt_ts
 _MAX_PARENT_CHAIN = 20
 
 
+def _encoded_size(message: dict) -> int:
+    try:
+        return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        return 0
+
+
 async def thread_context(msg_id: str, window_min: int = 15, limit: int = 60) -> dict:
     if not 0 <= window_min <= config.MAX_THREAD_WINDOW_MINUTES:
         raise ValueError(f"thread window 必须在 0..{config.MAX_THREAD_WINDOW_MINUTES} 分钟之间")
@@ -61,6 +68,10 @@ async def _thread_context(msg_id: str, window_min: int, limit: int) -> dict:
         chat_id, max(0, create_s - half), create_s + half, limit=limit
     )
     window_msgs = await gateway.fetch_messages(res["msg_ids"])
+    window_msgs = [
+        m for m in window_msgs
+        if messages.in_time_window(m, max(0, create_s - half), create_s + half)
+    ]
     window_msgs.sort(key=lambda m: (m.get("create_time") or 0, m["msg_id"]))
 
     chain_ids = {m["msg_id"] for m in chain} | {msg_id}
@@ -70,22 +81,102 @@ async def _thread_context(msg_id: str, window_min: int, limit: int) -> dict:
     ]
     context = [m for m in window_msgs if m["msg_id"] not in chain_ids and m not in replies]
 
+    # A reply can be posted long after the target.  The normal time window is
+    # intentionally narrow for surrounding chatter, so do one bounded root
+    # scan when it found no replies.  The gateway has no root-id search filter;
+    # 200 ids is the hard ceiling and an incomplete scan stays visible.
+    reply_scan_has_more = False
+    if root_id and not replies:
+        broad = await gateway.search_msg_ids(
+            chat_id, 0, 0, limit=config.MAX_HISTORY_LIMIT
+        )
+        reply_scan_has_more = bool(broad.get("has_more"))
+        broad_msgs = await gateway.fetch_messages(broad["msg_ids"])
+        known_ids = chain_ids | {m["msg_id"] for m in context}
+        replies.extend(
+            m for m in broad_msgs
+            if m.get("root_id") == root_id and m["msg_id"] not in known_ids
+        )
+
     all_msgs = chain + [target] + replies + context
     await messages.resolve_names(all_msgs)
 
-    return {
+    result = {
         "target": target,
         "root": root,
         "chain": chain,
         "replies": replies,
         "window": context,
-        "complete": not missing and not res["has_more"],
+        "complete": not missing and not res["has_more"] and not reply_scan_has_more,
         "missing_parent_ids": missing,
-        "truncated": bool(res["has_more"]),
+        "truncated": bool(res["has_more"]) or reply_scan_has_more,
+        "reply_scan_has_more": reply_scan_has_more,
         "search_window": {
             "start": fmt_ts(create_s - half),
             "end": fmt_ts(create_s + half),
         },
+    }
+    return bound_context(result)
+
+
+def bound_context(ctx: dict, *, max_messages: int | None = None, max_bytes: int | None = None) -> dict:
+    """Bound a live context before it reaches stdout or a durable event.
+
+    Keep the grouping shape used by the Markdown renderer, but strip transport
+    fields and clip text so a single unusually large message cannot turn a
+    bounded search into an unbounded output.
+    """
+    max_messages = max_messages or config.CONTEXT_MAX_MESSAGES
+    max_bytes = max_bytes or config.CONTEXT_MAX_BYTES
+    used = 0
+    count = 0
+    clipped = False
+
+    def clean_group(group: list[dict]) -> list[dict]:
+        nonlocal used, count, clipped
+        out: list[dict] = []
+        for message in group:
+            if count >= max_messages:
+                clipped = True
+                break
+            clean = {
+                key: message.get(key)
+                for key in (
+                    "msg_id", "chat_id", "chat_type", "from_id", "from_name", "type",
+                    "type_name", "create_time", "parent_id", "root_id", "thread_id",
+                    "text", "mention_user_ids", "at_me_server", "decode_status",
+                    "is_removed", "is_truncated",
+                )
+                if key in message
+            }
+            encoded = _encoded_size(clean)
+            if encoded > max_bytes - used:
+                # Preserve the message identity and metadata even when its
+                # body is too large.  The body itself is explicitly marked.
+                clean["text"] = "[正文超出上下文大小限制，已截断]"
+                encoded = _encoded_size(clean)
+                if encoded > max_bytes - used:
+                    clipped = True
+                    break
+                clipped = True
+            out.append(clean)
+            used += encoded
+            count += 1
+        return out
+
+    chain = clean_group(ctx.get("chain", []))
+    target_group = clean_group([ctx.get("target", {})])
+    replies = clean_group(ctx.get("replies", []))
+    window = clean_group(ctx.get("window", []))
+    return {
+        **ctx,
+        "target": target_group[0] if target_group else ctx.get("target", {}),
+        "root": chain[0] if chain else ctx.get("root", {}),
+        "chain": chain,
+        "replies": replies,
+        "window": window,
+        "truncated": bool(ctx.get("truncated")) or clipped,
+        "complete": bool(ctx.get("complete")) and not clipped,
     }
 
 
@@ -154,5 +245,5 @@ def render_markdown(ctx: dict) -> str:
     if ctx["missing_parent_ids"]:
         parts.append(f"\n> ⚠️ 缺父消息：{', '.join(ctx['missing_parent_ids'])}")
     if ctx["truncated"]:
-        parts.append("\n> ⚠️ 时间窗内还有未拉取的消息（has_more），上下文可能不全")
+        parts.append("\n> ⚠️ 消息搜索达到有界上限（has_more），上下文可能不全")
     return "\n".join(parts)

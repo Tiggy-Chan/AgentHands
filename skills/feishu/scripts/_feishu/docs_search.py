@@ -12,8 +12,8 @@ import json
 import os
 from pathlib import Path
 
-from . import auth, config
-from .errors import FeishuError
+from . import auth, browser_guard, config
+from .errors import EndpointNotAdapted, FeishuError, ResourceIsolationUnavailable
 from .secure_store import decrypt_blob
 
 
@@ -28,6 +28,14 @@ async def search(keyword: str, local: bool = False, limit: int = 30) -> dict:
 
 
 async def _browser_search(keyword: str, limit: int) -> dict:
+    from .browser_worker import run
+
+    return await run("docs-search", {"keyword": keyword, "limit": limit})
+
+
+async def _browser_search_impl(keyword: str, limit: int) -> dict:
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("文档网页搜索只能由受限 Browser Worker 执行")
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -44,20 +52,21 @@ async def _browser_search(keyword: str, limit: int) -> dict:
             ignore_https_errors=False,
             env={k: v for k, v in os.environ.items()
                  if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
-            args=["--no-proxy-server"],
+            args=config.BROWSER_ARGS,
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            blocked = await browser_guard.install(page)
             await page.goto(f"https://{domain}/next/messenger/", wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2500)
-            await page.get_by_text("搜索", exact=True).first.click()
+            await _click_visible(page, page.get_by_text("搜索", exact=True).first)
             await page.wait_for_timeout(1200)
             editor = page.locator("[contenteditable=true]").first
             if not await editor.count():
                 # The search panel can render asynchronously after a cached
                 # Messenger load. One bounded retry is enough; never inspect
                 # the page's React object graph.
-                await page.get_by_text("搜索", exact=True).first.click()
+                await _click_visible(page, page.get_by_text("搜索", exact=True).first)
                 await page.wait_for_timeout(1200)
                 editor = page.locator("[contenteditable=true]").first
             if not await editor.count():
@@ -67,11 +76,25 @@ async def _browser_search(keyword: str, limit: int) -> dict:
             await page.wait_for_timeout(1200)
             cloud = page.get_by_text("云文档", exact=True).last
             if await cloud.count():
-                await cloud.click()
+                await _click_visible(page, cloud)
             await page.wait_for_timeout(4500)
 
             result_cards = page.locator(".search-doc-card-box")
-            raw_count = await result_cards.count()
+            raw_count = min(await result_cards.count(), config.MAX_BROWSER_CARDS)
+            if raw_count == 0:
+                empty_marker = False
+                for marker in ("暂无结果", "没有找到", "无结果", "没有相关"):
+                    try:
+                        if await page.get_by_text(marker, exact=False).count():
+                            empty_marker = True
+                            break
+                    except Exception:
+                        pass
+                if not empty_marker:
+                    raise EndpointNotAdapted(
+                        "云文档搜索页未渲染结果卡片",
+                        hint=f"运行 feishu.py probe --scope docs-search 检查网页结构（blocked={len(blocked)}）",
+                    )
             seen = set()
             for i in range(min(raw_count, limit * 3)):
                 card = result_cards.nth(i)
@@ -79,12 +102,12 @@ async def _browser_search(keyword: str, limit: int) -> dict:
                 summary = ""
                 subtitle = card.locator(".doc-info-subtitle").first
                 if await subtitle.count():
-                    summary = (await subtitle.inner_text()).strip()
+                    summary = (await subtitle.inner_text()).strip()[:config.MAX_BROWSER_TEXT_BYTES]
                 tags = [
                     (await card.locator(".search-tag").nth(j).inner_text()).strip()
                     for j in range(min(await card.locator(".search-tag").count(), 4))
                 ]
-                meta = (await card.locator(".doc-extra-info").first.inner_text()).strip()
+                meta = (await card.locator(".doc-extra-info").first.inner_text()).strip()[:config.MAX_BROWSER_TEXT_BYTES]
                 key = (title.strip(), summary.strip(), meta.strip())
                 if key in seen:
                     continue
@@ -121,6 +144,8 @@ def _iter_cached_markdown():
             if not path.is_file():
                 continue
             try:
+                if path.stat().st_size > config.MAX_LOCAL_DOC_BYTES:
+                    continue
                 if path.suffix == ".md":
                     yield path, path.read_bytes()
                 elif path.suffix == ".enc":
@@ -133,14 +158,22 @@ def _local_search(keyword: str, limit: int) -> dict:
     hits = []
     kw = keyword.lower()
     if config.DOCS_INDEX.exists():
-        for line in config.DOCS_INDEX.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                node = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if kw in (node.get("name") or "").lower() or kw in (node.get("path") or "").lower():
-                hits.append({**node, "match": "name"})
+        with config.DOCS_INDEX.open(encoding="utf-8", errors="replace") as index_file:
+            for line in index_file:
+                if len(hits) >= limit * 5:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    node = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if kw in (node.get("name") or "").lower() or kw in (node.get("path") or "").lower():
+                    hits.append({**node, "match": "name"})
     for path, raw in _iter_cached_markdown() or ():
+        if len(hits) >= limit * 5:
+            break
         text = raw.decode("utf-8", errors="replace")
         low = text.lower()
         if kw in low:
@@ -160,3 +193,17 @@ def _local_search(keyword: str, limit: int) -> dict:
         "complete": True,
         "note": "本地缓存搜索（doc --walk 的索引 + 已导出的文档），不是远程全量结果",
     }
+
+
+async def _click_visible(page, locator) -> None:
+    """Click a visible control without waiting on an unrelated UI overlay."""
+    try:
+        await locator.click(timeout=3000)
+        return
+    except Exception:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(250)
+        try:
+            await locator.dispatch_event("click")
+        except Exception:
+            await locator.click(force=True, timeout=3000)

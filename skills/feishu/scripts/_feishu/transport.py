@@ -38,6 +38,7 @@ _ALLOW_SEND_ENV = "FEISHU_ALLOW_SEND"
 # One-shot arming: send.py arms, transport disarms after the first cmd=5.
 _send_armed = False
 _direct_send_armed = False
+_write_armed = False
 
 # Bound session for the current process (set by the CLI after auth load).
 _cookie_header = ""
@@ -49,6 +50,7 @@ def configure() -> None:
     """Install TLS policy and the send gate into the vendor seam."""
     _http.configure(verify=config.CA_BUNDLE or True)
     _http.install_send_gate(_send_gate_check)
+    _http.install_write_gate(_write_gate_check)
     _http.install_request_policy(check_allowed)
 
 
@@ -75,6 +77,24 @@ def arm_direct_send_once() -> None:
     global _send_armed, _direct_send_armed
     _send_armed = True
     _direct_send_armed = True
+
+
+def arm_write_once() -> None:
+    """Arm exactly one explicitly confirmed mail/calendar write."""
+    global _write_armed
+    _write_armed = True
+
+
+def _write_gate_check() -> None:
+    global _write_armed
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+        raise SendBlocked(
+            "写入被拦截：需要环境变量 FEISHU_ALLOW_WRITE=1",
+            hint="邮件/日历写入必须同时匹配 fingerprint 并使用该环境变量",
+        )
+    if not _write_armed:
+        raise SendBlocked("写入被拦截：当前进程没有为本次请求武装一次性闸门")
+    _write_armed = False
 
 
 def _send_gate_check() -> None:
@@ -179,6 +199,10 @@ async def request(
 
     Retries never apply to gateway_cmd==5 (sending must not duplicate).
     """
+    if os.environ.get("FEISHU_NO_NETWORK") == "1":
+        from .errors import FeishuError
+
+        raise FeishuError("网络请求已被 FEISHU_NO_NETWORK=1 禁用")
     check_allowed(method, url, gateway_cmd)
     if gateway_cmd == SEND_CMD:
         retries = 0

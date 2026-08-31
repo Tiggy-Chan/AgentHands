@@ -14,7 +14,7 @@ from datetime import datetime
 
 from . import event_store, gateway
 from . import config
-from .errors import EndpointNotAdapted
+from .errors import EndpointNotAdapted, ResourceIsolationUnavailable
 from .messages import _CHAT_TYPE
 
 
@@ -22,27 +22,25 @@ async def list_chats(from_events: bool = False) -> list[dict]:
     if not from_events:
         return await _list_from_browser()
     seen: dict[str, dict] = {}
-    for ev in event_store.read_events(limit=100000):
-        cid = ev.get("chat_id")
-        if not cid:
-            continue
+    for cid, summary in event_store.chat_summaries().items():
         cur = seen.setdefault(
             cid,
             {
                 "chat_id": cid,
-                "chat_type": _CHAT_TYPE.get(ev.get("chat_type", 0), "?"),
+                "chat_type": _CHAT_TYPE.get(summary.get("chat_type", 0), "?"),
                 "last_text": "",
                 "last_time": 0,
                 "source": "events",
                 "member_count": None,
                 "can_query": True,
                 "status": "seen",
+                "permission_error": None,
+                "complete": False,
+                "completeness": "event_snapshot",
             },
         )
-        event_time = event_store.event_time_ms(ev)
-        if event_time >= cur["last_time"]:
-            cur["last_time"] = event_time
-            cur["last_text"] = (ev.get("text") or "")[:60]
+        cur["last_time"] = summary.get("last_time", 0)
+        cur["last_text"] = summary.get("last_text", "")[:60]
     chats = sorted(seen.values(), key=lambda c: -c["last_time"])
     for c in chats:
         try:
@@ -75,6 +73,13 @@ def _sidebar_time(lines: list[str]) -> int:
 
 
 async def _list_from_browser() -> list[dict]:
+    from .browser_worker import run
+
+    result = await run("chats", {})
+    return result.get("items", [])
+
+
+async def _list_from_browser_impl() -> list[dict]:
     """Read the currently visible Messenger feed cards through a short-lived
     persistent browser context.
 
@@ -84,6 +89,8 @@ async def _list_from_browser() -> list[dict]:
     captures page bodies.  ``source`` and ``complete`` make the limitation
     visible to callers.
     """
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("Messenger 浏览器读取只能由受限 Browser Worker 执行")
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -93,6 +100,7 @@ async def _list_from_browser() -> list[dict]:
         ) from exc
 
     from . import auth
+    from . import browser_guard
 
     data = auth.load_cookies()
     domain = data.get("domain") or config.DOMAIN
@@ -108,15 +116,16 @@ async def _list_from_browser() -> list[dict]:
             ignore_https_errors=False,
             env={k: v for k, v in os.environ.items()
                  if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
-            args=["--no-proxy-server"],
+            args=config.BROWSER_ARGS,
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            blocked = await browser_guard.install(page)
             await page.goto(f"https://{domain}/next/messenger/", wait_until="domcontentloaded", timeout=60000)
             for _ in range(8):
                 await page.wait_for_timeout(700)
                 cards = page.locator("[data-feed-id]")
-                count = min(await cards.count(), 500)
+                count = min(await cards.count(), config.MAX_BROWSER_CARDS)
                 for i in range(count):
                     card = cards.nth(i)
                     item = await card.evaluate(
@@ -129,7 +138,7 @@ async def _list_from_browser() -> list[dict]:
                     cid = item.get("id", "")
                     if not cid:
                         continue
-                    lines = [line.strip() for line in item.get("text", "").splitlines() if line.strip()]
+                    lines = [line.strip() for line in item.get("text", "")[:config.MAX_BROWSER_TEXT_BYTES].splitlines() if line.strip()]
                     name = item.get("name") or (lines[0] if lines else "")
                     rest = [line for line in lines if line != name and line not in {"1", "2", "3"}]
                     preview = rest[1] if len(rest) > 1 else (rest[0] if rest else "")
@@ -144,6 +153,7 @@ async def _list_from_browser() -> list[dict]:
                         "member_count": None,
                         "can_query": True,
                         "status": "visible",
+                        "permission_error": None,
                     }
                     if cid in cached:
                         local = cached[cid]
@@ -163,24 +173,21 @@ async def _list_from_browser() -> list[dict]:
             if not rows:
                 raise EndpointNotAdapted(
                     "Messenger 未渲染出会话卡片",
-                    hint="运行 feishu.py probe --scope chats 检查网页协议是否变化",
+                    hint=f"运行 feishu.py probe --scope chats 检查网页协议是否变化（blocked={len(blocked)}）",
                 )
         finally:
             await ctx.close()
-    complete = stable_rounds >= 2 and not has_more_marker
+    # A DOM snapshot is never evidence of the account's complete conversation
+    # set: Messenger can virtualize or lazily load cards without a marker.
+    complete = False
     for row in rows.values():
         row["complete"] = complete
         row["completeness"] = "ui_snapshot"
+        row["pagination_observed"] = not has_more_marker
+        row["last_message_time"] = row.get("last_time", 0)
     return sorted(rows.values(), key=lambda row: (-row.get("last_time", 0), row.get("name", "")))
 
 
 async def known_chat_ids() -> list[str]:
     """chat_ids we can already query: daemon events (reliable superset over time)."""
-    ids = []
-    seen = set()
-    for ev in event_store.read_events(limit=100000):
-        cid = ev.get("chat_id")
-        if cid and cid not in seen:
-            seen.add(cid)
-            ids.append(cid)
-    return ids
+    return list(event_store.chat_summaries().keys())

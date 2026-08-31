@@ -12,7 +12,7 @@ import os
 import time
 
 from . import config, transport
-from .errors import AuthRequired, FeishuError
+from .errors import AuthRequired, FeishuError, ResourceIsolationUnavailable
 from .output import note, register_secret, scrubbed_exc
 
 from lark_bridge._urls import INTERNAL_API
@@ -110,6 +110,12 @@ async def whoami(cookies: dict) -> dict:
         retries=1,
         timeout=10,
     )
+    # A normal account request may slide the web session cookie.  Keep the
+    # refreshed values in the caller's in-memory cookie set; daemon keepalive
+    # persists them after this function returns.
+    for morsel in resp.cookies.jar:
+        cookies[morsel.name] = morsel.value
+        register_secret(morsel.value)
     try:
         data = resp.json()
     except Exception:
@@ -143,9 +149,10 @@ async def prepare() -> dict:
     return await asyncio.wait_for(run(), timeout=config.AUTH_TIMEOUT_SECONDS)
 
 
-async def touch(cookies: dict) -> dict:
+async def touch(cookies: dict, domain: str = "") -> dict:
     """Keep-alive: hit the account endpoint, merge refreshed cookies, persist."""
     me = await whoami(cookies)
+    save_cookies(cookies, domain or config.DOMAIN)
     return me
 
 
@@ -153,6 +160,15 @@ async def touch(cookies: dict) -> dict:
 
 async def login_playwright() -> dict:
     """Headed browser, user scans QR themselves. Never types credentials."""
+    from .browser_worker import run
+
+    return await run("login", {})
+
+
+async def _login_playwright_impl() -> dict:
+    """Implementation used only by the bounded Browser Worker."""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("网页登录只能由受限 Browser Worker 执行")
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -169,7 +185,7 @@ async def login_playwright() -> dict:
             ignore_https_errors=False,
             env={k: v for k, v in os.environ.items()
                  if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
-            args=["--no-proxy-server"],
+            args=config.BROWSER_ARGS,
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()

@@ -16,7 +16,8 @@
 ## 本地补丁台账（升级上游时必须逐条重新应用）
 
 1. **`_http.py`（新增文件，不是上游代码）**：统一的 httpx client 工厂 +
-   TLS 配置钩子 + 发送闸门钩子（`require_send_allowed` / `write_disabled`）。
+   TLS 配置钩子 + 发送/资源写入闸门钩子（`require_send_allowed` /
+   `require_write_allowed` / `write_disabled`）。
 2. **所有 `httpx.AsyncClient(verify=False, ...)` → `_http.make_client(...)`**：
    `search.py`（2 处）、`listener.py`（1 处）、`sender.py`（1 处）、
    `drive.py`（10 处）。上游全局关 TLS 校验，这里恢复严格校验。
@@ -52,7 +53,7 @@
 ## 升级步骤
 
 1. `git clone` 上游到 /tmp，`diff -r` 对比本目录，评估上游改动。
-2. 拷入新代码后**逐条重打上面 7 条补丁**。
+2. 拷入新代码后**逐条重打上面全部补丁**，不要只覆盖上游同名文件。
 3. 跑 `./test.sh` 的单测（protobuf round-trip、发送闸门、解码）。
 4. 用真实会话按 `references/protocol.md` 的清单复核关键命令号。
 

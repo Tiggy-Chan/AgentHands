@@ -12,6 +12,26 @@ from .output import fmt_ts, note
 _CHAT_TYPE = {0: "unknown", 1: "p2p", 2: "group", 3: "topic"}
 
 
+def _seconds(value) -> float:
+    try:
+        stamp = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return stamp / 1000.0 if stamp > 1e12 else stamp
+
+
+def in_time_window(message: dict, start_time: int = 0, end_time: int = 0) -> bool:
+    """Apply the requested window locally as a second line of defense."""
+    stamp = _seconds(message.get("create_time"))
+    if not stamp:
+        return False if start_time or end_time else True
+    if start_time and stamp < start_time:
+        return False
+    if end_time and stamp > end_time:
+        return False
+    return True
+
+
 def _load_names() -> dict:
     try:
         return json.loads(config.NAMES_CACHE.read_text())
@@ -73,6 +93,7 @@ async def history(chat_id: str, start_time: int = 0, end_time: int = 0, limit: i
     async def run() -> dict:
         res = await gateway.search_msg_ids(chat_id, start_time, end_time, limit=limit)
         msgs = await gateway.fetch_messages(res["msg_ids"])
+        msgs = [m for m in msgs if in_time_window(m, start_time, end_time)]
         msgs.sort(key=lambda m: (m.get("create_time") or 0, m["msg_id"]))
         await resolve_names(msgs)
         return {"messages": msgs, "has_more": res["has_more"]}

@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -67,7 +68,17 @@ def _rotated_paths(path: Path) -> list[Path]:
 
 
 def _active_path() -> Path:
+    encrypted_exists = config.EVENTS_ENCRYPTED_FILE.exists() or any(
+        config.HOME.glob(config.EVENTS_ENCRYPTED_FILE.name + ".*")
+    )
+    if encrypted_exists:
+        return config.EVENTS_ENCRYPTED_FILE
     return config.EVENTS_ENCRYPTED_FILE if secure_store.mode() == "encrypted" else config.EVENTS_FILE
+
+
+def _encrypted_store_locked() -> bool:
+    """An existing encrypted store must never silently downgrade to plaintext."""
+    return bool(_encrypted_paths()) and secure_store.mode() != "encrypted"
 
 
 def _encrypted_paths() -> list[Path]:
@@ -177,12 +188,20 @@ def prepare_storage() -> dict:
     """Ensure the active store is ready; daemon calls this at startup."""
     config.ensure_home()
     result = _migrate_legacy()
-    return {**secure_store.status(), **result, "active_file": str(_active_path())}
+    return {
+        **secure_store.status(),
+        **result,
+        "active_file": str(_active_path()),
+        "encrypted_store_locked": _encrypted_store_locked(),
+    }
 
 
 def append_event(ev: dict) -> bool:
     """Append one record with an exclusive lock and fsync before returning."""
     config.ensure_home()
+    if _encrypted_store_locked():
+        note("  ! 加密事件池的密钥环当前不可用，暂停写入以避免混写明文")
+        return False
     current = sum(p.stat().st_size for p in _all_storage_files() if p.exists())
     if config.EVENTS_TOTAL_MAX_BYTES and current >= config.EVENTS_TOTAL_MAX_BYTES:
         note("  ! 事件池已达到磁盘配额，暂停写入；请运行 events purge 明确清理旧数据")
@@ -249,7 +268,7 @@ def _iter_lines():
     # Once an encrypted active store exists it already contains the legacy
     # records copied during migration. Reading both would duplicate every
     # message and make long-term scans unnecessarily expensive.
-    if secure_store.mode() == "encrypted" and _encrypted_paths():
+    if _encrypted_paths():
         yield from _iter_encrypted()
     else:
         yield from _read_plain_file_ordered()
@@ -263,9 +282,15 @@ def read_events(
     include_mine: bool = False,
     limit: int = 200,
 ) -> list[dict]:
-    """Filtered, msg_id-deduped, chronological events."""
+    """Filtered, msg_id-deduped, chronological events with a hard tail cap.
+
+    The event pool is intentionally long-lived.  Never turn a multi-gigabyte
+    archive into one Python list just because a caller asked for events.
+    """
+    if not 1 <= limit <= config.MAX_EVENT_READ_LIMIT:
+        raise ValueError(f"events limit 必须在 1..{config.MAX_EVENT_READ_LIMIT} 之间")
     seen: set[str] = set()
-    out: list[dict] = []
+    out: deque[dict] = deque(maxlen=limit)
     for ev in _iter_lines():
         mid = ev.get("msg_id")
         if mid and mid in seen:
@@ -283,18 +308,24 @@ def read_events(
             continue
         if mid:
             seen.add(mid)
+            if len(seen) >= config.MAX_EVENT_DEDUP_IDS:
+                # Old generations are not expected to contain far-apart
+                # duplicates.  Keep the dedupe set bounded even for a very
+                # long retention period.
+                seen.clear()
         out.append(ev)
-    out.sort(key=lambda e: (_event_time_ms(e), e.get("msg_id") or e.get("trigger_msg_id") or ""))
-    return out[-limit:] if limit else out
+    result = list(out)
+    result.sort(key=lambda e: (_event_time_ms(e), e.get("msg_id") or e.get("trigger_msg_id") or ""))
+    return result
 
 
 def recent_msg_ids(n: int = 2000) -> set[str]:
     """Tail of the pool for daemon-side dedupe after reconnect."""
-    ids: list[str] = []
+    ids: deque[str] = deque(maxlen=max(0, n))
     for ev in _iter_lines():
         if ev.get("msg_id"):
             ids.append(ev["msg_id"])
-    return set(ids[-max(0, n):])
+    return set(ids)
 
 
 def chat_summaries(max_chats: int = 20_000) -> dict[str, dict]:
@@ -332,6 +363,7 @@ def storage_status() -> dict:
         "quota_bytes": config.EVENTS_TOTAL_MAX_BYTES,
         "quota_ratio": round(total / config.EVENTS_TOTAL_MAX_BYTES, 4)
         if config.EVENTS_TOTAL_MAX_BYTES else 0,
+        "encrypted_store_locked": _encrypted_store_locked(),
     })
     return status
 
@@ -347,6 +379,8 @@ def purge_before(before_ms: int) -> dict:
     if before_ms <= 0:
         raise ValueError("purge 需要有效的 before 时间")
     config.ensure_home()
+    if _encrypted_store_locked():
+        raise secure_store.SecureStoreError("加密事件池密钥环不可用，不能执行 purge")
     active = _active_path()
     encrypted = secure_store.mode() == "encrypted"
     fd, name = tempfile.mkstemp(prefix=f".{active.name}.purge.", dir=str(active.parent))

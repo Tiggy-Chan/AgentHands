@@ -102,6 +102,21 @@ class TestTransportPolicy(unittest.TestCase):
         finally:
             os.environ.pop("FEISHU_ALLOW_SEND", None)
 
+    def test_write_gate_requires_env_and_is_one_shot(self):
+        from lark_bridge import _http
+        os.environ.pop("FEISHU_ALLOW_WRITE", None)
+        self.t.arm_write_once()
+        with self.assertRaises(Exception):
+            _http.require_write_allowed()
+        os.environ["FEISHU_ALLOW_WRITE"] = "1"
+        try:
+            self.t.arm_write_once()
+            _http.require_write_allowed()
+            with self.assertRaises(Exception):
+                _http.require_write_allowed()
+        finally:
+            os.environ.pop("FEISHU_ALLOW_WRITE", None)
+
     def test_strict_tls_default(self):
         import asyncio
         import ssl
@@ -139,8 +154,37 @@ class TestTransportPolicy(unittest.TestCase):
 
             compressed = gzip.compress(b"hello")
             self.assertEqual(_decode_bounded(compressed, "gzip", 100), b"hello")
+            with self.assertRaises(ResponseTooLarge):
+                _decode_bounded(gzip.compress(b"x" * 100_000), "gzip", 100)
 
         asyncio.run(check())
+
+    def test_browser_route_guard_is_read_only(self):
+        from types import SimpleNamespace
+        from _feishu import browser_guard
+
+        def request(method, url, command=""):
+            return SimpleNamespace(
+                method=method,
+                url=url,
+                headers={"x-command": str(command)},
+            )
+
+        self.assertTrue(browser_guard._is_safe_request(
+            request("GET", "https://sample-tenant.feishu.cn/mail")
+        ))
+        self.assertTrue(browser_guard._is_safe_request(
+            request("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", 3700)
+        ))
+        self.assertFalse(browser_guard._is_safe_request(
+            request("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", 5)
+        ))
+        self.assertFalse(browser_guard._is_safe_request(
+            request("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", 999999)
+        ))
+        self.assertFalse(browser_guard._is_safe_request(
+            request("POST", "https://evil.example/v1/list")
+        ))
 
 
 class TestQueryGuards(unittest.TestCase):
@@ -201,6 +245,88 @@ class TestQueryGuards(unittest.TestCase):
     def test_wire_walk_advances_after_printable_string(self):
         from _feishu.gateway import _walk_strings
         self.assertEqual(_walk_strings(b"\x0a\x05hello\x12\x03bye"), ["hello", "bye"])
+
+    def test_browser_worker_command_has_cgroup_limits(self):
+        from _feishu import browser_worker
+        cmd = browser_worker.build_command("chats", "feishu-browser-test", 12.2)
+        joined = " ".join(cmd)
+        self.assertIn("--property=MemoryHigh=384M", joined)
+        self.assertIn("--property=MemoryMax=512M", joined)
+        self.assertIn("--property=TasksMax=128", joined)
+        self.assertIn("--property=RuntimeMaxSec=13s", joined)
+        self.assertNotIn("--eval", joined)
+
+    def test_browser_without_systemd_fails_closed(self):
+        import asyncio
+        from _feishu import browser_worker
+        from _feishu.errors import ResourceIsolationUnavailable
+        with patch.object(browser_worker, "_systemd_user_available", return_value=False):
+            with self.assertRaises(ResourceIsolationUnavailable):
+                asyncio.run(browser_worker.run("chats"))
+
+    def test_browser_cancellation_stops_transient_unit(self):
+        import asyncio
+        from _feishu import browser_worker
+
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.killed = False
+                self.released = asyncio.Event()
+
+            async def communicate(self, _input=b""):
+                if self.killed:
+                    return b"", b""
+                await self.released.wait()
+                return b"", b""
+
+            def kill(self):
+                self.killed = True
+                self.released.set()
+
+        async def check():
+            process = Process()
+            with patch.object(browser_worker, "_systemd_user_available", return_value=True), \
+                 patch.object(browser_worker.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)), \
+                 patch.object(browser_worker, "_stop_unit", new=AsyncMock()) as stop:
+                task = asyncio.create_task(browser_worker.run("chats", timeout=30))
+                await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                stop.assert_awaited_once()
+                self.assertTrue(process.killed)
+
+        asyncio.run(check())
+
+    def test_ten_processes_only_one_gets_query_lock(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        script_dir = Path(__file__).resolve().parents[1] / "scripts"
+        code = (
+            "import sys, time\n"
+            "sys.path[:0] = %r\n"
+            "from _feishu import query_lock\n"
+            "with query_lock.acquire('stress'):\n"
+            "    time.sleep(0.15)\n"
+        ) % ([str(script_dir), str(script_dir / "vendor")],)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, FEISHU_HOME=tmp, FEISHU_NO_BOOTSTRAP="1")
+            children = [
+                subprocess.Popen(
+                    [sys.executable, "-c", code],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for _ in range(10)
+            ]
+            results = [child.wait(timeout=5) for child in children]
+        self.assertEqual(results.count(0), 1)
+        self.assertEqual(results.count(1), 9)
 
 
 class TestEventStore(unittest.TestCase):
@@ -280,12 +406,32 @@ class TestEventStore(unittest.TestCase):
         self.es.config.EVENTS_MAX_BYTES = 600  # ~5 events per file
         for i in range(30):
             self.es.append_event(self._ev(f"m{i}", 1000 + i, text="x" * 50))
-        evs = self.es.read_events(limit=0)
+        evs = self.es.read_events(limit=10000)
         self.assertGreater(len(evs), 5)
         # chronological and deduped even across rotated files
         self.assertEqual([e["msg_id"] for e in evs], sorted({e["msg_id"] for e in evs},
                           key=lambda m: int(m[1:])))
         self.assertIn("m29", [e["msg_id"] for e in evs])
+
+    def test_read_tail_is_hard_bounded(self):
+        for i in range(40):
+            self.es.append_event(self._ev(f"m{i}", 1000 + i))
+        evs = self.es.read_events(limit=7)
+        self.assertEqual(len(evs), 7)
+        self.assertEqual([e["msg_id"] for e in evs], [f"m{i}" for i in range(33, 40)])
+
+    def test_zero_read_limit_rejected(self):
+        with self.assertRaises(ValueError):
+            self.es.read_events(limit=0)
+
+    def test_encrypted_store_never_downgrades_when_keyring_is_unavailable(self):
+        from _feishu import secure_store
+        self.es.config.EVENTS_ENCRYPTED_FILE.write_text("{}\n")
+        with patch.object(secure_store, "mode", return_value="plaintext_permissions"):
+            self.assertTrue(self.es.storage_status()["encrypted_store_locked"])
+            self.assertFalse(self.es.append_event(self._ev("blocked", 1000)))
+            with self.assertRaises(secure_store.SecureStoreError):
+                self.es.purge_before(1500)
 
     def test_no_secret_fields(self):
         ev = self._ev("m1", 1000)
@@ -300,7 +446,7 @@ class TestEventStore(unittest.TestCase):
         self.es.append_event(self._ev("m-secure", 1000, text="secret-body"))
         status = self.es.storage_status()
         self.assertIn(status["mode"], ("encrypted", "plaintext_permissions"))
-        self.assertEqual(self.es.read_events(limit=0)[0]["text"], "secret-body")
+        self.assertEqual(self.es.read_events(limit=10000)[0]["text"], "secret-body")
         if status["encrypted"]:
             self.assertTrue(status["active_file"].endswith("events.v2.jsonl.enc"))
             with open(status["active_file"]) as f:
@@ -316,20 +462,20 @@ class TestEventStore(unittest.TestCase):
         result = self.es.prepare_storage()
         self.assertEqual(result["migrated"], 1)
         self.assertTrue(os.path.exists(self.es.config.EVENTS_LEGACY_FILE))
-        self.assertEqual(self.es.read_events(limit=0)[0]["msg_id"], "legacy")
+        self.assertEqual(self.es.read_events(limit=10000)[0]["msg_id"], "legacy")
 
     def test_quota_blocks_without_deleting_history(self):
         self.es.config.EVENTS_TOTAL_MAX_BYTES = 1
         self.assertTrue(self.es.append_event(self._ev("m1", 1000)))
         self.assertFalse(self.es.append_event(self._ev("m2", 2000)))
-        self.assertEqual(len(self.es.read_events(limit=0)), 1)
+        self.assertEqual(len(self.es.read_events(limit=10000)), 1)
 
     def test_purge_moves_old_files_to_recoverable_archive(self):
         self.es.append_event(self._ev("old", 1000))
         self.es.append_event(self._ev("new", 2000))
         result = self.es.purge_before(1_500_000)
         self.assertEqual(result["removed"], 1)
-        self.assertEqual([e["msg_id"] for e in self.es.read_events(limit=0)], ["new"])
+        self.assertEqual([e["msg_id"] for e in self.es.read_events(limit=10000)], ["new"])
         self.assertTrue(os.path.isdir(result["moved_to"]))
 
 
@@ -463,6 +609,51 @@ class TestContextCompaction(unittest.TestCase):
         self.assertTrue(out["truncated"])
         self.assertNotIn("raw", out["messages"][0])
 
+    def test_live_context_is_bounded_and_strips_transport_fields(self):
+        from _feishu.context import bound_context
+        source = {
+            "target": {"msg_id": "target", "text": "x" * 10000, "raw": "secret"},
+            "root": {"msg_id": "root"},
+            "chain": [{"msg_id": "root", "text": "root", "raw": "secret"}],
+            "replies": [], "window": [], "complete": True, "truncated": False,
+            "missing_parent_ids": [], "search_window": {},
+        }
+        out = bound_context(source, max_messages=10, max_bytes=500)
+        self.assertTrue(out["truncated"])
+        self.assertNotIn("raw", out["target"])
+        self.assertLessEqual(
+            len(json.dumps(out["target"], ensure_ascii=False).encode()), 500
+        )
+
+
+class TestMailCalendarContracts(unittest.TestCase):
+    def test_mail_write_defaults_to_draft(self):
+        import asyncio
+        from _feishu.errors import SendBlocked
+        from _feishu import mail
+        with self.assertRaises(SendBlocked) as caught:
+            asyncio.run(mail.send_message(["recipient"], "主题", "正文"))
+        self.assertIn("mail_send", caught.exception.hint)
+
+    def test_calendar_write_defaults_to_draft(self):
+        import asyncio
+        from _feishu.errors import SendBlocked
+        from _feishu import calendar_ops as calendar
+        with self.assertRaises(SendBlocked) as caught:
+            asyncio.run(calendar.create_event("联调", "2026-08-31T10:00:00+08:00", "2026-08-31T11:00:00+08:00"))
+        self.assertIn("calendar_create", caught.exception.hint)
+
+    def test_ui_fingerprint_and_calendar_time_helpers(self):
+        from _feishu import calendar_ops as calendar
+        from _feishu import mail
+        a = {"id": "", "subject": "主题", "sender": "甲", "date": "10:00", "desc": "正文", "text": "主题\n正文"}
+        self.assertEqual(mail._row_id(a), mail._row_id(a))
+        self.assertTrue(mail._row_id(a).startswith("ui:"))
+        self.assertEqual(
+            calendar._end_from_title("例会, 10:40 - 11:10", "2026-08-31T10:40:00+08:00"),
+            "2026-08-31T11:10:00+08:00",
+        )
+
 
 class TestDrivePagination(unittest.TestCase):
     def test_last_label_pagination_is_bounded(self):
@@ -499,6 +690,30 @@ class TestDrivePagination(unittest.TestCase):
             rows = await drive._paged_node_list(client, "https://example.test/list", {"length": "50"})
             self.assertEqual([row["token"] for row in rows], ["n1", "n2"])
             self.assertEqual(client.params[1]["last_label"], "next")
+
+        asyncio.run(check())
+
+
+class TestDocumentContracts(unittest.TestCase):
+    def test_space_listing_reports_partial_permission_failure(self):
+        import asyncio
+        from _feishu import documents
+
+        async def ok(*_args):
+            return [{"token": "mine", "name": "mine", "type": "folder"}]
+
+        async def denied(*_args):
+            raise PermissionError("denied")
+
+        async def check():
+            with patch.object(documents, "_creds", return_value=("", {}, "tenant.test")), \
+                 patch.object(documents.drive, "list_my_space", new=ok), \
+                 patch.object(documents.drive, "list_shared_folders", new=denied):
+                result = await documents.list_spaces()
+            self.assertFalse(result["complete"])
+            self.assertTrue(result["incomplete"])
+            self.assertEqual(result["my_space"][0]["token"], "mine")
+            self.assertEqual(result["errors"][0]["space"], "shared_space")
 
         asyncio.run(check())
 
@@ -552,6 +767,7 @@ class TestOutput(unittest.TestCase):
         t0 = now_ms()
         self.assertAlmostEqual(parse_when("30m"), t0 - 30 * 60 * 1000, delta=2000)
         self.assertAlmostEqual(parse_when("2h"), t0 - 7200 * 1000, delta=2000)
+        self.assertAlmostEqual(parse_when("+7d"), t0 + 7 * 86400 * 1000, delta=2000)
         self.assertEqual(parse_when("1700000000"), 1700000000 * 1000)
         self.assertIsNone(parse_when(""))
         with self.assertRaises(ValueError):
@@ -566,6 +782,11 @@ class TestOutput(unittest.TestCase):
         from _feishu.output import fmt_ts
         self.assertEqual(fmt_ts(1700000000), fmt_ts(1700000000000))  # s == ms
         self.assertEqual(fmt_ts(0), "-")
+
+    def test_local_message_time_window(self):
+        from _feishu.messages import in_time_window
+        self.assertTrue(in_time_window({"create_time": "1000"}, 900, 1100))
+        self.assertFalse(in_time_window({"create_time": "1000"}, 1001, 0))
 
 
 if __name__ == "__main__":

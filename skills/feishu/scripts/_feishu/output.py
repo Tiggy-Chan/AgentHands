@@ -51,7 +51,7 @@ def now_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
 
-_DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$", re.I)
+_DURATION_RE = re.compile(r"^([+-]?)(\d+)\s*([smhd])$", re.I)
 _UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -63,7 +63,8 @@ def parse_when(spec: str):
     spec = spec.strip()
     m = _DURATION_RE.match(spec)
     if m:
-        return now_ms() - int(m.group(1)) * _UNIT_S[m.group(2).lower()] * 1000
+        seconds = int(m.group(2)) * _UNIT_S[m.group(3).lower()]
+        return now_ms() + (seconds if m.group(1) == "+" else -seconds) * 1000
     try:
         dt = datetime.fromisoformat(spec)
         if dt.tzinfo is None:

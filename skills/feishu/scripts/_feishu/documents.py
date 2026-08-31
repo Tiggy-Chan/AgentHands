@@ -11,6 +11,7 @@ import json
 import os
 import re
 import asyncio
+import tempfile
 from collections import deque
 
 from . import auth, config, secure_store, transport
@@ -99,9 +100,18 @@ def _cache_export(ref: str, fmt: str, data: bytes) -> None:
 
 async def list_spaces() -> dict:
     cookie, cookies, domain = _creds()
-    mine = await drive.list_my_space(cookie, cookies, domain)
-    shared = await drive.list_shared_folders(cookie, cookies, domain)
-    return {"my_space": mine, "shared_space": shared}
+    result = {"my_space": [], "shared_space": [], "errors": [], "complete": True, "incomplete": False}
+    for label, key, loader in (
+        ("my_space", "my_space", drive.list_my_space),
+        ("shared_space", "shared_space", drive.list_shared_folders),
+    ):
+        try:
+            result[key] = await loader(cookie, cookies, domain)
+        except Exception as exc:
+            result["complete"] = False
+            result["incomplete"] = True
+            result["errors"].append({"space": label, "error": type(exc).__name__})
+    return result
 
 
 async def walk(max_nodes: int = 5000) -> dict:
@@ -155,13 +165,26 @@ async def walk(max_nodes: int = 5000) -> dict:
             else:
                 errors.append({"token": tok, "path": entry["path"], "error": type(last_error).__name__})
     config.ensure_home()
-    with open(config.DOCS_INDEX, "w", encoding="utf-8") as f:
-        for n in nodes:
-            f.write(json.dumps(n, ensure_ascii=False) + "\n")
-    os.chmod(config.DOCS_INDEX, 0o600)
+    config.DOCS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".docs-index.", dir=str(config.DOCS_INDEX.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for n in nodes:
+                f.write(json.dumps(n, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, config.DOCS_INDEX)
+        os.chmod(config.DOCS_INDEX, 0o600)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
     return {
         "nodes": nodes,
         "errors": errors,
         "complete": not errors and len(nodes) < max_nodes,
+        "incomplete": bool(errors) or len(nodes) >= max_nodes,
         "truncated": len(nodes) >= max_nodes,
     }

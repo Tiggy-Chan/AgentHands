@@ -25,6 +25,7 @@ LARGE_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
 
 # Callable that must raise to block a send. None = not installed = deny.
 _SEND_CHECK = None
+_WRITE_CHECK = None
 _REQUEST_POLICY = None
 
 
@@ -47,6 +48,12 @@ def install_send_gate(check) -> None:
     _SEND_CHECK = check
 
 
+def install_write_gate(check) -> None:
+    """Install the one-shot gate for future mail/calendar writes."""
+    global _WRITE_CHECK
+    _WRITE_CHECK = check
+
+
 def install_request_policy(check) -> None:
     """Install a callback ``(method, url, gateway_cmd)`` → None/raise."""
     global _REQUEST_POLICY
@@ -59,6 +66,14 @@ def require_send_allowed() -> None:
             "send gate not installed; sending is disabled in this build"
         )
     _SEND_CHECK()
+
+
+def require_write_allowed() -> None:
+    if _WRITE_CHECK is None:
+        raise SendBlockedError(
+            "write gate not installed; non-message writes are disabled in this build"
+        )
+    _WRITE_CHECK()
 
 
 def write_disabled(what: str) -> None:

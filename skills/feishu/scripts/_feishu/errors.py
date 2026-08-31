@@ -35,3 +35,15 @@ class PolicyViolation(FeishuError):
 
 class QueryBusy(FeishuError):
     exit_code = 6
+
+
+class ResourceIsolationUnavailable(FeishuError):
+    """A browser operation cannot run without a host-level resource boundary."""
+
+    exit_code = 7
+
+
+class BrowserWorkerError(FeishuError):
+    """The bounded browser worker failed or exceeded its deadline."""
+
+    exit_code = 7

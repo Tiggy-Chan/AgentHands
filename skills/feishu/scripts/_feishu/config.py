@@ -35,6 +35,38 @@ QUERY_LOCK = HOME / "query.lock"
 CONTEXT_MAX_MESSAGES = int(os.environ.get("FEISHU_CONTEXT_MAX_MESSAGES", 200))
 CONTEXT_MAX_BYTES = int(os.environ.get("FEISHU_CONTEXT_MAX_BYTES", 2 * 1024 * 1024))
 CONTEXT_TIMEOUT_SECONDS = float(os.environ.get("FEISHU_CONTEXT_TIMEOUT", 45))
+MAX_MENTION_CHATS = max(1, int(os.environ.get("FEISHU_MAX_MENTION_CHATS", 100)))
+MAX_EVENT_READ_LIMIT = max(1, int(os.environ.get("FEISHU_MAX_EVENT_READ_LIMIT", 10_000)))
+MAX_EVENT_DEDUP_IDS = max(1_000, int(os.environ.get("FEISHU_MAX_EVENT_DEDUP_IDS", 100_000)))
+MAX_BROWSER_REQUESTS = max(10, int(os.environ.get("FEISHU_MAX_BROWSER_REQUESTS", 1_000)))
+MAX_BROWSER_CARDS = max(10, int(os.environ.get("FEISHU_MAX_BROWSER_CARDS", 500)))
+MAX_BROWSER_TEXT_BYTES = max(256, int(os.environ.get("FEISHU_MAX_BROWSER_TEXT_BYTES", 4096)))
+MAX_LOCAL_DOC_BYTES = max(1024, int(os.environ.get("FEISHU_MAX_LOCAL_DOC_BYTES", 16 * 1024 * 1024)))
+BROWSER_TIMEOUT_SECONDS = float(os.environ.get("FEISHU_BROWSER_TIMEOUT", 120))
+BROWSER_QUERY_TIMEOUT_SECONDS = max(
+    QUERY_TIMEOUT_SECONDS, BROWSER_TIMEOUT_SECONDS + 20
+)
+BROWSER_MEMORY_HIGH = os.environ.get("FEISHU_BROWSER_MEMORY_HIGH", "384M")
+BROWSER_MEMORY_MAX = os.environ.get("FEISHU_BROWSER_MEMORY_MAX", "512M")
+BROWSER_TASKS_MAX = os.environ.get("FEISHU_BROWSER_TASKS_MAX", "128")
+BROWSER_ARGS = [
+    "--no-proxy-server",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--no-first-run",
+    "--renderer-process-limit=4",
+    "--num-raster-threads=1",
+    "--renderer-process-limit=1",
+    "--no-zygote",
+    "--single-process",
+]
+MAIL_URL = os.environ.get("FEISHU_MAIL_URL", "")
+CALENDAR_URL = os.environ.get("FEISHU_CALENDAR_URL", "")
 DOCS_CACHE_DIR = HOME / "docs-cache"
 DAEMON_PID = HOME / "daemon.pid"
 DAEMON_LOCK = HOME / "daemon.lock"
