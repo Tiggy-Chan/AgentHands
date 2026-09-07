@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 
 from . import config, gateway
 from .message_model import public_message
@@ -78,6 +79,44 @@ def _drop_uniform_names(names: dict) -> None:
                 del names["users"][uid]
 
 
+_MENTION_RE = re.compile(
+    r'<at\b[^>]*\b(?:user_id|userid|id)=["\']([A-Za-z0-9_-]+)["\'][^>]*>@?([^<]+)</at>',
+    re.IGNORECASE,
+)
+
+
+def harvest_mentions(messages: list[dict], names: dict | None = None) -> bool:
+    """Harvest user_id -> display_name mappings from mentions in messages.
+
+    In group chats, cmd=64/5023 may be dead on current web tenants, but mentions
+    preserve the ground-truth user_id -> display name mapping.
+    """
+    if names is None:
+        names = _load_names()
+    dirty = False
+    sources = names.setdefault("sources", {})
+    users = names.setdefault("users", {})
+    for m in messages:
+        text_candidates = [
+            str(m.get("text") or ""),
+            str((m.get("content") or {}).get("text") or "") if isinstance(m.get("content"), dict) else "",
+        ]
+        for text in text_candidates:
+            if "<at" not in text:
+                continue
+            for uid, raw_name in _MENTION_RE.findall(text):
+                clean = raw_name.strip().lstrip("@").strip()
+                if not _name_ok(clean) or clean.lower() in ("所有人", "all", "everyone"):
+                    continue
+                if users.get(uid) != clean:
+                    users[uid] = clean
+                    sources[f"user:{uid}"] = "message_mention"
+                    dirty = True
+    if dirty:
+        _drop_uniform_names(names)
+    return dirty
+
+
 def _save_names(names: dict) -> None:
     config.ensure_home()
     config.NAMES_CACHE.write_text(json.dumps(names, ensure_ascii=False, indent=1))
@@ -110,6 +149,10 @@ async def resolve_names(messages: list[dict], my_id: str = "", my_name: str = ""
     dirty = False
     if my_id and _name_ok(my_name) and names["users"].get(my_id) != my_name.strip():
         names["users"][my_id] = my_name.strip()
+        dirty = True
+
+    # Ground-truth name resolution from mentions inside the messages themselves
+    if harvest_mentions(messages, names):
         dirty = True
     chat_ids = {m["chat_id"] for m in messages if m.get("chat_id")}
     user_ids = {m["from_id"] for m in messages if m.get("from_id")}

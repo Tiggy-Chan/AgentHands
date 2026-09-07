@@ -290,6 +290,92 @@ def _image_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]
     return structured, resources
 
 
+def _find_crypto(data: bytes, depth: int = 0) -> dict[str, str]:
+    """Recursively discover AES-256-GCM material (32B key + 12B nonce) in wire fields."""
+    if depth > 4 or not data:
+        return {}
+    raw_key = raw_nonce = b""
+    nested: list[bytes] = []
+    for fn, wt, val in _wire_fields(data):
+        if wt == 2:
+            bval = bytes(val)
+            if fn == 1 and len(bval) == 32:
+                raw_key = bval
+            elif fn == 2 and len(bval) == 12:
+                raw_nonce = bval
+            elif 10 < len(bval) <= 4096:
+                nested.append(bval)
+    if raw_key and raw_nonce:
+        return {"algo": "aes-256-gcm", "key": raw_key.hex(), "nonce": raw_nonce.hex()}
+    for child in nested:
+        found = _find_crypto(child, depth + 1)
+        if found:
+            return found
+    return {}
+
+
+def _media_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """MEDIA / Video (type 15) layout, tenant-verified 2026-09-07:
+    f1 str = key (file_v3_…), f2 str = name, f3 varint = size, f4 str = mime,
+    f6 nested = video cover (img_v3_… + AES-256-GCM crypto), f7 varint = duration_ms.
+    """
+    key = name = mime = ""
+    size = duration = 0
+    cover_image_key = ""
+    cover_crypto: dict[str, str] = {}
+
+    for fn, wire_type, value in _wire_fields(content):
+        if fn == 1 and wire_type == 2:
+            key = _try_str(value)
+        elif fn == 2 and wire_type == 2:
+            name = _try_str(value)
+        elif fn == 3 and wire_type == 0:
+            size = int(value)
+        elif fn == 4 and wire_type == 2:
+            mime = _try_str(value)
+        elif fn == 6 and wire_type == 2:
+            raw_f6 = bytes(value)
+            for text in _wire_strings(raw_f6):
+                match = _MEDIA_KEY_RE.search(text)
+                if match and not cover_image_key:
+                    cover_image_key = match.group(0).rstrip("~")
+            cover_crypto = _find_crypto(raw_f6)
+        elif fn == 7 and wire_type == 0:
+            duration = int(value)
+
+    structured: dict[str, Any] = {}
+    if name:
+        structured["fileName"] = _clip(name, 512)
+    if mime:
+        structured["fileMime"] = _clip(mime, 256)
+    if size:
+        structured["fileSize"] = size
+    if duration:
+        structured["duration"] = duration
+    if cover_crypto:
+        structured["coverEncryption"] = cover_crypto["algo"]
+    structured["field_mapping"] = "tenant-verified-2026-09-07"
+
+    resources: list[dict[str, Any]] = []
+    if key:
+        _append_resource(
+            resources,
+            _resource("media", key, name=name, mime=mime, size=size, duration=duration, source="content.media_key"),
+        )
+    if cover_image_key:
+        cover_res = _resource(
+            "image",
+            cover_image_key,
+            name=f"{name}.cover.webp" if name else "cover.webp",
+            source="content.media_cover",
+        )
+        if cover_res and cover_crypto:
+            cover_res["_crypto"] = cover_crypto
+        _append_resource(resources, cover_res)
+
+    return structured, resources
+
+
 def _resource(
     kind: str,
     key: str,
@@ -731,6 +817,19 @@ def decode_message(m: dict) -> dict:
         for resource in image_resources + _wire_media_resources(content):
             _append_resource(resources, resource)
         parsed = bool(text or structured or resources)
+    elif msg_type == 15 and content:
+        # MEDIA (video): wire layout mapped 2026-09-07.
+        # f1: file_v3_ key, f2: fileName, f3: fileSize, f4: fileMime,
+        # f6: cover image & crypto, f7: duration (ms).
+        details, media_resources = _media_details(content)
+        structured.update(details)
+        for resource in media_resources + _wire_media_resources(content):
+            _append_resource(resources, resource)
+        parsed = bool(text or structured or resources)
+        if structured.get("fileName"):
+            text = f"[视频: {structured['fileName']}]"
+        elif not text:
+            text = "[视频]"
     else:
         structured, content_resources, content_parsed, content_errors = _parse_content_proto(content)
         resources.extend(content_resources)

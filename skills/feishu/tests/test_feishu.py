@@ -1287,6 +1287,8 @@ class TestAttribution(unittest.TestCase):
         self.assertEqual(self.messages._sender_label(m), "u9")
 
     def test_name_endpoint_dead_short_circuits(self):
+        self.gateway._NAME_ENDPOINT["dead"] = False
+        self.gateway._NAME_ENDPOINT["noted"] = False
         calls = []
 
         async def fake_call(cmd, req, rid):
@@ -1329,6 +1331,90 @@ class TestAttribution(unittest.TestCase):
         summaries = {"c_p2p": {"chat_type": 1, "senders": ["a", "b", "c"]}}
         self.messages.harvest_chat_names(rows, summaries=summaries, my_id="me1")
         self.assertEqual(self.messages._load_names()["users"], {})
+
+    def test_harvest_mentions_resolves_group_senders(self):
+        import asyncio
+        msgs = [
+            {
+                "msg_id": "m1",
+                "from_id": "u100",
+                "chat_id": "c_grp",
+                "chat_type": 2,
+                "text": '<at user_id="u200">@李四</at> 请看下',
+            },
+            {
+                "msg_id": "m2",
+                "from_id": "u200",
+                "chat_id": "c_grp",
+                "chat_type": 2,
+                "text": '<at user_id="u100">@林小明</at> 收到',
+            },
+            {
+                "msg_id": "m3",
+                "from_id": "u300",
+                "chat_id": "c_grp",
+                "chat_type": 2,
+                "text": '<at user_id="all">@所有人</at> 忽略通用at',
+            },
+        ]
+        asyncio.run(self.messages.resolve_names(msgs, my_id="my_id", my_name="号主"))
+        names = self.messages._load_names()
+        self.assertEqual(names["users"]["u100"], "林小明")
+        self.assertEqual(names["users"]["u200"], "李四")
+        self.assertNotIn("all", names["users"])
+        # Both senders must be resolved in place
+        self.assertEqual(msgs[0]["from_name"], "林小明")
+        self.assertEqual(msgs[1]["from_name"], "李四")
+        self.assertEqual(self.messages._sender_label(msgs[0]), "林小明")
+        self.assertEqual(self.messages._sender_label(msgs[1]), "李四")
+
+    def test_media_video_message_decode(self):
+        from _feishu.message_decode import decode_message
+        def ev(n):
+            out = b""
+            while True:
+                b, n = n & 0x7F, n >> 7
+                if n:
+                    out += bytes([b | 0x80])
+                else:
+                    return out + bytes([b])
+
+        def fld(fn, wt):
+            return ev(fn << 3 | wt)
+
+        # Wire layout: f1=key, f2=name, f3=size, f4=mime, f6=cover, f7=duration
+        key = "file_v3_0015a_00000000-0000-0000-0000-000000000004g"
+        name = "test.mov"
+        mime = "video/quicktime"
+        cover_key = "img_v3_0215a_00000000-0000-0000-0000-000000000005g"
+        raw_key = b"K" * 32
+        raw_nonce = b"N" * 12
+        crypto_proto = fld(1, 2) + ev(32) + raw_key + fld(2, 2) + ev(12) + raw_nonce
+        cover_payload = (
+            fld(1, 2) + ev(len(cover_key)) + cover_key.encode()
+            + fld(9, 2) + ev(len(crypto_proto)) + crypto_proto
+        )
+        f6_payload = fld(2, 2) + ev(len(cover_payload)) + cover_payload
+
+        content = (
+            fld(1, 2) + ev(len(key)) + key.encode()
+            + fld(2, 2) + ev(len(name)) + name.encode()
+            + fld(3, 0) + ev(1024)
+            + fld(4, 2) + ev(len(mime)) + mime.encode()
+            + fld(6, 2) + ev(len(f6_payload)) + f6_payload
+            + fld(7, 0) + ev(5000)
+        )
+        out = decode_message({"type": 15, "content": content})
+        self.assertEqual(out["semantic_status"], "decoded")
+        self.assertEqual(out["decode_status"], "nontext")
+        self.assertEqual(out["text"], "[视频: test.mov]")
+        kinds = {r["kind"] for r in out["resources"]}
+        self.assertIn("media", kinds)
+        self.assertIn("image", kinds)
+        cover_res = next(r for r in out["resources"] if r["source"] == "content.media_cover")
+        self.assertEqual(cover_res["_crypto"]["algo"], "aes-256-gcm")
+        self.assertEqual(cover_res["_crypto"]["key"], raw_key.hex())
+        self.assertEqual(cover_res["_crypto"]["nonce"], raw_nonce.hex())
 
 
 class TestSearchPageLimit(unittest.TestCase):
