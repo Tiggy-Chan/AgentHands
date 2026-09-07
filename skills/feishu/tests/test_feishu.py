@@ -227,7 +227,6 @@ class TestQueryGuards(unittest.TestCase):
     def test_page_limit_stops(self):
         import asyncio
         from _feishu import config, gateway
-        from _feishu.errors import FeishuError
 
         async def check():
             with patch.object(config, "SEARCH_MAX_PAGES", 1), \
@@ -237,10 +236,14 @@ class TestQueryGuards(unittest.TestCase):
                          "msg_ids": ["m1"], "has_more": True, "page_token": "next"
                      }),
                  ):
-                with self.assertRaises(FeishuError):
-                    await gateway.search_msg_ids("c1", limit=10)
+                return await gateway.search_msg_ids("c1", limit=10)
 
-        asyncio.run(check())
+        res = asyncio.run(check())
+        # Page budget is a host-protection bound, but hitting it must degrade
+        # to a flagged partial result instead of failing the whole query.
+        self.assertEqual(res["msg_ids"], ["m1"])
+        self.assertTrue(res["page_limit_hit"])
+        self.assertTrue(res["has_more"])
 
     def test_wire_walk_advances_after_printable_string(self):
         from _feishu.gateway import _walk_strings
@@ -560,35 +563,80 @@ class TestDecode(unittest.TestCase):
         from lark_bridge._proto_utils import proto_to_dict
         from lark_bridge.proto import proto_pb2 as pb
 
-        content = pb.Content(
-            imageKey="image-key",
-            fileKey="file-key",
-            fileName="report.pdf",
-            fileMime="application/pdf",
-            fileSize=123,
-            audioKey="audio-key",
-            audioDuration=9,
-            stickerSetId="set-1",
-            stickerId="sticker-1",
-            shareUserId="user-1",
+        # Tenant-verified IMAGE layout: Content.f2 is a nested descriptor
+        # {f1 key, f2 region, f4 repeated variant {f1 slot, f2 {f1 w, f2 h}}},
+        # root f4 = byte size.  Build it on the wire, not via the vendored
+        # (misaligned) Content schema.
+        def ev(n):
+            out = b""
+            while True:
+                b, n = n & 0x7F, n >> 7
+                if n:
+                    out += bytes([b | 0x80])
+                else:
+                    return out + bytes([b])
+
+        def fld(fn, wt):
+            return ev(fn << 3 | wt)
+
+        key = "img_v3_0215a_00000000-0000-0000-0000-000000000001g"
+        dims = fld(1, 0) + ev(1441) + fld(2, 0) + ev(508)
+        variant = fld(1, 0) + ev(1) + fld(2, 2) + ev(len(dims)) + dims
+        descriptor = (
+            fld(1, 2) + ev(len(key)) + key.encode()
+            + fld(2, 2) + ev(9) + b"eu_nc-cdn"
+            + fld(4, 2) + ev(len(variant)) + variant
         )
+        content = fld(2, 2) + ev(len(descriptor)) + descriptor + fld(4, 0) + ev(261038)
+
         raw = pb.entities.Message(
             id="m1", type=5, fromId="u1", chatId="c1", createTime=1,
-            content=content.SerializeToString(),
+            content=content,
         )
         message = gateway.normalize("m1", proto_to_dict(raw))
         self.assertEqual(message["schema"], 2)
         self.assertEqual(message["type"], {"code": 5, "name": "image"})
         self.assertEqual(message["decode"]["status"], "decoded")
-        self.assertEqual(
-            {item["kind"] for item in message["resources"]},
-            {"image", "file", "audio", "sticker"},
-        )
+        kinds = {item["kind"] for item in message["resources"]}
+        self.assertEqual(kinds, {"image"})
+        self.assertEqual(message["content"]["structured"]["image"], {"width": 1441, "height": 508})
         safe = public_message(message)
         encoded = json.dumps(safe, ensure_ascii=False)
-        for secret_key in ("image-key", "file-key", "audio-key"):
-            self.assertNotIn(secret_key, encoded)
+        self.assertNotIn(key, encoded)
         self.assertNotIn("_resource_keys", safe)
+
+    def test_file_message_has_no_phantom_media_resources(self):
+        """The vendored schema reads a FILE message's name/mime as
+        imageKey/audioKey — those phantom resources must not appear."""
+        from _feishu.message_decode import decode_message
+
+        def ev(n):
+            out = b""
+            while True:
+                b, n = n & 0x7F, n >> 7
+                if n:
+                    out += bytes([b | 0x80])
+                else:
+                    return out + bytes([b])
+
+        def fld(fn, wt):
+            return ev(fn << 3 | wt)
+
+        def s(fn, text):
+            return fld(fn, 2) + ev(len(text)) + text.encode()
+
+        content = (
+            s(1, "file_v3_00157_00000000-0000-0000-0000-000000000002g")
+            + s(2, "firmware_update_v1.0.4.bin")
+            + fld(3, 0) + ev(37472)
+            + s(4, "application/octet-stream")
+            + s(7, "eu_nc")
+        )
+        decoded = decode_message({"type": 3, "content": content})
+        kinds = {r["kind"] for r in decoded["resources"]}
+        self.assertEqual(kinds, {"file"})
+        self.assertEqual(decoded["structured"]["fileName"], "firmware_update_v1.0.4.bin")
+        self.assertEqual(decoded["structured"]["fileSize"], 37472)
 
     def test_file_token_in_content_text_is_a_downloadable_file_resource(self):
         from _feishu.message_decode import decode_message
@@ -685,16 +733,24 @@ class TestMessageResourcesAndMedia(unittest.TestCase):
         message = {
             "resources": [
                 {"resource_id": "file:one", "kind": "file", "name": "a.txt", "_key": "file-key"},
-                {"resource_id": "image:two", "kind": "image", "name": "a.png", "_key": "image-key"},
+                {"resource_id": "image:two", "kind": "image", "name": "a.png",
+                 "_key": "img_v3_0215a_00000000-0000-0000-0000-000000000001g"},
+                {"resource_id": "sticker:three", "kind": "sticker", "_key": "set:stk"},
             ],
-            "_resource_keys": {"file:one": "file-key", "image:two": "image-key"},
+            "_resource_keys": {},
         }
         with self.assertRaises(ResourceError):
             message_resources.select_resource(message)
         file_resource = message_resources.select_resource(message, "file:one")
         self.assertIn("internal-api-drive-stream.feishu.cn", message_resources._url_for(file_resource))
+        # Registered 2026-09-07 via media-observe probe (verified 200 image/jpeg).
+        image_resource = message_resources.select_resource(message, "image:two")
+        url = message_resources._url_for(image_resource)
+        self.assertIn("internal-api-lark-file.feishu.cn/static-resource/v1/", url)
+        self.assertTrue(url.endswith("~"))
+        # Sticker download stays closed until its route is observed.
         with self.assertRaises(EndpointNotAdapted):
-            message_resources._url_for(message_resources.select_resource(message, "image:two"))
+            message_resources._url_for(message_resources.select_resource(message, "sticker:three"))
 
     def test_media_worker_command_is_cgroup_bounded(self):
         from _feishu import media_worker
@@ -802,7 +858,8 @@ class TestMessageResourcesAndMedia(unittest.TestCase):
             self.assertFalse(result["contains_bodies"])
             self.assertFalse(result["contains_credentials"])
             self.assertEqual(result["resources"][0]["endpoint_status"], "registered")
-            self.assertEqual(result["resources"][1]["endpoint_status"], "not_adapted")
+            # image is registered since 2026-09-07 (static-resource route)
+            self.assertEqual(result["resources"][1]["endpoint_status"], "registered")
             self.assertNotIn("file-key", json.dumps(result, ensure_ascii=False))
 
         asyncio.run(check())
@@ -1137,6 +1194,180 @@ class TestOutput(unittest.TestCase):
         from _feishu.messages import in_time_window
         self.assertTrue(in_time_window({"create_time": "1000"}, 900, 1100))
         self.assertFalse(in_time_window({"create_time": "1000"}, 1001, 0))
+
+
+class TestAttribution(unittest.TestCase):
+    """Bug: p2p history showed every sender as a garbage heuristic name
+    ("xi tong xiao xi"), making it impossible to tell 我 from 对方."""
+
+    def setUp(self):
+        import tempfile
+        import importlib
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FEISHU_HOME"] = self.tmp.name
+        from _feishu import config, messages, gateway
+        importlib.reload(config)
+        importlib.reload(messages)
+        self.config = config
+        self.messages = messages
+        self.gateway = gateway
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        os.environ.pop("FEISHU_HOME", None)
+
+    def _write_names(self, users=None, chats=None):
+        self.config.ensure_home()
+        self.config.NAMES_CACHE.write_text(json.dumps(
+            {"users": users or {}, "chats": chats or {}}, ensure_ascii=False))
+
+    def test_load_names_purges_poisoned_entries(self):
+        self._write_names(users={"u1": "xi tong xiao xi", "u2": "张伟", "u3": ""},
+                          chats={"c1": "系统消息", "c2": "真实的群"})
+        names = self.messages._load_names()
+        self.assertEqual(names["users"], {"u2": "张伟"})
+        self.assertEqual(names["chats"], {"c2": "真实的群"})
+
+    def test_resolve_names_never_caches_garbage(self):
+        async def fake_user_name(uid, cid="0"):
+            return "xi tong xiao xi"  # the observed poison value
+        with patch.object(self.messages.gateway, "get_user_name", fake_user_name), \
+             patch.object(self.messages.gateway, "get_group_name", AsyncMock(return_value="")):
+            msgs = [{"msg_id": "m1", "chat_id": "c1", "from_id": "u1"}]
+            import asyncio
+            asyncio.run(self.messages.resolve_names(msgs))
+        self.assertEqual(msgs[0]["from_name"], "")
+        self.assertEqual(msgs[0]["name_status"], "unresolved")
+        self.assertEqual(self.messages._load_names()["users"], {})
+
+    def test_whoami_self_name_wins_over_cache(self):
+        self._write_names(users={"me1": "xi tong xiao xi"})
+        msgs = [{"msg_id": "m1", "chat_id": "c1", "from_id": "me1"}]
+        import asyncio
+        with patch.object(self.messages.gateway, "get_group_name", AsyncMock(return_value="")):
+            asyncio.run(self.messages.resolve_names(msgs, my_id="me1", my_name="号主"))
+        self.assertEqual(msgs[0]["from_name"], "号主")
+        self.assertEqual(self.messages._load_names()["users"]["me1"], "号主")
+
+    def test_uniform_name_across_users_is_dropped(self):
+        async def same_for_all(uid, cid="0"):
+            return "同名"
+        with patch.object(self.messages.gateway, "get_user_name", same_for_all), \
+             patch.object(self.messages.gateway, "get_group_name", AsyncMock(return_value="")):
+            msgs = [{"msg_id": f"m{i}", "chat_id": "c1", "from_id": f"u{i}"} for i in range(4)]
+            import asyncio
+            asyncio.run(self.messages.resolve_names(msgs))
+        # one string covering many distinct ids is a poison signature
+        self.assertEqual(self.messages._load_names()["users"], {})
+        self.assertTrue(all(m["from_name"] == "" for m in msgs))
+
+    def test_apply_direction_labels_roles(self):
+        msgs = [
+            {"msg_id": "m1", "from_id": "me1"},
+            {"msg_id": "m2", "from_id": "peer1"},
+        ]
+        self.messages.apply_direction(msgs, "me1")
+        self.assertTrue(msgs[0]["is_me"])
+        self.assertEqual(msgs[0]["direction"], "outgoing")
+        self.assertFalse(msgs[1]["is_me"])
+        self.assertEqual(msgs[1]["direction"], "incoming")
+
+    def test_sender_label_p2p_roles_cannot_swap(self):
+        me = {"from_id": "me1", "chat_type": 1, "is_me": True, "from_name": "号主"}
+        peer = {"from_id": "peer1", "chat_type": 1, "is_me": False, "from_name": ""}
+        poisoned = {"from_id": "peer1", "chat_type": 1, "is_me": False,
+                    "from_name": "xi tong xiao xi"}
+        self.assertEqual(self.messages._sender_label(me), "我（号主）")
+        self.assertEqual(self.messages._sender_label(peer), "对方（id:peer1）")
+        # denylisted garbage must never be displayed as a name
+        self.assertEqual(self.messages._sender_label(poisoned), "对方（id:peer1）")
+
+    def test_sender_label_group_falls_back_to_id(self):
+        m = {"from_id": "u9", "chat_type": 2, "is_me": False, "from_name": ""}
+        self.assertEqual(self.messages._sender_label(m), "u9")
+
+    def test_name_endpoint_dead_short_circuits(self):
+        calls = []
+
+        async def fake_call(cmd, req, rid):
+            calls.append(cmd)
+            pkt = self.gateway.pb.Packet()
+            pkt.payloadType = 5  # observed tenant behavior: no payload at all
+            return pkt.SerializeToString()
+
+        async def run():
+            with patch.object(self.gateway.transport, "gateway_call", fake_call):
+                self.assertEqual(await self.gateway.get_user_name("u1", "c1"), "")
+                self.assertEqual(await self.gateway.get_user_name("u2", "c1"), "")
+                self.assertEqual(await self.gateway.get_group_name("c1"), "")
+
+        import asyncio
+        asyncio.run(run())
+        # first failure marks the endpoint dead; later lookups skip the network
+        self.assertEqual(len(calls), 1)
+
+    def test_harvest_chat_names_infers_p2p_peer(self):
+        rows = [
+            {"chat_id": "c_p2p", "name": "张伟"},
+            {"chat_id": "c_grp", "name": "项目群"},
+        ]
+        summaries = {
+            "c_p2p": {"chat_type": 1, "senders": ["me1", "peer1"]},
+            "c_grp": {"chat_type": 2, "senders": ["u1", "u2"]},
+        }
+        report = self.messages.harvest_chat_names(rows, summaries=summaries, my_id="me1")
+        names = self.messages._load_names()
+        self.assertEqual(names["chats"]["c_p2p"], "张伟")
+        self.assertEqual(names["chats"]["c_grp"], "项目群")
+        self.assertEqual(names["users"]["peer1"], "张伟")
+        self.assertEqual(report["peer_names"], 1)
+        # group chat names must not become user names
+        self.assertNotIn("u1", names["users"])
+
+    def test_harvest_chat_names_ambiguous_p2p_skipped(self):
+        rows = [{"chat_id": "c_p2p", "name": "某人"}]
+        summaries = {"c_p2p": {"chat_type": 1, "senders": ["a", "b", "c"]}}
+        self.messages.harvest_chat_names(rows, summaries=summaries, my_id="me1")
+        self.assertEqual(self.messages._load_names()["users"], {})
+
+
+class TestSearchPageLimit(unittest.TestCase):
+    """Bug: thread/history failed outright when a search needed >8 pages."""
+
+    def test_page_limit_degrades_to_partial_result(self):
+        import asyncio
+        from _feishu import gateway, config
+
+        async def fake_page(chat_id, start, end, from_id, mention_user_id, page_token):
+            # Server always has another page: the page budget must run out.
+            return {
+                "msg_ids": [f"m-{page_token}-{i}" for i in range(3)],
+                "has_more": True,
+                "page_token": f"{page_token}x",
+            }
+
+        old = config.SEARCH_MAX_PAGES
+        config.SEARCH_MAX_PAGES = 2
+        try:
+            with patch.object(gateway, "search_msg_ids_page", fake_page):
+                res = asyncio.run(gateway.search_msg_ids("c1", 0, 0, limit=200))
+        finally:
+            config.SEARCH_MAX_PAGES = old
+        self.assertTrue(res["page_limit_hit"])
+        self.assertTrue(res["has_more"])
+        self.assertEqual(len(res["msg_ids"]), 6)  # 2 pages x 3 ids, not an error
+
+    def test_within_budget_has_no_page_limit_flag(self):
+        import asyncio
+        from _feishu import gateway
+
+        async def fake_page(chat_id, start, end, from_id, mention_user_id, page_token):
+            return {"msg_ids": ["m1", "m2"], "has_more": False, "page_token": ""}
+
+        with patch.object(gateway, "search_msg_ids_page", fake_page):
+            res = asyncio.run(gateway.search_msg_ids("c1", 0, 0, limit=30))
+        self.assertFalse(res["page_limit_hit"])
+        self.assertFalse(res["has_more"])
 
 
 if __name__ == "__main__":

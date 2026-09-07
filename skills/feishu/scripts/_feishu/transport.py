@@ -140,6 +140,14 @@ def classify(method: str, url: str, gateway_cmd: int = 0) -> str:
             return "allow"
         return "deny"
 
+    # Message media (image/audio/video keys) — route shape observed from the
+    # real web client and verified with a live key on 2026-09-07
+    # (media-observe probe: 200 image/jpeg for an own-message img_v3 key).
+    if host == "internal-api-lark-file.feishu.cn":
+        if path.startswith("/static-resource/v1/") and method == "GET":
+            return "allow"
+        return "deny"
+
     if host == _domain:
         if method == "GET" and (
             path.startswith("/space/api/explorer/")

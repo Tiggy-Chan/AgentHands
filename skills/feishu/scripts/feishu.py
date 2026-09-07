@@ -172,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=30)
 
     p = sub.add_parser("probe", help="安全抓取网页接口元数据（不保存正文或凭证）")
-    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "all"], default="all")
+    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "media-observe", "all"], default="all")
     p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
     p.add_argument("--msg-id", default="", help="message-media probe 使用的消息 ID")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
@@ -351,6 +351,14 @@ async def _run(args) -> int:
         elif fmt == "json":
             emit_json(evs)
         else:
+            # Events are stored without display names; resolve from the cache
+            # (whoami-seeded self + DOM-harvested chat/peer names) at render.
+            # This handler runs before auth.prepare, so my_id comes from the
+            # daemon state file (offline-friendly).
+            msg_evs = [e for e in evs if e.get("kind", "message") == "message"]
+            my_id, my_name = chats._daemon_identity()
+            await messages.resolve_names(msg_evs, my_id=my_id, my_name=my_name)
+            messages.apply_direction(msg_evs, my_id)
             emit(messages.render_markdown(evs, title="事件池") if evs
                  else "（事件池为空——先 feishu.py daemon start 攒消息）")
         return 0
@@ -465,7 +473,8 @@ async def _run(args) -> int:
                 message_resources.fetch_message(args.msg_id),
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
-            await messages.resolve_names([message])
+            await messages.resolve_names([message], my_id=me["user_id"], my_name=me.get("name", ""))
+            messages.apply_direction([message], me["user_id"])
         if fmt == "json":
             emit_json(messages.render_json([message])[0])
         else:
@@ -554,14 +563,20 @@ async def _run(args) -> int:
                     parse_when(args.since) // 1000 if parse_when(args.since) else 0,
                     parse_when(args.until) // 1000 if parse_when(args.until) else 0,
                     limit=args.limit,
+                    my_id=me["user_id"],
+                    my_name=me.get("name", ""),
                 ),
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
         if fmt == "json":
-            emit_json({"messages": messages.render_json(res["messages"]), "has_more": res["has_more"]})
+            emit_json({"messages": messages.render_json(res["messages"]), "has_more": res["has_more"],
+                       "page_limit_hit": res.get("page_limit_hit", False)})
         else:
             emit(messages.render_markdown(res["messages"], title=f"群 {args.chat_id} 历史"))
-            if res["has_more"]:
+            if res.get("page_limit_hit"):
+                note(f"（消息太多，搜索到达 {config.SEARCH_MAX_PAGES} 页上限，以上是部分结果；"
+                     "收窄时间窗可拿全，或设 FEISHU_SEARCH_MAX_PAGES 提高页数上限）")
+            elif res["has_more"]:
                 note("（还有更多，调大 --limit 或收窄时间窗）")
         return 0
 
@@ -577,6 +592,7 @@ async def _run(args) -> int:
                     parse_when(args.since) // 1000 if parse_when(args.since) else 0,
                     parse_when(args.until) // 1000 if parse_when(args.until) else 0,
                     limit_per_chat=args.limit,
+                    my_name=me.get("name", ""),
                 ),
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
@@ -592,7 +608,8 @@ async def _run(args) -> int:
     if args.cmd == "thread":
         with query_lock.acquire("thread"):
             ctx = await asyncio.wait_for(
-                context.thread_context(args.msg_id, window_min=args.window, limit=args.limit),
+                context.thread_context(args.msg_id, window_min=args.window, limit=args.limit,
+                                       my_id=me["user_id"], my_name=me.get("name", "")),
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
         emit_json(ctx) if fmt == "json" else emit(context.render_markdown(ctx))

@@ -12,10 +12,25 @@ import re
 import time
 from datetime import datetime
 
-from . import event_store, gateway
+from . import event_store, gateway, messages
 from . import config
 from .errors import EndpointNotAdapted, ResourceIsolationUnavailable
 from .messages import _CHAT_TYPE
+
+
+def _daemon_my_id() -> str:
+    """my_user_id recorded by the running daemon; '' when never seen."""
+    return _daemon_identity()[0]
+
+
+def _daemon_identity() -> tuple[str, str]:
+    """(my_user_id, my_name) recorded by the daemon; ('', '') when unseen."""
+    try:
+        import json
+        state = json.loads(config.DAEMON_STATE.read_text())
+        return str(state.get("my_user_id") or ""), str(state.get("my_name") or "")
+    except Exception:
+        return "", ""
 
 
 async def list_chats(from_events: bool = False) -> list[dict]:
@@ -42,11 +57,11 @@ async def list_chats(from_events: bool = False) -> list[dict]:
         cur["last_time"] = summary.get("last_time", 0)
         cur["last_text"] = summary.get("last_text", "")[:60]
     chats = sorted(seen.values(), key=lambda c: -c["last_time"])
+    cached_names = messages._load_names()["chats"]
     for c in chats:
-        try:
-            c["name"] = await gateway.get_group_name(c["chat_id"])
-        except Exception:
-            c["name"] = ""
+        # cmd=64 is dead tenant-side; names come from the cache (seeded by
+        # the browser provider harvest) instead of a live lookup.
+        c["name"] = cached_names.get(c["chat_id"], "")
     return chats
 
 
@@ -185,6 +200,9 @@ async def _list_from_browser_impl() -> list[dict]:
         row["completeness"] = "ui_snapshot"
         row["pagination_observed"] = not has_more_marker
         row["last_message_time"] = row.get("last_time", 0)
+    # Feed the display names back into the name cache; for known p2p chats the
+    # conversation title is the peer's name (cmd=64/5023 are dead tenant-side).
+    messages.harvest_chat_names(list(rows.values()), summaries=cached, my_id=_daemon_my_id())
     return sorted(rows.values(), key=lambda row: (-row.get("last_time", 0), row.get("name", "")))
 
 

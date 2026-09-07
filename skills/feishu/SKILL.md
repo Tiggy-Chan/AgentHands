@@ -44,7 +44,7 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
-| `probe --scope chats|docs-search|mail|calendar|message-media|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证 |
+| `probe --scope chats|docs-search|mail|calendar|message-media|media-observe|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证 |
 | `mail list|search|get` | 读邮件，结果来自稳定接口或受控 DOM，并带 source/complete |
 | `mail send|reply` | 默认只产邮件草稿；受控写接口确认后才可能执行 |
 | `calendar list|get` | 读会议和日历事件，默认不缓存正文 |
@@ -117,9 +117,15 @@ daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）
   `$FEISHU_HOME/venv` 装 playwright+protobuf+httpx+websockets。浏览器二进制复用
   playwright 全局缓存 `~/.cache/ms-playwright`。
 - **消息搜索时间参数已在当前租户验证为 epoch 秒**；输入层仍接受秒/毫秒并统一转换。
-- cmd=64/5023（群名/用户名）的响应是 UserInfo proto，字段号没收进 vendor，
-  名字是 wire-walk 启发式取的，**可能取到空串或错串**——输出里名字缺失是正常的，
-  别编一个。
+- cmd=64/5023（群名/用户名）**2026-09-07 实测已失效**（payloadType=5 空响应）。
+  发送者角色由 whoami user_id 确定性标注（p2p 显示「我/对方」，不可能判反）；
+  显示名来自 whoami（自己）+ Messenger DOM 会话名反哺缓存（p2p 会话名=对方名字）。
+  名字缺失时显示 id，**别编一个**。
+- 消息图片/音频/视频是 **AES-256-GCM 加密**的，密钥在消息 content 里（进程内私有），
+  下载管线透明解密。消息文件（file_v3_ key）的下载路由还没找到（两个候选都 4xx），
+  报 404 是已知缺口，不是账号问题。
+- 消息量大的群搜索到 8 页上限时**降级为部分结果**并明确标记，不再整体失败；
+  要拿全就收窄时间窗或设 `FEISHU_SEARCH_MAX_PAGES`。
 - `chats` 当前通过短生命周期 Messenger 浏览器读取会话卡片；结果会标记
   `source=browser_dom`、`completeness=ui_snapshot` 且 `complete=false`。不要把网页快照
   误称为永久全量。邮件/日历/远程文档搜索也遵循同样规则。
@@ -127,8 +133,9 @@ daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）
   `opaque` 表示已取得但类型未适配，`unavailable` 表示没有可用资源接口，`truncated` 表示达到上限。
 - `probe --scope message-media --msg-id <msg_id>` 只检查该消息的资源元数据和已登记 adapter，
   不下载附件、不保存正文；缺少 `--msg-id` 时拒绝执行。
-- `media` 只使用已登记的资源接口。文件/云文件复用已验证的 Drive stream；图片、音频、视频等
-  租户专用接口必须先经受控 probe 观察，未登记时明确失败关闭。
+- `media` 只使用已登记的资源接口。文件/云文件复用已验证的 Drive stream；图片走
+  已验证的 static-resource 路由（含透明 AES-256-GCM 解密）；音频/视频/贴纸必须先
+  经受控 probe 观察，未登记时明确失败关闭。
 - `probe` 只记录请求元数据；它可以发现新的 command，但不能把响应正文、Cookie、ticket
   或 access key 写进 fixture。不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
 - WS 重连可能重发消息：写入端按 msg_id 去重，读取端 `events` 再去一次。

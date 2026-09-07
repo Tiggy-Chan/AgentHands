@@ -34,21 +34,23 @@ def _clean_message(message: dict) -> dict:
         "mentions", "mention_user_ids", "resources", "nested_messages", "state",
         "decode", "decode_status", "complete", "parent_id", "root_id", "thread_id",
         "is_removed", "is_truncated", "at_out_chatter_ids", "at_me_server", "from_name",
-        "chat_name",
+        "chat_name", "is_me", "direction", "name_status",
     )
     return {key: safe[key] for key in fields if key in safe}
 
 
-async def thread_context(msg_id: str, window_min: int = 15, limit: int = 60) -> dict:
+async def thread_context(msg_id: str, window_min: int = 15, limit: int = 60,
+                         my_id: str = "", my_name: str = "") -> dict:
     if not 0 <= window_min <= config.MAX_THREAD_WINDOW_MINUTES:
         raise ValueError(f"thread window 必须在 0..{config.MAX_THREAD_WINDOW_MINUTES} 分钟之间")
     if not 1 <= limit <= config.CONTEXT_MAX_MESSAGES:
         raise ValueError(f"thread limit 必须在 1..{config.CONTEXT_MAX_MESSAGES} 之间")
 
-    return await _thread_context(msg_id, window_min, limit)
+    return await _thread_context(msg_id, window_min, limit, my_id=my_id, my_name=my_name)
 
 
-async def _thread_context(msg_id: str, window_min: int, limit: int) -> dict:
+async def _thread_context(msg_id: str, window_min: int, limit: int,
+                          my_id: str = "", my_name: str = "") -> dict:
     targets = await gateway.fetch_messages([msg_id])
     if not targets:
         from .errors import FeishuError
@@ -114,7 +116,8 @@ async def _thread_context(msg_id: str, window_min: int, limit: int) -> dict:
         )
 
     all_msgs = chain + [target] + replies + context
-    await messages.resolve_names(all_msgs)
+    await messages.resolve_names(all_msgs, my_id=my_id, my_name=my_name)
+    messages.apply_direction(all_msgs, my_id)
 
     result = {
         "target": target,
@@ -126,6 +129,7 @@ async def _thread_context(msg_id: str, window_min: int, limit: int) -> dict:
         "missing_parent_ids": missing,
         "truncated": bool(res["has_more"]) or reply_scan_has_more,
         "reply_scan_has_more": reply_scan_has_more,
+        "page_limit_hit": bool(res.get("page_limit_hit")),
         "search_window": {
             "start": fmt_ts(create_s - half),
             "end": fmt_ts(create_s + half),
@@ -241,6 +245,9 @@ def render_markdown(ctx: dict) -> str:
     parts += block("同群前后消息", ctx["window"])
     if ctx["missing_parent_ids"]:
         parts.append(f"\n> ⚠️ 缺父消息：{', '.join(ctx['missing_parent_ids'])}")
-    if ctx["truncated"]:
+    if ctx.get("page_limit_hit"):
+        parts.append(f"\n> ⚠️ 消息量超过 {config.SEARCH_MAX_PAGES} 页搜索上限，以上为部分结果"
+                     "（收窄 --window 或设 FEISHU_SEARCH_MAX_PAGES 提高上限）")
+    elif ctx["truncated"]:
         parts.append("\n> ⚠️ 消息搜索达到有界上限（has_more），上下文可能不全")
     return "\n".join(parts)

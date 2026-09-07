@@ -22,6 +22,10 @@ _TOKEN_RE = re.compile(r"^[^\s\x00]{1,4096}$")
 _MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9:_-]{1,256}$")
 _MAX_OUT_NAME = 255
 _KNOWN_DOWNLOAD_KINDS = frozenset({"file", "cloud_file", "document"})
+# Kinds served by the tenant's static-resource route (observed from the real
+# web client; verified 200 + image/jpeg with a live img_v3 key on 2026-09-07).
+_STATIC_RESOURCE_KINDS = frozenset({"image", "audio", "media", "attachment"})
+_STATIC_RESOURCE_HOST = "https://internal-api-lark-file.feishu.cn"
 _DIRECT_HOSTS = frozenset({urlsplit(DRIVE_STREAM).netloc, config.DOMAIN, "www.feishu.cn"})
 
 
@@ -36,6 +40,39 @@ def _resource_data(message: dict, resource: dict) -> bytes:
     private = message.get("_resource_data") or {}
     value = private.get(rid) or resource.get("_data") or b""
     return value if isinstance(value, bytes) else b""
+
+
+def _resource_crypto(message: dict, resource: dict) -> dict:
+    """In-process AES-256-GCM material for tenant-encrypted media blobs."""
+    rid = str(resource.get("resource_id") or "")
+    private = message.get("_resource_crypto") or {}
+    value = private.get(rid) or resource.get("_crypto") or {}
+    if not isinstance(value, dict):
+        return {}
+    if value.get("algo") != "aes-256-gcm":
+        return {}
+    key_hex, nonce_hex = str(value.get("key") or ""), str(value.get("nonce") or "")
+    if len(key_hex) != 64 or len(nonce_hex) != 24:
+        return {}
+    return {"key": key_hex, "nonce": nonce_hex}
+
+
+def _decrypt_in_place(path: Path, crypto: dict) -> None:
+    """AES-256-GCM decrypt a downloaded media blob (tag = last 16 bytes)."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    from .output import register_secret
+
+    register_secret(crypto["key"])
+    register_secret(crypto["nonce"])
+    blob = path.read_bytes()
+    if len(blob) <= 16:
+        raise ResourceError("加密媒体数据过短，无法校验完整性")
+    plain = AESGCM(bytes.fromhex(crypto["key"])).decrypt(
+        bytes.fromhex(crypto["nonce"]), blob, None
+    )
+    path.write_bytes(plain)
+    os.chmod(path, 0o600)
 
 
 async def fetch_message(msg_id: str) -> dict:
@@ -97,6 +134,7 @@ def select_resource(message: dict, resource_id_value: str = "") -> dict:
                 selected = dict(resource)
                 selected["_key"] = _resource_key(message, resource)
                 selected["_data"] = _resource_data(message, resource)
+                selected["_crypto"] = _resource_crypto(message, resource)
                 if not selected["_key"] and not selected["_data"]:
                     raise EndpointNotAdapted("消息资源只有元数据，尚未取得可下载的资源 key")
                 return selected
@@ -106,6 +144,7 @@ def select_resource(message: dict, resource_id_value: str = "") -> dict:
     selected = dict(resources[0])
     selected["_key"] = _resource_key(message, resources[0])
     selected["_data"] = _resource_data(message, resources[0])
+    selected["_crypto"] = _resource_crypto(message, resources[0])
     if not selected["_key"] and not selected["_data"]:
         raise EndpointNotAdapted("消息资源只有元数据，尚未取得可下载的资源 key")
     return selected
@@ -122,6 +161,11 @@ def _url_for(resource: dict) -> str:
     # tenant-specific route is observed by probe it must be added explicitly.
     if kind in _KNOWN_DOWNLOAD_KINDS:
         return f"{DRIVE_STREAM}/space/api/box/stream/download/all/{quote(key, safe='')}/"
+
+    # Message media keys (img_v3_…/audio_v3_…/media_v3_…).  The trailing "~"
+    # is the exact observed form; query params are only used for stickers.
+    if kind in _STATIC_RESOURCE_KINDS:
+        return f"{_STATIC_RESOURCE_HOST}/static-resource/v1/{quote(key, safe='')}~"
 
     # A post may contain an absolute, already-rendered image URL.  Permit it
     # only for the small host set already covered by transport policy; signed
@@ -247,6 +291,12 @@ async def download_resource(
                         digest.update(chunk)
                     f.flush()
                     os.fsync(f.fileno())
+        crypto = resource.get("_crypto") or {}
+        if crypto and total:
+            _decrypt_in_place(temp, crypto)
+            total = temp.stat().st_size
+            digest = hashlib.sha256(temp.read_bytes())
+            content_type = ""  # re-sniff below; the ciphertext claimed a mime
         if total > config.MEDIA_JOB_MAX_BYTES:
             raise ResourceError("媒体任务超过总输入大小上限")
         sniffed = _sniff_mime(temp)

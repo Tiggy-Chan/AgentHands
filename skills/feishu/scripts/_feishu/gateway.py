@@ -25,6 +25,7 @@ from . import config, transport
 from .errors import FeishuError
 from .message_decode import decode_message
 from .message_model import build_envelope
+from .output import note
 
 
 def _rid(tag: str = "") -> str:
@@ -160,6 +161,7 @@ async def search_msg_ids(
     all_ids: list[str] = []
     page_token = ""
     has_more = False
+    page_limit_hit = False
     seen_tokens: set[str] = set()
     for _page_no in range(config.SEARCH_MAX_PAGES):
         if len(all_ids) >= limit:
@@ -182,18 +184,49 @@ async def search_msg_ids(
             raise FeishuError("消息搜索分页 token 无效，已停止以避免无限请求")
         page_token = next_token
     else:
-        raise FeishuError(
-            f"消息搜索超过 {config.SEARCH_MAX_PAGES} 页，已停止以保护主机",
-            hint="收窄时间窗或降低 --limit",
-        )
+        # Page budget exhausted while the server still has more.  Degrade to a
+        # partial, clearly-flagged result instead of failing the whole query —
+        # callers mark the output incomplete (thread) or note it (history).
+        page_limit_hit = True
+        has_more = True
     all_ids = list(dict.fromkeys(all_ids))[:limit]
-    return {"msg_ids": all_ids, "has_more": has_more or len(all_ids) >= limit}
+    return {
+        "msg_ids": all_ids,
+        "has_more": has_more or len(all_ids) >= limit or page_limit_hit,
+        "page_limit_hit": page_limit_hit,
+    }
 
 
 # --- cmd 64 / 5023: name resolution -----------------------------------------
 # lark-cli showed the request shapes; the response is a UserInfo proto whose
 # exact field numbers we don't vendor, so names are extracted by a wire walk
 # and picked heuristically. Best-effort: verify against real sessions.
+#
+# 2026-09-07 实测：当前租户对 cmd=64/5023 一律回 payloadType=5 的空 Packet
+# （无 payload）。继续重试只会刷屏，所以观察到一次后进程内短路，名字改由
+# whoami（自己）+ Messenger DOM 会话名（chats 命令反哺缓存）提供。
+
+_NAME_ENDPOINT = {"dead": False, "noted": False}
+
+
+def _name_endpoint_dead() -> bool:
+    return _NAME_ENDPOINT["dead"]
+
+
+def _mark_name_endpoint_dead(cmd: int) -> None:
+    _NAME_ENDPOINT["dead"] = True
+    if not _NAME_ENDPOINT["noted"]:
+        _NAME_ENDPOINT["noted"] = True
+        note(f"cmd={cmd} 名字接口在当前租户无有效响应，本次运行改用缓存/DOM 名字来源")
+
+
+def _name_payload(pkt: dict, cmd: int) -> bytes:
+    """Return the UserInfo payload, or mark the endpoint dead and return b''."""
+    pl = pkt.get("payload", b"")
+    if pl and pkt.get("payloadType") in (None, 1, 2):
+        return pl
+    _mark_name_endpoint_dead(cmd)
+    return b""
 
 def _walk_strings(
     data: bytes,
@@ -271,20 +304,24 @@ def _pick_name(candidates: list[str]) -> str:
 
 
 async def get_group_name(chat_id: str) -> str:
-    """cmd=64 → group display name (best effort)."""
+    """cmd=64 → group display name (best effort; '' when endpoint is dead)."""
+    if _name_endpoint_dead():
+        return ""
     req = b"\x0a" + _ev(len(chat_id)) + chat_id.encode()
     data = await transport.gateway_call(64, req, _rid("g"))
-    pl = _parse_reply_packet(data).get("payload", b"")
+    pl = _name_payload(_parse_reply_packet(data), 64)
     return _pick_name(_walk_strings(pl)) if pl else ""
 
 
 async def get_user_name(user_id: str, chat_id: str = "0") -> str:
-    """cmd=5023 → user display name (best effort)."""
+    """cmd=5023 → user display name (best effort; '' when endpoint is dead)."""
+    if _name_endpoint_dead():
+        return ""
     try:
         uid, cid = int(user_id), int(chat_id) if str(chat_id).isdigit() else 0
     except (TypeError, ValueError):
         return ""
     req = b"\x08" + _ev(uid) + b"\x10" + _ev(cid) + b"\x18\x01"
     data = await transport.gateway_call(5023, req, _rid("u"))
-    pl = _parse_reply_packet(data).get("payload", b"")
+    pl = _name_payload(_parse_reply_packet(data), 5023)
     return _pick_name(_walk_strings(pl)) if pl else ""

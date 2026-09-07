@@ -221,6 +221,34 @@ async def _keepalive(cookies: dict, domain: str, stop: asyncio.Event) -> None:
             note(f"  ! keepalive 失败（不致命）：{scrubbed_exc(e)}")
 
 
+class _StorageLocked(Exception):
+    """Encryption keyring locked (e.g. daemon started before desktop login).
+
+    Handled by dropping the WebSocket (un-ACKed messages are re-pushed on
+    reconnect) and waiting for the key instead of exiting — systemd is
+    configured to *not* restart on exit 3, so exiting here used to leave the
+    daemon dead until someone noticed.
+    """
+
+
+async def _wait_for_storage_unlock(stop: asyncio.Event) -> None:
+    """Poll until the encrypted event store becomes writable; give up after
+    ~20 minutes (then exit 3 so the failure is loud, not silent)."""
+    for _ in range(40):
+        if stop.is_set():
+            return
+        storage = event_store.prepare_storage()
+        if storage.get("encrypted") or not storage.get("encrypted_store_locked"):
+            note("  ✓ 事件池密钥已恢复，继续写入")
+            _write_state(last_error="")
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+    raise SystemExit(3)
+
+
 async def run_async() -> None:
     config.ensure_home()
     lock_fd = open(config.DAEMON_LOCK, "w")
@@ -262,51 +290,57 @@ async def run_async() -> None:
     ka = asyncio.create_task(_keepalive(cookies, data.get("domain") or config.DOMAIN, stop))
     context_task = asyncio.create_task(_context_worker(context_queue, stop, my_id))
     try:
-        async for m in listener.listen(
-            cookie_header, cookies, None, data.get("domain") or config.DOMAIN, ""
-        ):
-            if m["msg_id"] in seen:
+        while not stop.is_set():
+            try:
+                async for m in listener.listen(
+                    cookie_header, cookies, None, data.get("domain") or config.DOMAIN, ""
+                ):
+                    if m["msg_id"] in seen:
+                        continue
+                    seen.add(m["msg_id"])
+                    seen_order.append(m["msg_id"])
+                    while len(seen) > config.MAX_SEEN_MSG_IDS:
+                        seen.discard(seen_order.popleft())
+                    if m.get("is_removed"):
+                        continue  # tombstones carry no content
+                    if not _should_store(m, my_id):
+                        continue
+                    ev = _build_event(m, my_id)
+                    if event_store.append_event(ev) is False:
+                        storage_state = event_store.storage_status()
+                        if storage_state.get("encrypted_store_locked"):
+                            _write_state(ws_connected=False,
+                                         last_error="event encryption key unavailable")
+                            _notify("飞书事件池密钥不可用，daemon 等待密钥环解锁（不退出）")
+                            raise _StorageLocked()
+                        _write_state(ws_connected=False, last_error="event storage quota reached")
+                        _notify("飞书事件池已达到磁盘配额，daemon 暂停写入")
+                        raise SystemExit(3)
+                    written += 1
+                    _write_state(
+                        last_event_at=ev["received_at"], events_written=written, ws_connected=True
+                    )
+                    if ev["at_me"]:
+                        _notify(f"有人在群里 @ 了你：{ev['text'][:80] or '[非文本消息]'}")
+                    if ev["at_me"] or ev.get("chat_type") == 1:
+                        try:
+                            context_queue.put_nowait(ev)
+                        except asyncio.QueueFull:
+                            event_store.append_event({
+                                "schema": 2,
+                                "kind": "mention_context_error",
+                                "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                "trigger_msg_id": ev["msg_id"],
+                                "chat_id": ev.get("chat_id", ""),
+                                "complete": False,
+                                "truncated": False,
+                                "error": "context_queue_full",
+                            })
+            except _StorageLocked:
+                # listener.listen exited → WS closed → un-ACKed messages will
+                # be re-pushed when we reconnect after the key comes back.
+                await _wait_for_storage_unlock(stop)
                 continue
-            seen.add(m["msg_id"])
-            seen_order.append(m["msg_id"])
-            while len(seen) > config.MAX_SEEN_MSG_IDS:
-                seen.discard(seen_order.popleft())
-            if m.get("is_removed"):
-                continue  # tombstones carry no content
-            if not _should_store(m, my_id):
-                continue
-            ev = _build_event(m, my_id)
-            if event_store.append_event(ev) is False:
-                storage_state = event_store.storage_status()
-                if storage_state.get("encrypted_store_locked"):
-                    reason = "event encryption key unavailable"
-                    message = "飞书事件池密钥不可用，daemon 暂停写入"
-                else:
-                    reason = "event storage quota reached"
-                    message = "飞书事件池已达到磁盘配额，daemon 暂停写入"
-                _write_state(ws_connected=False, last_error=reason)
-                _notify(message)
-                raise SystemExit(3)
-            written += 1
-            _write_state(
-                last_event_at=ev["received_at"], events_written=written, ws_connected=True
-            )
-            if ev["at_me"]:
-                _notify(f"有人在群里 @ 了你：{ev['text'][:80] or '[非文本消息]'}")
-            if ev["at_me"] or ev.get("chat_type") == 1:
-                try:
-                    context_queue.put_nowait(ev)
-                except asyncio.QueueFull:
-                    event_store.append_event({
-                        "schema": 2,
-                        "kind": "mention_context_error",
-                        "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                        "trigger_msg_id": ev["msg_id"],
-                        "chat_id": ev.get("chat_id", ""),
-                        "complete": False,
-                        "truncated": False,
-                        "error": "context_queue_full",
-                    })
     except AuthRequired:
         _notify("飞书会话已过期，请重新运行 feishu.py login")
         _write_state(ws_connected=False, last_error="auth expired")

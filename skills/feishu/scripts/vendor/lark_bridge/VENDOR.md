@@ -52,6 +52,11 @@
 11. **`decoder.py`**：补充飞书当前 `type=2` 富文本消息的 protobuf 字段 2
    HTML 解码，提取可见文本、图片占位和 `<at user_id=...>` mention；原先
    只识别 `type=4/14`，会把这类正文误报为 `nontext`。
+12. **`proto.proto` 的 `Content` schema 对本租户 FILE/IMAGE 消息字段错位**
+   （2026-09-07 wire dump 实证：FILE 的 f2 是文件名而非 imageKey；IMAGE 的
+   f2 是嵌套描述符而非字符串）。skill 侧 `_feishu/message_decode.py` 已对
+   type=3/5 走自验证的 wire 级解析，proto 派生的媒体 key 一律过合理性检查；
+   上游 proto 未改，升级时注意不要把这套 workaround 删了。
 
 ## 升级步骤
 

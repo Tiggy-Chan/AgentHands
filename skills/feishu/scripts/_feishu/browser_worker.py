@@ -35,6 +35,7 @@ _OPERATIONS = frozenset({
     "docs-search",
     "probe",
     "message-media-probe",
+    "media-observe",
     "mail-list",
     "mail-search",
     "mail-get",
@@ -55,7 +56,10 @@ def _systemd_user_available() -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return result.returncode == 0 and result.stdout.strip() in {"running", "degraded"}
+    # is-system-running exits non-zero for "degraded" (any failed user unit,
+    # e.g. feishu-daemon itself).  Degraded still runs transient services
+    # fine, so decide on the reported state, not the exit code.
+    return result.stdout.strip() in {"running", "degraded"}
 
 
 def _worker_python() -> str:
@@ -194,6 +198,10 @@ async def _dispatch(operation: str, payload: dict) -> dict:
         from . import auth, message_resources
         await auth.prepare()
         return await message_resources.probe_metadata(str(payload.get("msg_id", "")))
+    if operation == "media-observe":
+        from . import probe as probe_mod
+        return await probe_mod._media_observe_impl(
+            str(payload.get("msg_id", "")), bool(payload.get("headed", False)))
     if operation.startswith("mail-"):
         from . import mail
         return await mail.browser_operation(operation[5:], payload)

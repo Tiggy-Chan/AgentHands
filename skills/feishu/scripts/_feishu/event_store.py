@@ -344,7 +344,13 @@ def chat_summaries(max_chats: int = 20_000) -> dict[str, dict]:
             "chat_type": ev.get("chat_type", 0),
             "last_time": 0,
             "last_text": "",
+            "senders": [],
         })
+        from_id = str(ev.get("from_id") or "")
+        # Bounded distinct-sender set: lets p2p chats identify "the peer"
+        # (the one sender that is not me) without scanning events again.
+        if from_id and from_id not in current["senders"] and len(current["senders"]) < 4:
+            current["senders"].append(from_id)
         stamp = _event_time_ms(ev)
         if stamp >= current["last_time"]:
             current["last_time"] = stamp

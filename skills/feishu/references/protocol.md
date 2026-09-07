@@ -25,11 +25,39 @@ body 是 `Packet{cmd, payload, cid}` 序列化。
 | cmd | 用途 | payload | 状态 |
 |---|---|---|---|
 | 5 | 发消息 | `PutMessageRequest` | 已按 lark-bridge 实现；**双重闸门后可用** |
-| 8 | 按 id 批量取消息 | 重复 field1 = msg_id | 已验证（开源实现） |
+| 8 | 按 id 批量取消息 | 重复 field1 = msg_id | 已验证（开源实现 + 本租户实测） |
 | 13 | 建私聊 | `PutChatRequest` | **永久拒绝** |
-| 64 | 群名 | field1 string chatId | 响应是 UserInfo proto，字段号未收，wire-walk 启发式取名，**待验证** |
-| 5023 | 用户名 | f1 varint userId, f2 varint chatId, f3=1 | 同上，**待验证** |
+| 64 | 群名 | field1 string chatId | **2026-09-07 实测已失效**：当前租户回 `payloadType=5` 空 Packet |
+| 5023 | 用户名 | f1 varint userId, f2 varint chatId, f3=1 | 同上，**已失效**。名字改由 whoami（自己）+ Messenger DOM 会话名（chats 反哺缓存，p2p 会话名=对方名字）提供 |
 | 11021 | 消息搜索 | chat/时间段/发送人/**mention_user_id** | 分页 token 是 JSON；时间参数已在 2026-08-31 当前租户用 epoch 秒实测可用 |
+
+**消息归属（2026-09-07 起）**：发送者角色不靠名字解析——`is_me`/`direction` 由
+whoami user_id 与 fromId 比对得出，p2p 会话渲染为「我/对方」，名字缺失只影响
+显示、不会判反角色。历史缓存里的错误名字（如全量 "xi tong xiao xi"）会被
+denylist 与同名 ≥3 用户规则自动清除。
+
+**Content 字段布局（2026-09-07 原始 wire dump 验证，vendor schema 对 FILE/IMAGE 错位）**：
+
+- FILE (type 3)：f1 str = key（`file_v3_<shard>_<uuid>g`）、f2 str = 文件名、
+  f3 varint = 字节数、f4 str = mime、f7 str = 区域标记（`eu_nc`）。
+  vendor 的 Content 会把 f2 文件名读成 imageKey、f4 mime 读成 attachments ——
+  解码器已按上述布局走 wire 级解析，proto 派生的媒体 key 一律过合理性检查。
+- IMAGE (type 5)：f2 nested { f1 str = key（`img_v3_<shard>_<uuid>g`）、
+  f2 str = 区域（`eu_nc-cdn`）、f3 nested 加密材料 { f2 { f1 32B AES-256 key,
+  f2 12B GCM nonce } }、f4 repeated 尺寸变体 { f1 slot, f2 { f1 宽, f2 高 } }
+  （slot=1 为原图）}；根 f4 varint = 字节数。
+- **消息媒体是 AES-256-GCM 加密的**（tag=密文最后 16B）。下载管线在
+  `message_resources._decrypt_in_place` 透明解密；密钥只存在进程内
+  `_resource_crypto`，绝不进公开输出/事件池/日志。
+
+**媒体下载路由（2026-09-07 media-observe probe 实测）**：
+
+| 种类 | 路由 | 状态 |
+|---|---|---|
+| image/audio/video (img_v3_/audio_v3_/media_v3_ key) | `GET https://internal-api-lark-file.feishu.cn/static-resource/v1/<完整 key 含前缀>~` | **已验证**：200 + image/jpeg，下载后 AES-256-GCM 解密得到与声明尺寸一致的 JPEG |
+| sticker/头像 | 同路由，query 带 `format/image_size/sticker_format` | 已观察到，未登记（sticker 下载仍失败关闭） |
+| 消息文件 (file_v3_ key) | static-resource 400/404；drive-stream box download 404 | **未找到路由，待观察** |
+| CDN 变体 | `s1-imfile.feishucdn.com/static-resource/v1/...` | 已观察到（免登录 CDN），未使用 |
 
 消息字段（`entities.Message`）：`chatId`/`fromId`/`createTime`/`parentId`/
 `rootId`/`threadId`/`atOutChatterIds`(f38)/`isRemoved`/`isTruncated`/`chatType`
@@ -109,12 +137,22 @@ REST 大多要带 `x-csrftoken: <_csrf_token cookie 值>`（注意：不是 swp_
 
 1. 完整会话列表的稳定 RPC schema（当前 DOM provider 可用，但不保证虚拟列表全量）。
 2. 文档搜索结果对应的稳定 token/URL 字段（当前网页 provider 能返回结果文本）。
-3. cmd=64/5023 的 UserInfo 字段语义；当前仍是 wire-walk 启发式。
+3. ~~cmd=64/5023~~ 已失效（payloadType=5）；如前端恢复名字 RPC 需重新观察。
 4. 邮件列表/详情的稳定 message id 和读 command 字段语义。
 5. 日历事件详情字段、分页语义和读 command 字段语义。
 6. 邮件发送/回复、日历创建/修改的精确写 endpoint 和 payload。
 7. WS ticket/app_key 轮换和长时间断线恢复的更多样本。
-8. 图片、音频、视频和贴纸资源 key 对应的租户专用下载端点；在确认前不得猜路径。
+8. ~~图片下载端点~~ 已登记（static-resource 路由 + AES-256-GCM 解密，2026-09-07 验证）。
+   剩余：audio/video 的 content 布局与加密材料字段（需真实样本）、sticker 路由的
+   query 参数语义、**消息文件（file_v3_ key）的下载路由**（两个候选均 4xx）。
+9. 会话内历史加载的客户端行为：2026-09-07 观察打开会话时只看到 feed 类 command
+   （1011741/1102001/1102002/1102601/1102602/1103941），消息体疑似走本地缓存
+   （IndexedDB）；直接打开老消息所在位置还没有可靠的 UI 路径。
+
+`probe --scope media-observe --msg-id <id>` 是观察媒体流量的受控入口：
+打开目标消息所在会话（deep link → feed 卡片点击 → 消息搜索跳转三段 fallback），
+只记录携带资源 key 的请求元数据与 `/static-resource/` 路由；client 没抓到时会用
+消息自己的 key 对已观察路由做 GET 候选验证（headers-only，不读 body）。
 
 抓包方法（别把凭证落盘）：
 

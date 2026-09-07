@@ -171,6 +171,11 @@ def build_envelope(
         for item in raw_resources
         if item.get("resource_id") and item.get("_data")
     }
+    resource_crypto = {
+        str(item.get("resource_id")): item.get("_crypto")
+        for item in raw_resources
+        if item.get("resource_id") and item.get("_crypto")
+    }
     typed = {
         "code": code,
         "name": type_name(code),
@@ -225,6 +230,8 @@ def build_envelope(
         envelope["_resource_keys"] = resource_keys
     if resource_data:
         envelope["_resource_data"] = resource_data
+    if resource_crypto:
+        envelope["_resource_crypto"] = resource_crypto
     return envelope
 
 

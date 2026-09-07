@@ -25,6 +25,7 @@ async def find_mentions(
     start_time: int = 0,
     end_time: int = 0,
     limit_per_chat: int = 15,
+    my_name: str = "",
 ) -> dict:
     """Search @me in each chat → {'mentions': [...], 'chats_searched': N,
     'chats_failed': [...]}. A chat failing never silently drops the rest."""
@@ -47,7 +48,8 @@ async def find_mentions(
             failed.append(cid)
             note(f"  ! 群 {cid} 的 @我 检索失败：{type(e).__name__}")
     out.sort(key=lambda m: (m.get("create_time") or 0, m["msg_id"]))
-    await messages.resolve_names(out)
+    await messages.resolve_names(out, my_id=my_id, my_name=my_name)
+    messages.apply_direction(out, my_id)
     return {
         "mentions": out,
         "chats_searched": len(chat_ids) - len(failed),

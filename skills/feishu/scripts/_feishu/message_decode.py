@@ -33,6 +33,25 @@ _MAX_NESTED_MESSAGES = 200
 _MAX_WIRE_FIELDS = 128
 _FILE_TOKEN_RE = re.compile(r"^(?:file|file_v3)_[A-Za-z0-9][A-Za-z0-9._:-]{7,4095}$")
 
+# Tenant-verified wire layout (2026-09-07, media-observe probe + raw content
+# dumps on real messages): media keys on the wire look like
+#   img_v3_0215a_<uuid>g      (IMAGE, inside nested field 2)
+#   file_v3_00157_<uuid>g     (FILE, field 1; name/mime/size in fields 2/4/3)
+# and the web client fetches them from /static-resource/v1/<key minus the
+# kind prefix>~ on internal-api-lark-file.feishu.cn / s1-imfile.feishucdn.com.
+_MEDIA_KEY_RE = re.compile(
+    r"\b(?P<prefix>img|image|file|audio|media|video)_v\d+_[A-Za-z0-9]{2,16}_[0-9a-fA-F-]{8,}g~?\b"
+)
+_MEDIA_KIND = {
+    "img": "image", "image": "image", "file": "file",
+    "audio": "audio", "media": "media", "video": "media",
+}
+# The vendored Content proto is misaligned for FILE/IMAGE (a FILE message's
+# field 2 is the file *name*, which the vendored schema reads as imageKey).
+# Proto-derived media keys must therefore pass a plausibility check; anything
+# else (filenames with dots, mime strings, short region tags) is dropped.
+_PROTO_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{16,512}$")
+
 # Kept as a compatibility alias for callers that imported the old constant.
 _TYPE_NAMES = TYPE_NAMES
 
@@ -117,6 +136,160 @@ def _wire_summary(content: bytes) -> dict[str, Any]:
     return {**content_digest(content), "fields": fields}
 
 
+def _try_str(value: Any) -> str:
+    if not isinstance(value, (bytes, bytearray)):
+        return ""
+    try:
+        text = bytes(value).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return ""
+    return text if text.isprintable() and len(text) <= 2048 else ""
+
+
+def _wire_strings(data: bytes, depth: int = 0, out: list[str] | None = None) -> list[str]:
+    """Collect bounded printable strings, recursing into nested fields."""
+    if out is None:
+        out = []
+    if depth > 2 or len(out) >= 64:
+        return out
+    for _fn, wire_type, value in _wire_fields(data):
+        if wire_type != 2 or len(out) >= 64:
+            continue
+        raw = bytes(value)
+        text = _try_str(raw)
+        if text:
+            out.append(text)
+        elif 2 < len(raw) <= 4096:
+            _wire_strings(raw, depth + 1, out)
+    return out
+
+
+def _wire_media_resources(content: bytes) -> list[dict[str, Any]]:
+    """Extract img/file/audio/media keys straight off the wire.
+
+    Type-specific layouts below cover the common cases; this scan is the
+    safety net for kinds whose layout we have not mapped (audio, video,
+    future variants), keyed on the stable ``<kind>_v<N>_<shard>_<uuid>g``
+    shape instead of field numbers.
+    """
+    out: list[dict[str, Any]] = []
+    for text in _wire_strings(content):
+        for match in _MEDIA_KEY_RE.finditer(text):
+            key = match.group(0).rstrip("~")
+            kind = _MEDIA_KIND[match.group("prefix")]
+            _append_resource(out, _resource(kind, key, source=f"content.wire_scan.{kind}"))
+    return out
+
+
+def _plausible_media_key(key: str) -> bool:
+    if not key:
+        return False
+    if _MEDIA_KEY_RE.search(key):
+        return True
+    if urlsplit(key).scheme == "https":
+        return True
+    return bool(_PROTO_KEY_RE.fullmatch(key))
+
+
+def _file_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """FILE (type 3) layout, tenant-verified 2026-09-07:
+    f1 str = key (file_v3_…), f2 str = name, f3 varint = size, f4 str = mime.
+    """
+    key = name = mime = ""
+    size = 0
+    for fn, wire_type, value in _wire_fields(content):
+        if fn == 1 and wire_type == 2:
+            key = _try_str(value)
+        elif fn == 2 and wire_type == 2:
+            name = _try_str(value)
+        elif fn == 3 and wire_type == 0:
+            size = int(value)
+        elif fn == 4 and wire_type == 2:
+            mime = _try_str(value)
+    structured: dict[str, Any] = {}
+    if name:
+        structured["fileName"] = _clip(name, 512)
+    if mime:
+        structured["fileMime"] = _clip(mime, 256)
+    if size:
+        structured["fileSize"] = size
+    structured["field_mapping"] = "tenant-verified-2026-09-07"
+    resources: list[dict[str, Any]] = []
+    if key:
+        _append_resource(resources, _resource(
+            "file", key, name=name, mime=mime, size=size, source="content.file_key"))
+    return structured, resources
+
+
+def _image_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """IMAGE (type 5) layout, tenant-verified 2026-09-07:
+    f2 nested {f1 str key (img_v3_…), f2 str region, f3 nested crypto
+    {f2 nested {f1 32B AES-256 key, f2 12B GCM nonce}}, f4 repeated size
+    variant {f1 varint slot, f2 nested {f1 width, f2 height}}};
+    root f4 varint = bytes.  Media bytes are AES-256-GCM encrypted; the tag
+    is the last 16 bytes of the downloaded blob (verified by decrypting a
+    live download to a valid JPEG matching the declared dimensions).
+    """
+    key = region = ""
+    crypto: dict[str, str] = {}
+    width = height = size = 0
+    for fn, wire_type, value in _wire_fields(content):
+        if fn == 2 and wire_type == 2:
+            for sfn, swt, sval in _wire_fields(bytes(value)):
+                if sfn == 1 and swt == 2:
+                    key = _try_str(sval)
+                elif sfn == 2 and swt == 2:
+                    region = _try_str(sval)
+                elif sfn == 3 and swt == 2:
+                    for cfn, cwt, cval in _wire_fields(bytes(sval)):
+                        if cfn == 2 and cwt == 2:
+                            raw_key = raw_nonce = b""
+                            for kfn, kwt, kval in _wire_fields(bytes(cval)):
+                                if kfn == 1 and kwt == 2 and len(bytes(kval)) == 32:
+                                    raw_key = bytes(kval)
+                                elif kfn == 2 and kwt == 2 and len(bytes(kval)) == 12:
+                                    raw_nonce = bytes(kval)
+                            if raw_key and raw_nonce:
+                                crypto = {
+                                    "algo": "aes-256-gcm",
+                                    "key": raw_key.hex(),
+                                    "nonce": raw_nonce.hex(),
+                                }
+                elif sfn == 4 and swt == 2:
+                    vslot = 0
+                    wh = (0, 0)
+                    for vfn, vwt, vval in _wire_fields(bytes(sval)):
+                        if vfn == 1 and vwt == 0:
+                            vslot = int(vval)
+                        elif vfn == 2 and vwt == 2:
+                            w = h = 0
+                            for dfn, dwt, dval in _wire_fields(bytes(vval)):
+                                if dfn == 1 and dwt == 0:
+                                    w = int(dval)
+                                elif dfn == 2 and dwt == 0:
+                                    h = int(dval)
+                            wh = (w, h)
+                    if vslot == 1 and wh != (0, 0):
+                        width, height = wh
+        elif fn == 4 and wire_type == 0:
+            size = int(value)
+    structured: dict[str, Any] = {}
+    if width and height:
+        structured["image"] = {"width": width, "height": height}
+    if size:
+        structured["imageBytes"] = size
+    if crypto:
+        structured["encryption"] = crypto["algo"]
+    structured["field_mapping"] = "tenant-verified-2026-09-07"
+    resources: list[dict[str, Any]] = []
+    if key:
+        item = _resource("image", key, size=size, source="content.image_key")
+        if item and crypto:
+            item["_crypto"] = crypto
+        _append_resource(resources, item)
+    return structured, resources
+
+
 def _resource(
     kind: str,
     key: str,
@@ -189,29 +362,36 @@ def _parse_content_proto(content: bytes) -> tuple[dict[str, Any], list[dict[str,
         return {}, [], False, []
     structured = _safe_content_fields(obj)
     resources: list[dict[str, Any]] = []
-    _append_resource(resources, _resource("image", obj.imageKey, name="", source="content.imageKey"))
-    _append_resource(
-        resources,
-        _resource(
-            "file",
-            obj.fileKey,
-            name=obj.fileName,
-            mime=obj.fileMime,
-            size=obj.fileSize,
-            source="content.fileKey",
-        ),
+
+    def add_proto_resource(kind: str, key: str, **kwargs) -> None:
+        # The vendored Content field numbers drift per tenant/message type;
+        # a proto-derived media key that cannot be a real key (file name,
+        # mime string, region tag) is dropped instead of becoming a phantom.
+        if not _plausible_media_key(key):
+            return
+        _append_resource(resources, _resource(kind, key, **kwargs))
+
+    add_proto_resource("image", obj.imageKey, name="", source="content.imageKey")
+    add_proto_resource(
+        "file",
+        obj.fileKey,
+        name=obj.fileName,
+        mime=obj.fileMime,
+        size=obj.fileSize,
+        source="content.fileKey",
     )
-    _append_resource(
-        resources,
-        _resource(
-            "audio",
-            obj.audioKey,
-            duration=obj.audioDuration or obj.duration,
-            source="content.audioKey",
-        ),
+    add_proto_resource(
+        "audio",
+        obj.audioKey,
+        duration=obj.audioDuration or obj.duration,
+        source="content.audioKey",
     )
     for index, key in enumerate(obj.attachments):
-        _append_resource(resources, _resource("attachment", key, ordinal=index, source="content.attachments"))
+        add_proto_resource("attachment", key, ordinal=index, source="content.attachments")
+    # Wire scan is the source of truth for tenant media keys; union it in for
+    # kinds the proto mapping missed (and it is what catches future drift).
+    for resource in _wire_media_resources(content):
+        _append_resource(resources, resource)
     if obj.stickerSetId or obj.stickerId:
         _append_resource(
             resources,
@@ -531,6 +711,25 @@ def decode_message(m: dict) -> dict:
             mentions = sorted(set(mentions + card_mentions))
             for resource in card_resources:
                 _append_resource(resources, resource)
+        parsed = bool(text or structured or resources)
+    elif msg_type == 3 and content:
+        # FILE: the vendored Content schema is field-misaligned for this type
+        # (it reads the file name as imageKey and the mime as attachments).
+        # Use the tenant-verified wire layout instead.
+        details, file_resources = _file_details(content)
+        structured.update(details)
+        for resource in file_resources + _wire_media_resources(content):
+            _append_resource(resources, resource)
+        parsed = bool(text or structured or resources)
+        if structured.get("fileName"):
+            text = _clip(structured["fileName"], 512)
+    elif msg_type == 5 and content:
+        # IMAGE: Content.f2 is a nested descriptor the vendored schema reads
+        # as a flat string (decode fails on bad UTF-8).  Wire layout instead.
+        details, image_resources = _image_details(content)
+        structured.update(details)
+        for resource in image_resources + _wire_media_resources(content):
+            _append_resource(resources, resource)
         parsed = bool(text or structured or resources)
     else:
         structured, content_resources, content_parsed, content_errors = _parse_content_proto(content)
