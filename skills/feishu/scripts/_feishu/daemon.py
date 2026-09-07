@@ -23,6 +23,7 @@ from pathlib import Path
 from . import auth, config, event_store, transport
 from .errors import AuthRequired, FeishuError, QueryBusy
 from .message_decode import decode_message
+from .message_model import build_envelope, event_message
 from .output import note, register_secret, scrubbed_exc
 
 _UNIT = "feishu-daemon.service"
@@ -51,6 +52,8 @@ def _build_event(m: dict, my_id: str) -> dict:
     raw = m.get("raw") or {}
     dec = decode_message(raw) if raw else {
         "text": m.get("text", ""), "mention_user_ids": [], "decode_status": "unknown",
+        "semantic_status": "opaque", "msg_type": m.get("type", 0),
+        "structured": {}, "resources": [], "nested_messages": [], "errors": [],
     }
     sources = []
     if m.get("at_me"):
@@ -65,8 +68,23 @@ def _build_event(m: dict, my_id: str) -> dict:
         at_me, confidence = None, "unknown"
     else:
         at_me, confidence = False, "none"
+    if not raw:
+        raw = {
+            "type": m.get("type", 0),
+            "fromId": m.get("from_id", ""),
+            "chatId": m.get("chat_id", ""),
+            "chatType": m.get("chat_type", 0),
+            "createTime": m.get("create_time", 0),
+            "parentId": m.get("parent_id", ""),
+            "rootId": m.get("root_id", ""),
+            "threadId": m.get("thread_id", ""),
+            "isRemoved": m.get("is_removed", False),
+            "isTruncated": m.get("is_truncated", False),
+            "atOutChatterIds": m.get("at_out_chatter_ids", []),
+        }
+    envelope = event_message(build_envelope(m.get("msg_id", ""), raw, dec, at_me_server=m.get("at_me")))
     return {
-        "schema": 1,
+        "schema": 2,
         "kind": "message",
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "msg_id": m.get("msg_id", ""),
@@ -86,6 +104,11 @@ def _build_event(m: dict, my_id: str) -> dict:
         "at_me_sources": sources,
         "is_from_me": bool(my_id) and m.get("from_id") == my_id,
         "decode_status": dec.get("decode_status", "unknown"),
+        "resources": envelope.get("resources", []),
+        "nested_messages": envelope.get("nested_messages", []),
+        "decode": envelope.get("decode", {}),
+        "complete": envelope.get("complete", False),
+        "message": envelope,
         "context_status": "pending",
     }
 
@@ -121,7 +144,7 @@ async def _context_worker(queue: asyncio.Queue, stop: asyncio.Event, my_id: str)
             ctx = await _context_with_query_lock(context, trigger)
             bundle = context.compact_context(ctx)
             event_store.append_event({
-                "schema": 1,
+                "schema": 2,
                 "kind": "mention_context",
                 "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "trigger_msg_id": trigger["msg_id"],
@@ -137,7 +160,7 @@ async def _context_worker(queue: asyncio.Queue, stop: asyncio.Event, my_id: str)
             # marker instead of blocking the listener or silently losing state.
             try:
                 event_store.append_event({
-                    "schema": 1,
+                    "schema": 2,
                     "kind": "mention_context_error",
                     "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "trigger_msg_id": trigger.get("msg_id", ""),
@@ -275,7 +298,7 @@ async def run_async() -> None:
                     context_queue.put_nowait(ev)
                 except asyncio.QueueFull:
                     event_store.append_event({
-                        "schema": 1,
+                        "schema": 2,
                         "kind": "mention_context_error",
                         "received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         "trigger_msg_id": ev["msg_id"],

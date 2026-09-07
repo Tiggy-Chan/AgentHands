@@ -69,7 +69,7 @@ def _apply_process_limit(command: str) -> None:
     # Playwright starts a Node driver and Chromium children.  Those commands
     # are launched by browser_worker.py under a systemd cgroup instead of an
     # inherited RLIMIT_AS (Node reserves a normal CodeRange at startup).
-    if command not in {"history", "mentions", "thread", "doc", "mail", "calendar"}:
+    if command not in {"history", "mentions", "thread", "message", "media", "doc", "mail", "calendar"}:
         return
     try:
         import resource
@@ -134,6 +134,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=15, help="前后时间窗（分钟）")
     p.add_argument("--limit", type=int, default=60)
 
+    p = sub.add_parser("message", help="读取一条消息的统一结构和资源元数据")
+    p.add_argument("msg_id")
+    p.add_argument(
+        "--resolve-resources",
+        action="store_true",
+        help="显式标记需要解析资源元数据（消息正文读取本身已包含资源摘要）",
+    )
+
+    p = sub.add_parser("media", help="按需下载或在本机处理消息媒体")
+    p.add_argument("msg_id")
+    p.add_argument("--resource-id", default="", help="消息中的 resource_id；多资源时处理动作必须指定")
+    p.add_argument(
+        "--action",
+        choices=["metadata", "download", "inspect", "ocr", "transcribe"],
+        default="metadata",
+    )
+    p.add_argument("--keep-media", action="store_true", help="将原始媒体保存为加密缓存")
+    p.add_argument("--out", default="", help="下载到指定文件；拒绝覆盖已有文件")
+
+    p = sub.add_parser("media-cache", help="查看或可恢复清理加密媒体缓存")
+    p.add_argument("action", choices=["status", "purge"])
+    p.add_argument("--confirm-purge", action="store_true", help="确认把媒体缓存移动到可恢复归档")
+
     p = sub.add_parser("doc", help="读/导出文档，或 --list/--walk 云空间")
     p.add_argument("ref", nargs="?", help="docx/wiki/sheets 链接或裸 token")
     p.add_argument("--export", dest="fmt", default="markdown",
@@ -149,8 +172,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=30)
 
     p = sub.add_parser("probe", help="安全抓取网页接口元数据（不保存正文或凭证）")
-    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "all"], default="all")
+    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "all"], default="all")
     p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
+    p.add_argument("--msg-id", default="", help="message-media probe 使用的消息 ID")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
 
     p = sub.add_parser("send", help="默认只产草稿；--confirm-send 或用户明确指定 --direct 才真发")
@@ -224,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _run(args) -> int:
-    from _feishu import auth, calendar_ops as calendar, chats, context, daemon, docs_search, documents, mail, mentions, messages, probe, send, transport
+    from _feishu import auth, calendar_ops as calendar, chats, context, daemon, docs_search, documents, mail, media_store, media_worker, message_resources, mentions, messages, probe, send, transport
     from _feishu.errors import AuthRequired, SendBlocked
     from _feishu import config, event_store
     from _feishu.output import emit, emit_json, emit_jsonl, fmt_ts, note, parse_when
@@ -234,7 +258,7 @@ async def _run(args) -> int:
     if args.cmd == "probe":
         with query_lock.acquire("probe"):
             result = await asyncio.wait_for(
-                probe.run(args.scope, args.keyword, headed=args.headed),
+                probe.run(args.scope, args.keyword, headed=args.headed, msg_id=args.msg_id),
                 timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
             )
         if args.out:
@@ -296,7 +320,7 @@ async def _run(args) -> int:
                 f"存储模式: {result['mode']}｜迁移记录: {result.get('migrated', 0)}｜"
                 f"旧文件归档: {result.get('archive') or '-'}"
             )
-            return 0 if spaces.get("complete", False) else 1
+            return 0
         if args.action == "purge":
             if not args.confirm_purge:
                 raise SendBlocked(
@@ -358,6 +382,37 @@ async def _run(args) -> int:
         emit_json(result)
         return 0
 
+    if args.cmd == "media":
+        if args.action == "download" and not args.out and not args.keep_media:
+            raise ValueError("media download 需要 --out 或 --keep-media，否则下载结果不会保留")
+        with query_lock.acquire("media"):
+            result = await media_worker.run(
+                args.action,
+                args.msg_id,
+                resource_id=args.resource_id,
+                keep_media=args.keep_media,
+                out=args.out,
+            )
+        if fmt == "json":
+            emit_json(result)
+        else:
+            emit(media_worker.render_markdown(result))
+        return 0
+
+    if args.cmd == "media-cache":
+        if args.action == "status":
+            result = media_store.status()
+        else:
+            if not args.confirm_purge:
+                raise ValueError("media-cache purge 需要 --confirm-purge")
+            with query_lock.acquire("media-cache-purge"):
+                result = media_store.purge_all()
+        if fmt == "json":
+            emit_json(result)
+        else:
+            emit("\n".join(f"- {key}: {value}" for key, value in result.items()))
+        return 0
+
     if args.cmd == "mail" and args.mail_action in {"send", "reply"}:
         body = open(args.text_file, encoding="utf-8").read()
         if args.mail_action == "send":
@@ -402,6 +457,19 @@ async def _run(args) -> int:
             emit_json(me)
         else:
             emit(f"{me['name']}（user_id: {me['user_id']}）")
+        return 0
+
+    if args.cmd == "message":
+        with query_lock.acquire("message"):
+            message = await asyncio.wait_for(
+                message_resources.fetch_message(args.msg_id),
+                timeout=config.QUERY_TIMEOUT_SECONDS,
+            )
+            await messages.resolve_names([message])
+        if fmt == "json":
+            emit_json(messages.render_json([message])[0])
+        else:
+            emit(messages.render_markdown([message], title="消息"))
         return 0
 
     if args.cmd == "mail":

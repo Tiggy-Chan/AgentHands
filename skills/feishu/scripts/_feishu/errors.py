@@ -47,3 +47,15 @@ class BrowserWorkerError(FeishuError):
     """The bounded browser worker failed or exceeded its deadline."""
 
     exit_code = 7
+
+
+class ResourceError(FeishuError):
+    """A message resource is unavailable, invalid, or exceeded its limits."""
+
+    exit_code = 4
+
+
+class MediaWorkerError(FeishuError):
+    """The bounded local media worker failed or exceeded its deadline."""
+
+    exit_code = 7

@@ -35,6 +35,12 @@ body 是 `Packet{cmd, payload, cid}` 序列化。
 `rootId`/`threadId`/`atOutChatterIds`(f38)/`isRemoved`/`isTruncated`/`chatType`
 (1 私聊 2 群 3 话题群)。
 
+消息内容字段（`Content`）包括 `imageKey`、`fileKey`、`audioKey`、`fileName`、
+`fileMime`、`fileSize`、`attachments`、`stickerSetId`、`stickerId` 和 `shareUserId`。
+当前 `message` provider 将这些字段转换为资源元数据；资源 key 不进入普通输出。
+`entities.Message.Type` 已覆盖 0、2–25 中定义的文本、文件、图片、音频、卡片、
+合并转发、位置、用户卡片、日历和 Todo 类型，未来数值类型统一降级为 `opaque`。
+
 ## WebSocket 实时推送
 
 - 地址：`wss://msg-frontier.feishu.cn/ws/v2?access_key=…&ticket=…&device_id=…`
@@ -108,15 +114,31 @@ REST 大多要带 `x-csrftoken: <_csrf_token cookie 值>`（注意：不是 swp_
 5. 日历事件详情字段、分页语义和读 command 字段语义。
 6. 邮件发送/回复、日历创建/修改的精确写 endpoint 和 payload。
 7. WS ticket/app_key 轮换和长时间断线恢复的更多样本。
+8. 图片、音频、视频和贴纸资源 key 对应的租户专用下载端点；在确认前不得猜路径。
 
 抓包方法（别把凭证落盘）：
 
 ```
 1. feishu.py login 之后，FEISHU 浏览器 profile 已登录
-2. 用 `feishu.py probe --scope chats|docs-search|mail|calendar`，不要直接启动 Playwright
+2. 用 `feishu.py probe --scope chats|docs-search|mail|calendar`，或
+   `feishu.py probe --scope message-media --msg-id <msg_id>`；不要直接启动 Playwright
 3. 只记录 method/host/path/x-command 头和结构摘要 —— 不记 Cookie、不存 HAR、
    WS URL 里的 ticket/access_key 不落盘
-4. 确认的端点写回本文件，实现进 _feishu/chats.py 或 docs_search.py
+4. 确认的端点写回本文件，实现进 `_feishu/chats.py`、`docs_search.py` 或消息资源 provider
+
+## 消息资源与本机媒体处理
+
+- `feishu.py message <msg_id>` 返回 schema-2 envelope；`history` 和 `thread` 使用相同模型。
+- `feishu.py media <msg_id> --action metadata|download|inspect|ocr|transcribe` 只处理
+  用户明确指定的消息资源。`download` 必须带 `--out` 或 `--keep-media`。
+- 已验证的 Drive stream 可用于文件/云文件 token；图片、音频、视频和贴纸必须由受控
+  probe 观察到精确 host/path 后再加入 transport 白名单。第三方 URL 不自动抓取。
+- Media Worker 使用 `systemd-run --user`，默认 `MemoryHigh=768M`、`MemoryMax=1G`、
+  `TasksMax=64`、`RuntimeMaxSec=600` 和 `KillMode=control-group`；其子进程包括
+  ffmpeg、tesseract 和 faster-whisper。
+- 原始附件默认只存在于受限临时文件，处理完成后删除；`--keep-media` 才写入加密媒体缓存。
+- OCR 使用 `tesseract chi_sim+eng`，ASR 使用本机 `faster-whisper base` CPU/int8；禁止把消息
+  内容上传到外部 OCR/ASR 服务。
 ```
 
 ## 已踩过的坑

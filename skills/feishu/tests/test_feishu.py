@@ -518,6 +518,31 @@ class TestDecode(unittest.TestCase):
         out = decode_message({"type": 14, "content": content})
         self.assertIn("ou_abc", out["mention_user_ids"])
 
+    def test_post_html_text_and_at_mention(self):
+        from _feishu.message_decode import decode_message
+        from lark_bridge.search import _ev
+
+        body = (
+            '<figure><img src="http://p1.pstatp.com/origin/demo"/></figure>'
+            '<p>请看下<at user_id="ou_post_user">@张三</at>的结果<br/>第二行</p>\x00'
+        ).encode()
+        # Current type=2 messages store the post HTML in wire field 2, then
+        # append opaque attachment metadata.
+        content = b"\x0a\x00\x12" + _ev(len(body)) + body + b"\x32\x01x"
+        out = decode_message({"type": 2, "content": content})
+        self.assertEqual(out["text"], "[图片]\n请看下@张三的结果\n第二行")
+        self.assertEqual(out["decode_status"], "ok")
+        self.assertIn("ou_post_user", out["mention_user_ids"])
+
+    def test_post_plain_body_fallback(self):
+        from _feishu.message_decode import decode_message
+        from lark_bridge.search import _ev
+
+        body = "<p>普通富文本</p>".encode()
+        out = decode_message({"type": 2, "content": b"\x12" + _ev(len(body)) + body})
+        self.assertEqual(out["text"], "普通富文本")
+        self.assertEqual(out["decode_status"], "ok")
+
     def test_nontext_type(self):
         from _feishu.message_decode import decode_message
         out = decode_message({"type": 5, "content": b"\x00\xff"})
@@ -528,6 +553,303 @@ class TestDecode(unittest.TestCase):
         from _feishu.message_decode import decode_message
         out = decode_message({"type": 4, "content": os.urandom(64)})
         self.assertIn(out["decode_status"], ("ok", "undecoded", "empty"))
+
+    def test_content_resource_metadata_and_safe_envelope(self):
+        from _feishu import gateway
+        from _feishu.message_model import public_message
+        from lark_bridge._proto_utils import proto_to_dict
+        from lark_bridge.proto import proto_pb2 as pb
+
+        content = pb.Content(
+            imageKey="image-key",
+            fileKey="file-key",
+            fileName="report.pdf",
+            fileMime="application/pdf",
+            fileSize=123,
+            audioKey="audio-key",
+            audioDuration=9,
+            stickerSetId="set-1",
+            stickerId="sticker-1",
+            shareUserId="user-1",
+        )
+        raw = pb.entities.Message(
+            id="m1", type=5, fromId="u1", chatId="c1", createTime=1,
+            content=content.SerializeToString(),
+        )
+        message = gateway.normalize("m1", proto_to_dict(raw))
+        self.assertEqual(message["schema"], 2)
+        self.assertEqual(message["type"], {"code": 5, "name": "image"})
+        self.assertEqual(message["decode"]["status"], "decoded")
+        self.assertEqual(
+            {item["kind"] for item in message["resources"]},
+            {"image", "file", "audio", "sticker"},
+        )
+        safe = public_message(message)
+        encoded = json.dumps(safe, ensure_ascii=False)
+        for secret_key in ("image-key", "file-key", "audio-key"):
+            self.assertNotIn(secret_key, encoded)
+        self.assertNotIn("_resource_keys", safe)
+
+    def test_file_token_in_content_text_is_a_downloadable_file_resource(self):
+        from _feishu.message_decode import decode_message
+        from _feishu.message_model import build_envelope
+
+        token = "file_v3_00154_00000000-0000-0000-0000-000000000003g"
+        decoded = decode_message({"type": 3, "content": b"\x0a" + bytes([len(token)]) + token.encode()})
+        envelope = build_envelope(
+            "m-file-token", {"type": 3, "fromId": "u", "chatId": "c", "createTime": 1}, decoded
+        )
+        self.assertEqual(envelope["decode"]["status"], "decoded")
+        self.assertTrue(any(item["kind"] == "file" for item in envelope["resources"]))
+
+    def test_unknown_type_is_opaque_and_has_bounded_summary(self):
+        from _feishu.message_decode import decode_message
+
+        out = decode_message({"type": 99, "content": b"\x0a\x05hello"})
+        self.assertEqual(out["semantic_status"], "opaque")
+        self.assertEqual(out["decode_status"], "nontext")
+        self.assertEqual(out["raw_summary"]["bytes"], 7)
+        self.assertNotIn("text_preview", out["raw_summary"]["fields"][0])
+
+    def test_merge_forward_json_is_bounded_and_typed(self):
+        from _feishu.message_decode import decode_message
+
+        payload = json.dumps({"messages": [
+            {"id": "m1", "type": 4, "text": "第一条"},
+            {"id": "m2", "type": 5, "text": ""},
+        ]}, ensure_ascii=False).encode()
+        out = decode_message({"type": 11, "content": payload})
+        self.assertEqual(out["semantic_status"], "decoded")
+        self.assertEqual(len(out["nested_messages"]), 2)
+        self.assertEqual(out["nested_messages"][1]["type"]["name"], "image")
+
+    def test_all_proto_types_have_a_schema_type(self):
+        from _feishu.message_decode import decode_message
+        from _feishu.message_model import TYPE_NAMES, build_envelope, public_message
+
+        for code, name in TYPE_NAMES.items():
+            decoded = decode_message({"type": code, "content": b""})
+            envelope = build_envelope(
+                f"m-{code}",
+                {
+                    "type": code, "fromId": "u", "chatId": "c",
+                    "createTime": 1, "chatType": 2,
+                },
+                decoded,
+            )
+            safe = public_message(envelope)
+            self.assertEqual(safe["type"], {"code": code, "name": name})
+            self.assertIn(safe["decode"]["status"], {"decoded", "opaque", "unavailable"})
+            self.assertNotIn("_resource_keys", safe)
+
+    def test_inline_post_image_is_a_processable_resource(self):
+        from _feishu.message_decode import decode_message
+        from _feishu.message_model import build_envelope
+        from lark_bridge.search import _ev
+
+        image = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+        body = "<p>图片</p>".encode()
+        content = b"\x12" + _ev(len(body)) + body + b"\x2a" + _ev(len(image)) + image
+        decoded = decode_message({"type": 2, "content": content})
+        envelope = build_envelope(
+            "m-inline", {"type": 2, "fromId": "u", "chatId": "c", "createTime": 1}, decoded
+        )
+        self.assertTrue(any(item["kind"] == "image" for item in envelope["resources"]))
+        self.assertTrue(envelope.get("_resource_data"))
+
+
+class TestMessageResourcesAndMedia(unittest.TestCase):
+    def test_resource_id_ignores_volatile_rendered_url_query(self):
+        from _feishu.message_model import resource_id
+
+        first = resource_id("image", "https://example.feishu.cn/image/a.png?token=one", 0)
+        second = resource_id("image", "https://example.feishu.cn/image/a.png?token=two", 0)
+        self.assertEqual(first, second)
+
+    def test_post_image_selector_uses_message_position_when_url_rotates(self):
+        from _feishu.message_decode import _resource
+
+        first = _resource(
+            "image", "https://example.feishu.cn/render/one/signed-a", ordinal=0, source="post.img"
+        )
+        second = _resource(
+            "image", "https://example.feishu.cn/render/two/signed-b", ordinal=0, source="post.img"
+        )
+        self.assertEqual(first["resource_id"], second["resource_id"])
+        self.assertNotEqual(first["_key"], second["_key"])
+
+    def test_resource_selection_and_known_endpoint_boundary(self):
+        from _feishu import message_resources
+        from _feishu.errors import EndpointNotAdapted, ResourceError
+
+        message = {
+            "resources": [
+                {"resource_id": "file:one", "kind": "file", "name": "a.txt", "_key": "file-key"},
+                {"resource_id": "image:two", "kind": "image", "name": "a.png", "_key": "image-key"},
+            ],
+            "_resource_keys": {"file:one": "file-key", "image:two": "image-key"},
+        }
+        with self.assertRaises(ResourceError):
+            message_resources.select_resource(message)
+        file_resource = message_resources.select_resource(message, "file:one")
+        self.assertIn("internal-api-drive-stream.feishu.cn", message_resources._url_for(file_resource))
+        with self.assertRaises(EndpointNotAdapted):
+            message_resources._url_for(message_resources.select_resource(message, "image:two"))
+
+    def test_media_worker_command_is_cgroup_bounded(self):
+        from _feishu import media_worker
+
+        command = media_worker.build_command("transcribe", "unit-test", 600)
+        self.assertIn("--property=MemoryMax=1G", command)
+        self.assertIn("--property=TasksMax=64", command)
+        self.assertIn("--property=KillMode=control-group", command)
+        self.assertIn("--property=RuntimeMaxSec=600s", command)
+
+    def test_media_inspect_does_not_require_optional_models(self):
+        import tempfile
+        from pathlib import Path
+        from _feishu import media_processing
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "payload.bin"
+            path.write_bytes(b"not a media container")
+            result = media_processing.inspect(path, {"kind": "file", "mime": "application/octet-stream"})
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["info"]["bytes"], 21)
+
+    def test_bounded_streaming_download_writes_requested_output(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from _feishu import message_resources
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "text/plain", "content-length": "10"}
+
+            async def aiter_raw(self):
+                yield b"hello"
+                yield b"world"
+
+        class Context:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        async def check(root):
+            target = root / "download.txt"
+            resource = {"resource_id": "file:test", "kind": "file", "_key": "file-key", "name": "x.txt"}
+            with patch.object(message_resources.transport, "stream_request", return_value=Context()):
+                result = await message_resources.download_resource(
+                    {}, resource, out=str(target)
+                )
+            self.assertEqual(target.read_bytes(), b"helloworld")
+            self.assertEqual(result["bytes"], 10)
+            self.assertEqual(result["status"], "downloaded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_home = message_resources.config.HOME
+            try:
+                message_resources.config.HOME = Path(tmp)
+                asyncio.run(check(Path(tmp)))
+            finally:
+                message_resources.config.HOME = old_home
+
+    def test_inline_resource_download_does_not_touch_network(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from _feishu import message_resources
+
+        async def check(root):
+            rid = "image:inline"
+            raw = b"\x89PNG\r\n\x1a\ninline"
+            message = {
+                "resources": [{"resource_id": rid, "kind": "image", "name": "x.png"}],
+                "_resource_data": {rid: raw},
+            }
+            resource = message_resources.select_resource(message, rid)
+            target = root / "inline.png"
+            result = await message_resources.download_resource(message, resource, out=str(target))
+            self.assertEqual(target.read_bytes(), raw)
+            self.assertEqual(result["bytes"], len(raw))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_home = message_resources.config.HOME
+            try:
+                message_resources.config.HOME = Path(tmp)
+                asyncio.run(check(Path(tmp)))
+            finally:
+                message_resources.config.HOME = old_home
+
+    def test_resource_probe_returns_adapter_status_without_body(self):
+        import asyncio
+        from _feishu import message_resources
+
+        async def check():
+            message = {
+                "type": {"code": 3, "name": "file"},
+                "resources": [
+                    {"resource_id": "file:test", "kind": "file", "name": "x.txt", "_key": "file-key"},
+                    {"resource_id": "image:test", "kind": "image", "name": "x.png", "_key": "image-key"},
+                ],
+                "_resource_keys": {"file:test": "file-key", "image:test": "image-key"},
+            }
+            with patch.object(message_resources, "fetch_message", new=AsyncMock(return_value=message)):
+                result = await message_resources.probe_metadata("m1")
+            self.assertFalse(result["contains_bodies"])
+            self.assertFalse(result["contains_credentials"])
+            self.assertEqual(result["resources"][0]["endpoint_status"], "registered")
+            self.assertEqual(result["resources"][1]["endpoint_status"], "not_adapted")
+            self.assertNotIn("file-key", json.dumps(result, ensure_ascii=False))
+
+        asyncio.run(check())
+
+    def test_media_cache_requires_encryption(self):
+        import tempfile
+        from pathlib import Path
+        from _feishu import media_store, secure_store
+        from _feishu.errors import ResourceError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_home = os.environ.get("FEISHU_HOME")
+            os.environ["FEISHU_HOME"] = tmp
+            import importlib
+            from _feishu import config
+            importlib.reload(config)
+            importlib.reload(media_store)
+            source = Path(tmp) / "source.bin"
+            source.write_bytes(b"data")
+            try:
+                with patch.object(secure_store, "mode", return_value="plaintext_permissions"):
+                    with self.assertRaises(ResourceError):
+                        media_store.store(source, "file:test")
+            finally:
+                if old_home is None:
+                    os.environ.pop("FEISHU_HOME", None)
+                else:
+                    os.environ["FEISHU_HOME"] = old_home
+                importlib.reload(config)
+                importlib.reload(media_store)
+
+    def test_chunked_media_encryption_round_trips_without_plaintext_file(self):
+        import tempfile
+        from pathlib import Path
+        from _feishu import secure_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.bin"
+            encrypted = root / "source.media.enc"
+            restored = root / "restored.bin"
+            source.write_bytes((b"0123456789" * 200_000) + b"tail")
+            with patch.object(secure_store, "_load_key", return_value=b"k" * 32):
+                secure_store.encrypt_file(source, encrypted, chunk_size=64 * 1024)
+                secure_store.decrypt_file(encrypted, restored, max_output_bytes=4 * 1024 * 1024)
+            self.assertEqual(restored.read_bytes(), source.read_bytes())
+            self.assertNotIn(b"0123456789", encrypted.read_bytes())
 
 
 class TestListenerPatch(unittest.TestCase):
@@ -592,6 +914,34 @@ class TestDaemonFiltering(unittest.TestCase):
     def test_own_message_is_not_relevant(self):
         from _feishu.daemon import _should_store
         self.assertFalse(_should_store({"msg_id": "m", "from_id": "me", "chat_type": 1}, "me"))
+
+    def test_build_event_contains_safe_schema2_message_envelope(self):
+        from _feishu import daemon
+        from lark_bridge._proto_utils import proto_to_dict
+        from lark_bridge.proto import proto_pb2 as pb
+
+        content = pb.Content(
+            fileKey="private-file-key",
+            fileName="x.txt",
+            fileMime="text/plain",
+            fileSize=4,
+        )
+        raw = pb.entities.Message(
+            id="m1", type=3, fromId="other", chatId="c1", chatType=1,
+            createTime=1, content=content.SerializeToString(),
+        )
+        event = daemon._build_event(
+            {
+                "msg_id": "m1", "from_id": "other", "chat_id": "c1", "chat_type": 1,
+                "type": 3, "create_time": 1, "at_me": False,
+                "at_out_chatter_ids": [], "raw": proto_to_dict(raw),
+            },
+            "me",
+        )
+        self.assertEqual(event["schema"], 2)
+        self.assertEqual(event["message"]["schema"], 2)
+        self.assertEqual(event["message"]["type"]["name"], "file")
+        self.assertNotIn("private-file-key", json.dumps(event, ensure_ascii=False))
 
 
 class TestContextCompaction(unittest.TestCase):

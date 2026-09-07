@@ -49,6 +49,9 @@
    `.label` 实例属性，上游写法在新运行时直接 AttributeError。
 10. **`_http.BoundedAsyncClient`**：控制面响应默认限制为 8 MiB，文档/文件下载
    显式放宽到 256 MiB，避免异常响应耗尽宿主机内存。
+11. **`decoder.py`**：补充飞书当前 `type=2` 富文本消息的 protobuf 字段 2
+   HTML 解码，提取可见文本、图片占位和 `<at user_id=...>` mention；原先
+   只识别 `type=4/14`，会把这类正文误报为 `nontext`。
 
 ## 升级步骤
 

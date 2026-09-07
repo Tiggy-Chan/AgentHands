@@ -2,6 +2,7 @@
 
 import json
 import re
+from html.parser import HTMLParser
 
 from google.protobuf.internal.decoder import _DecodeVarint
 
@@ -17,6 +18,8 @@ def decode_text(msg: dict) -> str:
         return ""
     if msg_type == 4:
         return decode_type4(content)
+    elif msg_type == 2:
+        return decode_type2(content)
     elif msg_type == 14:
         return decode_type14(content)
     return ""
@@ -95,6 +98,150 @@ def _extract_wire_field1(data: bytes) -> str:
     except Exception:
         pass
     return ""
+
+
+def _iter_length_delimited_fields(data: bytes):
+    """Yield ``(field_number, value)`` from a protobuf wire payload.
+
+    Message type 2 stores its HTML body in a length-delimited field but also
+    appends attachment metadata and binary image data.  A small bounded wire
+    walker lets us select the body without trying to interpret those opaque
+    fields as text.
+    """
+    pos = 0
+    while pos < len(data):
+        try:
+            tag, next_pos = _DecodeVarint(data, pos)
+            field_number, wire_type = tag >> 3, tag & 0x7
+            if not field_number:
+                return
+            if wire_type == 0:
+                _, pos = _DecodeVarint(data, next_pos)
+            elif wire_type == 1:
+                pos = next_pos + 8
+            elif wire_type == 2:
+                length, value_pos = _DecodeVarint(data, next_pos)
+                end = value_pos + length
+                if end > len(data):
+                    return
+                yield field_number, data[value_pos:end]
+                pos = end
+            elif wire_type == 5:
+                pos = next_pos + 4
+            else:
+                return
+            if pos > len(data):
+                return
+        except Exception:
+            return
+
+
+def _post_body(content: bytes) -> str:
+    """Extract the HTML body from a type=2 post payload."""
+    fields = list(_iter_length_delimited_fields(content))
+    # Current web clients put the HTML in field 2.  The other candidates make
+    # this tolerant of older/alternate envelopes without selecting binary
+    # attachment fields by accident.
+    for wanted in (2, 1, 20):
+        for field_number, value in fields:
+            if field_number != wanted or not value:
+                continue
+            try:
+                candidate = value.decode("utf-8", errors="replace").replace("\x00", "")
+            except Exception:
+                continue
+            if candidate.strip():
+                return candidate
+
+    # A few clients expose the body directly when the envelope is omitted.
+    try:
+        candidate = content.decode("utf-8", errors="replace").replace("\x00", "")
+    except Exception:
+        return ""
+    if candidate.lstrip().startswith(("<", "{")):
+        return candidate
+    return ""
+
+
+class _PostHTMLParser(HTMLParser):
+    """Turn Feishu's small post-HTML dialect into readable plain text."""
+
+    _BLOCK_TAGS = frozenset({
+        "address", "article", "blockquote", "div", "figure", "h1", "h2",
+        "h3", "h4", "h5", "h6", "header", "li", "ol", "p", "pre",
+        "section", "table", "td", "th", "tr", "ul",
+    })
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.mention_user_ids: list[str] = []
+
+    def _newline(self) -> None:
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        attrs_map = {str(key).lower(): value or "" for key, value in attrs}
+        if tag == "at":
+            user_id = (
+                attrs_map.get("user_id")
+                or attrs_map.get("userid")
+                or attrs_map.get("user_id_v2")
+                or attrs_map.get("id")
+            )
+            if user_id:
+                self.mention_user_ids.append(str(user_id))
+        elif tag == "img":
+            alt = attrs_map.get("alt", "").strip()
+            self.parts.append(f"[图片: {alt}]" if alt else "[图片]")
+        elif tag == "br":
+            self._newline()
+        elif tag in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data.replace("\x00", ""))
+
+    def text(self) -> str:
+        raw = "".join(self.parts).replace("\r\n", "\n").replace("\r", "\n")
+        lines = []
+        for line in raw.split("\n"):
+            line = re.sub(r"[ \t\f\v]+", " ", line).strip()
+            if line or (lines and lines[-1]):
+                lines.append(line)
+        return "\n".join(lines).strip()
+
+
+def decode_type2_content(content: bytes) -> tuple[str, list[str]]:
+    """Decode a type=2 post into visible text and @ user ids."""
+    html = _post_body(content)
+    if not html:
+        return "", []
+    parser = _PostHTMLParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        # HTMLParser is deliberately best-effort: a truncated post should
+        # still expose any text and mentions parsed before the malformed tail.
+        pass
+    mentions = set(parser.mention_user_ids)
+    mentions.update(
+        re.findall(r"<at\b[^>]*\b(?:user_id|userid|userID)=['\"]([^'\"]+)", html, re.I)
+    )
+    return parser.text(), sorted(mentions)
+
+
+def decode_type2(content: bytes) -> str:
+    """Decode type=2 (rich post) message text."""
+    return decode_type2_content(content)[0]
 
 
 def decode_type14(content: bytes) -> str:

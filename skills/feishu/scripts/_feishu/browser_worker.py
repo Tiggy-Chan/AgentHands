@@ -34,6 +34,7 @@ _OPERATIONS = frozenset({
     "chats",
     "docs-search",
     "probe",
+    "message-media-probe",
     "mail-list",
     "mail-search",
     "mail-get",
@@ -189,6 +190,10 @@ async def _dispatch(operation: str, payload: dict) -> dict:
             str(payload.get("keyword", "测试")),
             bool(payload.get("headed", False)),
         )
+    if operation == "message-media-probe":
+        from . import auth, message_resources
+        await auth.prepare()
+        return await message_resources.probe_metadata(str(payload.get("msg_id", "")))
     if operation.startswith("mail-"):
         from . import mail
         return await mail.browser_operation(operation[5:], payload)

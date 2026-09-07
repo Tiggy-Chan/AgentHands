@@ -23,9 +23,18 @@ _INTERESTING = (
 )
 
 
-async def run(scope: str, keyword: str = "测试", headed: bool = False) -> dict:
+async def run(
+    scope: str,
+    keyword: str = "测试",
+    headed: bool = False,
+    msg_id: str = "",
+) -> dict:
     from .browser_worker import run as run_worker
 
+    if scope == "message-media":
+        if not msg_id:
+            raise ValueError("message-media probe 需要 --msg-id")
+        return await run_worker("message-media-probe", {"msg_id": msg_id})
     return await run_worker("probe", {"scope": scope, "keyword": keyword, "headed": headed})
 
 

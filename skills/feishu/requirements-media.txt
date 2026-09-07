@@ -1,0 +1,3 @@
+# Optional local media processing dependency.  The base model is downloaded
+# into FEISHU_HOME/models on the first explicit `media --action transcribe`.
+faster-whisper>=1.1,<2

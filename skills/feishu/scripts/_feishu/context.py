@@ -12,6 +12,7 @@ import json
 
 from . import config
 from . import gateway, messages
+from .message_model import public_message
 from .output import fmt_ts
 
 _MAX_PARENT_CHAIN = 20
@@ -22,6 +23,20 @@ def _encoded_size(message: dict) -> int:
         return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode())
     except (TypeError, ValueError):
         return 0
+
+
+def _clean_message(message: dict) -> dict:
+    """Keep the schema-2 envelope while stripping private transport fields."""
+    safe = public_message(message)
+    fields = (
+        "schema", "id", "msg_id", "chat_id", "chat_type", "sender", "from_id",
+        "created_at", "create_time", "type", "type_name", "content", "text",
+        "mentions", "mention_user_ids", "resources", "nested_messages", "state",
+        "decode", "decode_status", "complete", "parent_id", "root_id", "thread_id",
+        "is_removed", "is_truncated", "at_out_chatter_ids", "at_me_server", "from_name",
+        "chat_name",
+    )
+    return {key: safe[key] for key in fields if key in safe}
 
 
 async def thread_context(msg_id: str, window_min: int = 15, limit: int = 60) -> dict:
@@ -139,16 +154,7 @@ def bound_context(ctx: dict, *, max_messages: int | None = None, max_bytes: int 
             if count >= max_messages:
                 clipped = True
                 break
-            clean = {
-                key: message.get(key)
-                for key in (
-                    "msg_id", "chat_id", "chat_type", "from_id", "from_name", "type",
-                    "type_name", "create_time", "parent_id", "root_id", "thread_id",
-                    "text", "mention_user_ids", "at_me_server", "decode_status",
-                    "is_removed", "is_truncated",
-                )
-                if key in message
-            }
+            clean = _clean_message(message)
             encoded = _encoded_size(clean)
             if encoded > max_bytes - used:
                 # Preserve the message identity and metadata even when its
@@ -192,16 +198,7 @@ def compact_context(ctx: dict, *, max_messages: int | None = None, max_bytes: in
             if not mid or mid in seen:
                 continue
             seen.add(mid)
-            clean = {
-                key: message.get(key)
-                for key in (
-                    "msg_id", "chat_id", "chat_type", "from_id", "from_name", "type",
-                    "type_name", "create_time", "parent_id", "root_id", "thread_id",
-                    "text", "mention_user_ids", "at_me_server", "decode_status",
-                    "is_removed", "is_truncated",
-                )
-                if key in message
-            }
+            clean = _clean_message(message)
             candidates.append(clean)
 
     ordered: list[dict] = []

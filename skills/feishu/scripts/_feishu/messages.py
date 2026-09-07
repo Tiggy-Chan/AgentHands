@@ -7,6 +7,7 @@ import json
 import os
 
 from . import config, gateway
+from .message_model import public_message
 from .output import fmt_ts, note
 
 _CHAT_TYPE = {0: "unknown", 1: "p2p", 2: "group", 3: "topic"}
@@ -83,6 +84,8 @@ async def resolve_names(messages: list[dict]) -> None:
     for m in messages:
         m["from_name"] = names["users"].get(m.get("from_id", ""), "")
         m["chat_name"] = names["chats"].get(m.get("chat_id", ""), "")
+        if isinstance(m.get("sender"), dict):
+            m["sender"]["name"] = m["from_name"]
 
 
 async def history(chat_id: str, start_time: int = 0, end_time: int = 0, limit: int = 30) -> dict:
@@ -127,9 +130,23 @@ def render_markdown(msgs: list[dict], title: str = "") -> str:
         if m.get("is_removed"):
             text = "~~已撤回~~"
         body = "\n".join(f"  > {ln}" for ln in str(text).splitlines())
-        lines.append(f"- `{m['msg_id']}` **{who}** ({ts})\n{body}")
+        suffix = []
+        if m.get("resources"):
+            suffix.append(f"资源 {len(m['resources'])} 个")
+        if m.get("nested_messages"):
+            suffix.append(f"合并消息 {len(m['nested_messages'])} 条")
+        semantic = (m.get("decode") or {}).get("status")
+        if semantic and semantic != "decoded":
+            suffix.append(f"解码状态 {semantic}")
+        tail = f"｜{'；'.join(suffix)}" if suffix else ""
+        lines.append(f"- `{m['msg_id']}` **{who}** ({ts}){tail}\n{body}")
     return "\n".join(lines)
 
 
 def render_json(msgs: list[dict]) -> list[dict]:
-    return [{**m, "create_time_iso": fmt_ts(m.get("create_time"))} for m in msgs]
+    rendered = []
+    for message in msgs:
+        item = public_message(message)
+        item["create_time_iso"] = fmt_ts(message.get("create_time"))
+        rendered.append(item)
+    return rendered

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from lark_bridge import _http
@@ -222,6 +223,39 @@ async def request(
 
                 raise FeishuError(f"请求失败：{urlsplit(url).netloc}{urlsplit(url).path}：{scrubbed_exc(e)}")
     raise last_exc  # unreachable, keeps type checkers happy
+
+
+@asynccontextmanager
+async def stream_request(
+    method: str,
+    url: str,
+    *,
+    gateway_cmd: int = 0,
+    headers: dict | None = None,
+    timeout: float = 15,
+    max_response_bytes: int = _http.DEFAULT_MAX_RESPONSE_BYTES,
+    **kw,
+):
+    """Yield a live bounded response for streaming resource downloads.
+
+    ``request`` intentionally returns eagerly materialized responses for the
+    existing gateway callers.  Media must stream into a capped file instead,
+    so this context manager owns both the client and response lifecycle.
+    The caller is responsible for enforcing the byte cap while iterating
+    ``response.aiter_raw()``.
+    """
+    check_allowed(method, url, gateway_cmd)
+    async with _http.make_client(
+        timeout=timeout,
+        headers=headers,
+        max_response_bytes=max_response_bytes,
+    ) as client:
+        request_obj = client.build_request(method, url, headers=headers, **kw)
+        response = await client.send(request_obj, stream=True)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
 
 async def gateway_call(cmd: int, payload: bytes, rid: str, timeout: float = 15):

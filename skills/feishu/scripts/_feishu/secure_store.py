@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import struct
 import tempfile
 from pathlib import Path
 
@@ -163,6 +164,116 @@ def decrypt_blob(data: bytes, *, aad: bytes = _AAD) -> bytes:
     nonce = base64.urlsafe_b64decode(envelope["nonce"])
     cipher = base64.urlsafe_b64decode(envelope["ciphertext"])
     return AESGCM(key).decrypt(nonce, cipher, aad)
+
+
+_MEDIA_MAGIC = b"AH-MEDIA-CHUNKED-1\n"
+_MEDIA_CHUNK_SIZE = 1024 * 1024
+
+
+def _chunk_aad(aad: bytes, index: int) -> bytes:
+    return aad + b"/chunk/" + str(index).encode("ascii")
+
+
+def encrypt_file(source: Path, target: Path, *, aad: bytes = _AAD, chunk_size: int = _MEDIA_CHUNK_SIZE) -> int:
+    """Encrypt a file incrementally so media never needs a giant byte buffer."""
+    key = _load_key()
+    if key is None:
+        raise SecureStoreError("encrypted file requested while keyring is unavailable")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    chunk_size = max(64 * 1024, min(int(chunk_size), 8 * 1024 * 1024))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    tmp = Path(name)
+    total = 0
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as out, source.open("rb") as src:
+            header = json.dumps(
+                {"v": 3, "alg": "AES-256-GCM-CHUNKED", "chunk_size": chunk_size},
+                separators=(",", ":"),
+            ).encode()
+            out.write(_MEDIA_MAGIC)
+            out.write(header + b"\n")
+            for index in range(1 << 31):
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                nonce = secrets.token_bytes(12)
+                cipher = AESGCM(key).encrypt(nonce, chunk, _chunk_aad(aad, index))
+                out.write(struct.pack(">I", len(cipher)))
+                out.write(nonce)
+                out.write(cipher)
+                total += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+        return total
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def decrypt_file(
+    source: Path,
+    target: Path,
+    *,
+    aad: bytes = _AAD,
+    max_output_bytes: int | None = None,
+) -> int:
+    """Decrypt a chunked media file incrementally with an optional output cap."""
+    key = _load_key()
+    if key is None:
+        raise SecureStoreError("encrypted file key unavailable")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    tmp = Path(name)
+    total = 0
+    try:
+        os.fchmod(fd, 0o600)
+        with source.open("rb") as src, os.fdopen(fd, "wb") as out:
+            if src.readline() != _MEDIA_MAGIC:
+                raise SecureStoreError("invalid encrypted media header")
+            try:
+                header = json.loads(src.readline().decode("utf-8"))
+                if header.get("v") != 3 or header.get("alg") != "AES-256-GCM-CHUNKED":
+                    raise ValueError
+                chunk_size = int(header.get("chunk_size", _MEDIA_CHUNK_SIZE))
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise SecureStoreError("invalid encrypted media metadata") from exc
+            for index in range(1 << 31):
+                length_bytes = src.read(4)
+                if not length_bytes:
+                    break
+                if len(length_bytes) != 4:
+                    raise SecureStoreError("truncated encrypted media length")
+                length = struct.unpack(">I", length_bytes)[0]
+                if length < 16 or length > chunk_size + 16:
+                    raise SecureStoreError("invalid encrypted media chunk size")
+                nonce = src.read(12)
+                cipher = src.read(length)
+                if len(nonce) != 12 or len(cipher) != length:
+                    raise SecureStoreError("truncated encrypted media chunk")
+                plain = AESGCM(key).decrypt(nonce, cipher, _chunk_aad(aad, index))
+                total += len(plain)
+                if max_output_bytes is not None and total > max_output_bytes:
+                    raise SecureStoreError("decrypted media exceeded the configured limit")
+                out.write(plain)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+        return total
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def atomic_write(path: Path, data: bytes) -> None:

@@ -24,6 +24,7 @@ from lark_bridge.search import _build_search_params, _ev
 from . import config, transport
 from .errors import FeishuError
 from .message_decode import decode_message
+from .message_model import build_envelope
 
 
 def _rid(tag: str = "") -> str:
@@ -67,25 +68,7 @@ async def fetch_messages(msg_ids: list[str]) -> list[dict]:
 def normalize(msg_id: str, m: dict, at_me_server=None) -> dict:
     """Raw proto dict → the message shape used everywhere in this skill."""
     dec = decode_message(m)
-    return {
-        "msg_id": msg_id,
-        "chat_id": m.get("chatId", ""),
-        "chat_type": m.get("chatType", 0),
-        "from_id": m.get("fromId", ""),
-        "type": m.get("type", 0),
-        "type_name": dec["msg_type_name"],
-        "create_time": m.get("createTime", 0),
-        "parent_id": m.get("parentId", ""),
-        "root_id": m.get("rootId", ""),
-        "thread_id": m.get("threadId", ""),
-        "is_removed": bool(m.get("isRemoved", False)),
-        "is_truncated": bool(m.get("isTruncated", False)),
-        "text": dec["text"],
-        "mention_user_ids": dec["mention_user_ids"],
-        "decode_status": dec["decode_status"],
-        "at_out_chatter_ids": list(m.get("atOutChatterIds", [])),
-        "at_me_server": at_me_server,  # True/False/None — cmd 8 may not set it
-    }
+    return build_envelope(msg_id, m, dec, at_me_server=at_me_server)
 
 
 # --- cmd 11021: message search ----------------------------------------------
