@@ -135,8 +135,16 @@ async def _list_from_browser_impl() -> list[dict]:
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
             blocked = await browser_guard.install(page)
             await page.goto(f"https://{domain}/next/messenger/", wait_until="domcontentloaded", timeout=60000)
+            # The SPA authenticates and renders feed cards asynchronously;
+            # a fixed short sleep raced the render and produced a bogus
+            # "协议变了" EndpointNotAdapted (observed 2026-09-10).
+            try:
+                await page.wait_for_selector("[data-feed-id]", timeout=25000)
+            except Exception:
+                await auth.raise_if_login_redirect(page)
             for _ in range(8):
                 await page.wait_for_timeout(700)
                 cards = page.locator("[data-feed-id]")

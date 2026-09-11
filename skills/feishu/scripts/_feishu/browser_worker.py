@@ -33,8 +33,12 @@ _OPERATIONS = frozenset({
     "login",
     "chats",
     "docs-search",
+    "doc-replace",
+    "doc-read",
+    "doc-clipboard-inspect",
     "probe",
     "message-media-probe",
+    "media-file-download",
     "media-observe",
     "mail-list",
     "mail-search",
@@ -80,7 +84,7 @@ def build_command(operation: str, unit: str, timeout: float) -> list[str]:
     """Build the transient-service command; kept pure for contract tests."""
     if operation not in _OPERATIONS:
         raise BrowserWorkerError(f"未允许的 Browser Worker 操作：{operation}")
-    return [
+    cmd = [
         "systemd-run", "--user", "--wait", "--pipe", "--collect", "--quiet",
         f"--unit={unit}",
         f"--property=MemoryHigh={config.BROWSER_MEMORY_HIGH}",
@@ -91,15 +95,29 @@ def build_command(operation: str, unit: str, timeout: float) -> list[str]:
         f"--property=RuntimeMaxSec={max(1, math.ceil(timeout))}s",
         f"--setenv=FEISHU_HOME={config.HOME}",
         "--setenv=FEISHU_BROWSER_WORKER=1",
-        _worker_python(), _worker_script(), "--worker", "--operation", operation,
     ]
+    # Headed operations (login, --capture) need the user's display; a
+    # transient systemd unit does not reliably inherit it (2026-09-10: the
+    # headed capture window never appeared and the browser died headless).
+    for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "FEISHU_CAPTURE_WINDOW"):
+        value = os.environ.get(var)
+        if value:
+            cmd.append(f"--setenv={var}={value}")
+    cmd += [_worker_python(), _worker_script(), "--worker", "--operation", operation]
+    return cmd
 
 
 def _decode_worker_output(stdout: bytes) -> dict:
     # systemd --pipe should leave stdout untouched.  Parse the last JSON line
     # defensively so a future launcher warning cannot turn into fake data.
-    for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
-        line = line.strip()
+    # Split ONLY on \n: str.splitlines() also breaks on U+2028/U+2029/NEL,
+    # which json.dumps leaves raw inside strings (captured page text carries
+    # them) — that shattered a perfectly valid 150KB result (2026-09-11).
+    for raw_line in reversed(stdout.split(b"\n")):
+        try:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
         if not line:
             continue
         try:
@@ -137,44 +155,63 @@ async def run(operation: str, payload: dict | None = None, *, timeout: float | N
         )
 
     timeout = float(timeout or config.BROWSER_TIMEOUT_SECONDS)
-    unit = _unit_name(operation)
-    cmd = build_command(operation, unit, timeout)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    request = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(request), timeout=timeout + 10)
-    except asyncio.TimeoutError as exc:
-        await _stop_unit(unit)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.communicate()
-        raise BrowserWorkerError(
-            f"Browser Worker 超过 {timeout:g} 秒，已终止整个浏览器进程树"
-        ) from exc
-    except asyncio.CancelledError:
-        # A caller-level deadline can cancel this coroutine before the
-        # worker's own timeout. Stop the transient unit first; otherwise the
-        # systemd service and its Chromium descendants could outlive the CLI.
-        await _stop_unit(unit)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.communicate()
-        raise
-    if proc.returncode != 0:
-        detail = scrub(stderr.decode("utf-8", errors="replace"))[-1200:]
-        raise BrowserWorkerError(
-            f"Browser Worker 失败（退出码 {proc.returncode}）" + (f"：{detail}" if detail else "")
+    attempt = 0
+    while True:
+        attempt += 1
+        unit = _unit_name(operation)
+        cmd = build_command(operation, unit, timeout)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    return _decode_worker_output(stdout)
+        request = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(request), timeout=timeout + 10)
+        except asyncio.TimeoutError as exc:
+            await _stop_unit(unit)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+            raise BrowserWorkerError(
+                f"Browser Worker 超过 {timeout:g} 秒，已终止整个浏览器进程树"
+            ) from exc
+        except asyncio.CancelledError:
+            # A caller-level deadline can cancel this coroutine before the
+            # worker's own timeout. Stop the transient unit first; otherwise the
+            # systemd service and its Chromium descendants could outlive the CLI.
+            await _stop_unit(unit)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+            raise
+        # systemd-run exits 255 with no worker output when systemd-oomd
+        # SIGKILLs the unit (session-level PSI trip — observed 2026-09-10 on
+        # a busy desktop; the service journal shows status=9/KILL).  The kill
+        # is racy, so retry once into (hopefully) a quieter window.  All
+        # browser operations here are idempotent reads or clear-then-write
+        # replace flows, so a cold restart is safe.
+        if proc.returncode == 255 and not stdout.strip() and attempt == 1:
+            continue
+        if proc.returncode != 0:
+            detail = scrub(stderr.decode("utf-8", errors="replace"))[-1200:]
+            raise BrowserWorkerError(
+                f"Browser Worker 失败（退出码 {proc.returncode}）" + (f"：{detail}" if detail else "")
+            )
+        try:
+            return _decode_worker_output(stdout)
+        except BrowserWorkerError:
+            try:
+                (config.HOME / ".last-worker-stdout.bin").write_bytes(stdout)
+                (config.HOME / ".last-worker-stderr.txt").write_bytes(stderr)
+            except Exception:
+                pass
+            raise
 
 
 async def _dispatch(operation: str, payload: dict) -> dict:
@@ -186,7 +223,20 @@ async def _dispatch(operation: str, payload: dict) -> dict:
         return {"items": await _list_from_browser_impl()}
     if operation == "docs-search":
         from .docs_search import _browser_search_impl
-        return await _browser_search_impl(str(payload.get("keyword", "")), int(payload.get("limit", 30)))
+        return await _browser_search_impl(
+            str(payload.get("keyword", "")), int(payload.get("limit", 30)),
+            debug=bool(payload.get("debug")))
+    if operation == "doc-replace":
+        from .documents import _replace_document_impl
+        return await _replace_document_impl(
+            str(payload.get("ref", "")), str(payload.get("content_file", ""))
+        )
+    if operation == "doc-read":
+        from .documents import _read_document_impl
+        return await _read_document_impl(str(payload.get("ref", "")))
+    if operation == "doc-clipboard-inspect":
+        from .documents import _inspect_clipboard_impl
+        return await _inspect_clipboard_impl(str(payload.get("ref", "")))
     if operation == "probe":
         from .probe import _run_impl
         return await _run_impl(
@@ -198,10 +248,16 @@ async def _dispatch(operation: str, payload: dict) -> dict:
         from . import auth, message_resources
         await auth.prepare()
         return await message_resources.probe_metadata(str(payload.get("msg_id", "")))
+    if operation == "media-file-download":
+        from . import message_resources
+        return await message_resources._download_file_browser_impl(
+            str(payload.get("msg_id", "")), str(payload.get("chat_id", "")),
+            str(payload.get("file_name", "")), bool(payload.get("headed", False)))
     if operation == "media-observe":
         from . import probe as probe_mod
         return await probe_mod._media_observe_impl(
-            str(payload.get("msg_id", "")), bool(payload.get("headed", False)))
+            str(payload.get("msg_id", "")), bool(payload.get("headed", False)),
+            bool(payload.get("interact", False)))
     if operation.startswith("mail-"):
         from . import mail
         return await mail.browser_operation(operation[5:], payload)
@@ -225,7 +281,14 @@ def worker_main(argv: list[str]) -> int:
         from . import transport
         transport.configure()
         result = asyncio.run(_dispatch(args.operation, payload))
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        line = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        try:
+            # Side-channel for diagnosing "systemd-run ate my stdout" cases
+            # (2026-09-11: capture runs exit 0 with the JSON never arriving).
+            (config.HOME / ".last-worker-result.json").write_text(line)
+        except Exception:
+            pass
+        print(line)
         return 0
     except Exception as exc:
         # Keep worker diagnostics concise: Playwright call logs can include

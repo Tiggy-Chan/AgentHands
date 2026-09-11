@@ -16,6 +16,8 @@ from . import auth, browser_guard, config
 from .errors import EndpointNotAdapted, FeishuError, ResourceIsolationUnavailable
 from .secure_store import decrypt_blob
 
+_DEBUG_CLICKS: list[dict] = []
+
 
 async def search(keyword: str, local: bool = False, limit: int = 30) -> dict:
     if not keyword.strip():
@@ -30,10 +32,13 @@ async def search(keyword: str, local: bool = False, limit: int = 30) -> dict:
 async def _browser_search(keyword: str, limit: int) -> dict:
     from .browser_worker import run
 
-    return await run("docs-search", {"keyword": keyword, "limit": limit})
+    return await run("docs-search", {"keyword": keyword, "limit": limit,
+                                     "debug": bool(os.environ.get("FEISHU_DEBUG_SEARCH"))})
 
 
-async def _browser_search_impl(keyword: str, limit: int) -> dict:
+async def _browser_search_impl(keyword: str, limit: int, debug: bool = False) -> dict:
+    if debug:
+        os.environ["FEISHU_DEBUG_SEARCH"] = "1"
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("文档网页搜索只能由受限 Browser Worker 执行")
     try:
@@ -56,28 +61,12 @@ async def _browser_search_impl(keyword: str, limit: int) -> dict:
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
             blocked = await browser_guard.install(page)
             await page.goto(f"https://{domain}/next/messenger/", wait_until="domcontentloaded", timeout=60000)
+            await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(2500)
-            await _click_visible(page, page.get_by_text("搜索", exact=True).first)
-            await page.wait_for_timeout(1200)
-            editor = page.locator("[contenteditable=true]").first
-            if not await editor.count():
-                # The search panel can render asynchronously after a cached
-                # Messenger load. One bounded retry is enough; never inspect
-                # the page's React object graph.
-                await _click_visible(page, page.get_by_text("搜索", exact=True).first)
-                await page.wait_for_timeout(1200)
-                editor = page.locator("[contenteditable=true]").first
-            if not await editor.count():
-                raise FeishuError("搜索框未渲染", hint="运行 feishu.py probe --scope docs-search 检查网页变化")
-            await editor.click()
-            await page.keyboard.type(keyword)
-            await page.wait_for_timeout(1200)
-            cloud = page.get_by_text("云文档", exact=True).last
-            if await cloud.count():
-                await _click_visible(page, cloud)
-            await page.wait_for_timeout(4500)
+            await _run_search(page, keyword)
 
             result_cards = page.locator(".search-doc-card-box")
             raw_count = min(await result_cards.count(), config.MAX_BROWSER_CARDS)
@@ -108,6 +97,17 @@ async def _browser_search_impl(keyword: str, limit: int) -> dict:
                     for j in range(min(await card.locator(".search-tag").count(), 4))
                 ]
                 meta = (await card.locator(".doc-extra-info").first.inner_text()).strip()[:config.MAX_BROWSER_TEXT_BYTES]
+                # A result card is only actionable with its link; grab the
+                # card's own anchor href when the frontend renders one.
+                url = ""
+                try:
+                    anchor = card.locator("a[href]").first
+                    if await anchor.count():
+                        href = await anchor.get_attribute("href")
+                        if href:
+                            url = href if href.startswith("http") else f"https://{domain}{href}"
+                except Exception:
+                    url = ""
                 key = (title.strip(), summary.strip(), meta.strip())
                 if key in seen:
                     continue
@@ -119,10 +119,26 @@ async def _browser_search_impl(keyword: str, limit: int) -> dict:
                     "type": tags[-1] if tags else "doc",
                     "summary": summary[:1000],
                     "meta": meta[:500],
-                    "url": "",
+                    "url": url,
+                    "card_index": i,
                     "source": "browser_dom",
                 })
             complete_marker_found = bool(await page.get_by_text("已经展示全部结果", exact=True).count())
+
+            # Cards carry no <a href> on this tenant; clicking opens the doc
+            # in a new tab (or SPA-navigates).  Resolve URLs for the first
+            # few hits so results are directly usable with `doc <url>`.
+            # Clicking a result usually CLOSES the search panel — reopen and
+            # re-run the search between resolutions when that happens.
+            for card_info in cards[:10]:
+                if not await result_cards.first.count() or not await result_cards.first.is_visible():
+                    await _run_search(page, keyword)
+                    result_cards = page.locator(".search-doc-card-box")
+                url = await _resolve_card_url(ctx, page, result_cards, card_info["card_index"], domain)
+                if url:
+                    card_info["url"] = url
+            for card_info in cards:
+                card_info.pop("card_index", None)
         finally:
             await ctx.close()
     complete = complete_marker_found and len(cards) <= limit
@@ -133,6 +149,7 @@ async def _browser_search_impl(keyword: str, limit: int) -> dict:
         "total": len(cards),
         "complete": complete,
         "note": "飞书网页端云文档搜索结果（当前租户未暴露稳定 REST 搜索接口）",
+        **({"debug_clicks": list(_DEBUG_CLICKS)} if _DEBUG_CLICKS else {}),
     }
 
 
@@ -195,6 +212,28 @@ def _local_search(keyword: str, limit: int) -> dict:
     }
 
 
+async def _run_search(page, keyword: str) -> None:
+    """(Re)open the search panel and run the cloud-doc search."""
+    await _click_visible(page, page.get_by_text("搜索", exact=True).first)
+    await page.wait_for_timeout(1200)
+    editor = page.locator("[contenteditable=true]").first
+    if not await editor.count():
+        await _click_visible(page, page.get_by_text("搜索", exact=True).first)
+        await page.wait_for_timeout(1200)
+        editor = page.locator("[contenteditable=true]").first
+    if not await editor.count():
+        raise FeishuError("搜索框未渲染", hint="运行 feishu.py probe --scope docs-search 检查网页变化")
+    await editor.click()
+    await page.keyboard.press("Control+a")  # panel may remember the last query
+    await page.keyboard.press("Backspace")
+    await page.keyboard.type(keyword)
+    await page.wait_for_timeout(1200)
+    cloud = page.get_by_text("云文档", exact=True).last
+    if await cloud.count():
+        await _click_visible(page, cloud)
+    await page.wait_for_timeout(4500)
+
+
 async def _click_visible(page, locator) -> None:
     """Click a visible control without waiting on an unrelated UI overlay."""
     try:
@@ -207,3 +246,90 @@ async def _click_visible(page, locator) -> None:
             await locator.dispatch_event("click")
         except Exception:
             await locator.click(force=True, timeout=3000)
+
+
+_DOC_URL_RE = __import__("re").compile(
+    r"^https?://[^/]+/(?P<kind>docx|docs|wiki|sheets|file|folder)/(?P<token>[A-Za-z0-9_-]+)"
+)
+
+
+def _public_doc_url(url: str) -> str:
+    """Keep only scheme/host/kind/token — strip query, fragments, sub-paths."""
+    m = _DOC_URL_RE.match(url or "")
+    if not m:
+        return ""
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}/{m.group('kind')}/{m.group('token')}"
+
+
+async def _resolve_card_url(ctx, page, result_cards, index: int, domain: str) -> str:
+    """Click one result card and capture where it lands (new tab or same-tab).
+
+    NB: no Escape-based click fallbacks here — Escape closes the search panel.
+    """
+    before = page.url
+    before_pages = set(ctx.pages)
+    try:
+        card = result_cards.nth(index)
+        clicked = False
+        for attempt in ("normal", "force", "dispatch"):
+            try:
+                if attempt == "normal":
+                    await card.click(timeout=2500)
+                elif attempt == "force":
+                    await card.click(force=True, timeout=2500)
+                else:
+                    await card.dispatch_event("click")
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            if os.environ.get("FEISHU_DEBUG_SEARCH"):
+                _DEBUG_CLICKS.append({"index": index, "click_error": "all_attempts_failed"})
+            return ""
+        if os.environ.get("FEISHU_DEBUG_SEARCH"):
+            _DEBUG_CLICKS.append({"index": index, "click_via": attempt})
+        popup = None
+        try:
+            async with ctx.expect_page(timeout=6000) as pop_info:
+                pass
+            popup = await pop_info.value
+        except Exception:
+            for p in ctx.pages:  # fallback: a tab opened without an event race
+                if p not in before_pages:
+                    popup = p
+                    break
+        if popup is not None:
+            try:
+                await popup.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            url = _public_doc_url(popup.url)
+            try:
+                await popup.close()
+            except Exception:
+                pass
+            return url
+        await page.wait_for_timeout(1200)
+        if page.url != before:
+            url = _public_doc_url(page.url)
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=8000)
+                await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            return url
+        if os.environ.get("FEISHU_DEBUG_SEARCH"):
+            _DEBUG_CLICKS.append({
+                "index": index,
+                "url_unchanged": page.url == before,
+                "pages": len(ctx.pages),
+                "dialogs": await page.locator("[role=dialog]").count(),
+                "panel_visible": await result_cards.first.count() > 0,
+            })
+    except Exception:
+        pass
+    return ""

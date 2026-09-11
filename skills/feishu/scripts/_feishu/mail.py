@@ -136,8 +136,10 @@ async def browser_operation(action: str, payload: dict) -> dict:
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
             blocked = await browser_guard.install(page)
             await page.goto(_mail_url(domain), wait_until="domcontentloaded", timeout=60000)
+            await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(8000)
             folder = str(payload.get("folder", "inbox"))
             if folder != "inbox":

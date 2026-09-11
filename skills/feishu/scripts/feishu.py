@@ -157,14 +157,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["status", "purge"])
     p.add_argument("--confirm-purge", action="store_true", help="确认把媒体缓存移动到可恢复归档")
 
-    p = sub.add_parser("doc", help="读/导出文档，或 --list/--walk 云空间")
-    p.add_argument("ref", nargs="?", help="docx/wiki/sheets 链接或裸 token")
+    p = sub.add_parser("doc", help="读/导出文档，--list/--walk 云空间，或 import/replace 写文档")
+    p.add_argument("ref", nargs="?", help="docx/wiki/sheets 链接、裸 token 或 import/replace 操作")
+    p.add_argument("file_path", nargs="?", help="导入文件，或 replace 时的目标文档引用")
+    p.add_argument("replacement_file", nargs="?", help="replace 时用于覆盖正文的本地 Markdown 文件")
+    p.add_argument("--import-file", "--import", dest="import_file", default="", help="要导入的本地文件路径")
     p.add_argument("--export", dest="fmt", default="markdown",
                    choices=["markdown", "docx", "pdf", "xlsx"])
     p.add_argument("--out", default="", help="二进制导出必须写文件；markdown 默认 stdout")
+    p.add_argument("--strict", action="store_true", help="导出失败时直接报错，不降级为浏览器 DOM 文本")
     p.add_argument("--list", action="store_true", help="列我的空间+共享空间根节点")
     p.add_argument("--walk", action="store_true", help="遍历全部可见文档建索引（docs-index.jsonl）")
     p.add_argument("--max-nodes", type=int, default=5000)
+    p.add_argument("--folder", default="", help="导入目标文件夹 token 或 URL（默认我的空间根目录）")
+    p.add_argument("--title", "--name", dest="title", default="", help="导入文档标题（默认取文件名）")
+    p.add_argument("--direct", action="store_true", help="直接写入模式：用户已明确授权，免草稿确认")
+    p.add_argument("--confirm-write", default="", help="写入确认指纹")
 
     p = sub.add_parser("docs-search", help="搜文档（远程网页搜索；--local 搜本地索引/缓存）")
     p.add_argument("keyword")
@@ -175,12 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "media-observe", "all"], default="all")
     p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
     p.add_argument("--msg-id", default="", help="message-media probe 使用的消息 ID")
+    p.add_argument("--interact", action="store_true",
+                   help="media-observe：点击文件卡片触发真实下载（配合 --headed 可手动点）")
+    p.add_argument("--capture", action="store_true",
+                   help="calendar/mail 写接口抓包：headed 浏览器里由用户手动操作一次，记请求元数据与截断 body")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
 
     p = sub.add_parser("send", help="默认只产草稿；--confirm-send 或用户明确指定 --direct 才真发")
     p.add_argument("--chat-id", required=True)
     p.add_argument("--text", default="", help="正文（慎用，会进 shell history；优先 --text-file）")
     p.add_argument("--text-file", default="", help="从文件读正文（- 表示 stdin）")
+    p.add_argument("--file", default="", help="要发送的本地文件路径")
     p.add_argument("--reply-to", default="", help="被回复消息的 msg_id")
     p.add_argument("--at-user-id", action="append", default=[])
     p.add_argument("--confirm-send", default="", metavar="FINGERPRINT")
@@ -237,6 +250,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--title", required=True)
     q.add_argument("--start", required=True)
     q.add_argument("--end", required=True)
+    q.add_argument("--calendar-id", default="", help="目标日历 id（或设 FEISHU_CALENDAR_ID）")
+    q.add_argument("--description", default="")
     q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
     q = cal_sub.add_parser("update", help="修改会议；默认只产草稿")
     q.add_argument("event_id")
@@ -244,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--start", default="")
     q.add_argument("--end", default="")
     q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
+    q = cal_sub.add_parser("delete", help="删除日程；默认只产草稿")
+    q.add_argument("--event-uuid", required=True, help="创建时返回的 event_uuid")
+    q.add_argument("--start-epoch", type=int, required=True, help="事件的 start_epoch（秒）")
+    q.add_argument("--calendar-id", default="", help="目标日历 id（或设 FEISHU_CALENDAR_ID）")
+    q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
+    q = cal_sub.add_parser("sync", help="gateway 增量同步日历事件（含 event_uuid）")
+    q.add_argument("--calendar-id", default="", help="目标日历 id（或设 FEISHU_CALENDAR_ID）")
+    q.add_argument("--since-micros", type=int, default=0, help="增量起点（微秒）；0=全量")
     return ap
 
 
@@ -256,10 +279,20 @@ async def _run(args) -> int:
     fmt = "json" if args.json else args.format
 
     if args.cmd == "probe":
+        capture = getattr(args, "capture", False)
+        if capture and not args.out:
+            note("✗ --capture 结果含截断请求 body，必须用 --out 写文件，不落 stdout")
+            return 2
+        if capture:
+            what = "创建一个测试日程（标题如「测试会议」，今天，30 分钟）" if args.scope == "calendar" \
+                else "发送一封测试邮件（发给自己即可）"
+            note(f"浏览器即将打开（有界面）。请在 240 秒内手动{what}；")
+            note("抓到写请求后再等 20 秒窗口即自动结束。结果只写入 --out 文件。")
         with query_lock.acquire("probe"):
             result = await asyncio.wait_for(
-                probe.run(args.scope, args.keyword, headed=args.headed, msg_id=args.msg_id),
-                timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                probe.run(args.scope, args.keyword, headed=args.headed, msg_id=args.msg_id,
+                          interact=getattr(args, "interact", False), capture=capture),
+                timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS + (240 if capture else 0),
             )
         if args.out:
             probe.save(result, args.out)
@@ -376,16 +409,17 @@ async def _run(args) -> int:
     if args.cmd == "send":
         # Draft is a local operation — no session needed. Cookies are only
         # loaded inside send.send() once the confirmation gates are satisfied.
-        text = args.text
+        text = args.text or ""
         if args.text_file:
             text = (sys.stdin.read() if args.text_file == "-"
                     else open(args.text_file, encoding="utf-8").read())
-        if not text.strip():
-            note("正文为空，拒绝（空消息没有草稿价值）")
+        if not text.strip() and not args.file:
+            note("正文和文件均为空，拒绝（空消息没有草稿价值）")
             return 1
         result = await send.send(
             args.chat_id, text, reply_id=args.reply_to,
-            at_user_ids=args.at_user_id, confirm=args.confirm_send, direct=args.direct,
+            at_user_ids=args.at_user_id, file_path=args.file,
+            confirm=args.confirm_send, direct=args.direct,
         )
         emit_json(result)
         return 0
@@ -422,6 +456,8 @@ async def _run(args) -> int:
         return 0
 
     if args.cmd == "mail" and args.mail_action in {"send", "reply"}:
+        if args.confirm_write:
+            await auth.prepare()  # 确认执行前必须绑定会话，否则网关 401
         body = open(args.text_file, encoding="utf-8").read()
         if args.mail_action == "send":
             result = await mail.send_message(
@@ -434,16 +470,31 @@ async def _run(args) -> int:
         emit_json(result)
         return 0
 
-    if args.cmd == "calendar" and args.calendar_action in {"create", "update"}:
+    if args.cmd == "calendar" and args.calendar_action in {"create", "update", "delete"}:
+        if args.confirm_write:
+            await auth.prepare()  # 确认执行前必须绑定会话，否则网关 401（payloadType=5）
         if args.calendar_action == "create":
             result = await calendar.create_event(
-                args.title, args.start, args.end, confirm_write=args.confirm_write
+                args.title, args.start, args.end, confirm_write=args.confirm_write,
+                calendar_id=args.calendar_id, description=args.description,
+            )
+        elif args.calendar_action == "delete":
+            result = await calendar.delete_event(
+                args.event_uuid, args.start_epoch, confirm_write=args.confirm_write,
+                calendar_id=args.calendar_id,
             )
         else:
             result = await calendar.update_event(
                 args.event_id, args.title, args.start, args.end,
                 confirm_write=args.confirm_write,
             )
+        emit_json(result)
+        return 0
+
+    if args.cmd == "calendar" and args.calendar_action == "sync":
+        me = await auth.prepare()
+        result = await calendar.sync_events(
+            calendar_id=args.calendar_id, since_micros=args.since_micros)
         emit_json(result)
         return 0
 
@@ -616,6 +667,43 @@ async def _run(args) -> int:
         return 0
 
     if args.cmd == "doc":
+        if args.ref in ("replace", "update"):
+            if not args.file_path or not args.replacement_file:
+                note("用法：feishu.py doc replace <文档链接或token> <本地Markdown文件>")
+                return 2
+            with query_lock.acquire("doc-replace"):
+                res = await documents.replace_document(
+                    ref=args.file_path,
+                    file_path=args.replacement_file,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 文档已原地更新！\n- 链接：{res.get('url')}\n- Token：`{res.get('token')}`")
+            return 0
+
+        import_target = (
+            args.import_file
+            or (args.file_path if args.ref in ("import", "create", "write", "upload") else "")
+            or (args.ref if args.ref and os.path.isfile(args.ref) else "")
+        )
+        if import_target:
+            with query_lock.acquire("doc-import"):
+                res = await documents.import_file(
+                    file_path=import_target,
+                    title=args.title,
+                    folder=args.folder,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 文档导入成功！\n- 标题：{res.get('name')}\n- 链接：{res.get('url')}\n- Token：`{res.get('token')}`")
+            return 0
+
         if args.list:
             with query_lock.acquire("doc-list"):
                 spaces = await asyncio.wait_for(
@@ -651,7 +739,7 @@ async def _run(args) -> int:
             return 2
         with query_lock.acquire("doc-export"):
             data = await asyncio.wait_for(
-                documents.export_document(args.ref, args.fmt),
+                documents.export_document(args.ref, args.fmt, fallback=not getattr(args, "strict", False)),
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
         if args.fmt == "markdown" and not args.out:
@@ -688,8 +776,56 @@ async def _run(args) -> int:
     return 1
 
 
+_GLOBAL_VALUE_FLAGS = ("--format",)
+_GLOBAL_BOOL_FLAGS = ("--json", "--unattended", "--headed")
+
+
+def _split_global_flags(argv: list[str]) -> tuple[dict, list[str]]:
+    """Pull global flags out of argv wherever they appear.
+
+    argparse subparsers only accept options defined on the top-level parser
+    *before* the subcommand, so ``feishu.py message <id> --format json`` used
+    to die with an opaque usage error.  Hoisting the four global flags here
+    makes ``feishu.py --format json message <id>`` and the more natural
+    trailing form equivalent.  Only exact flag tokens are touched, so values
+    belonging to other options (``--text "--format"``) are left alone.
+    """
+    found: dict[str, object] = {}
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        matched = False
+        for flag in _GLOBAL_VALUE_FLAGS:
+            if token == flag and i + 1 < len(argv):
+                found[flag.lstrip("-").replace("-", "_")] = argv[i + 1]
+                i += 2
+                matched = True
+                break
+            if token.startswith(flag + "="):
+                found[flag.lstrip("-").replace("-", "_")] = token.split("=", 1)[1]
+                i += 1
+                matched = True
+                break
+        if matched:
+            continue
+        if token in _GLOBAL_BOOL_FLAGS:
+            found[token.lstrip("-").replace("-", "_")] = True
+            i += 1
+            continue
+        rest.append(token)
+        i += 1
+    return found, rest
+
+
 def main() -> int:
-    args = build_parser().parse_args()
+    globals_, rest = _split_global_flags(sys.argv[1:])
+    args = build_parser().parse_args(rest)
+    for key, value in globals_.items():
+        setattr(args, key, value)
+    if getattr(args, "format", "markdown") not in ("markdown", "json", "jsonl"):
+        print(f"✗ --format 只支持 markdown|json|jsonl（收到 {args.format!r}）", file=sys.stderr)
+        return 2
     _apply_process_limit(args.cmd)
     try:
         return asyncio.run(_run(args))

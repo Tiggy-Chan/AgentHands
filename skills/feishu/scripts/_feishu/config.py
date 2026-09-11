@@ -41,6 +41,7 @@ MAX_EVENT_DEDUP_IDS = max(1_000, int(os.environ.get("FEISHU_MAX_EVENT_DEDUP_IDS"
 MAX_BROWSER_REQUESTS = max(10, int(os.environ.get("FEISHU_MAX_BROWSER_REQUESTS", 1_000)))
 MAX_BROWSER_CARDS = max(10, int(os.environ.get("FEISHU_MAX_BROWSER_CARDS", 500)))
 MAX_BROWSER_TEXT_BYTES = max(256, int(os.environ.get("FEISHU_MAX_BROWSER_TEXT_BYTES", 4096)))
+MAX_DOC_WRITE_BYTES = max(1024, int(os.environ.get("FEISHU_MAX_DOC_WRITE_MB", 16)) * 1024 * 1024)
 MAX_LOCAL_DOC_BYTES = max(1024, int(os.environ.get("FEISHU_MAX_LOCAL_DOC_BYTES", 16 * 1024 * 1024)))
 MESSAGE_RESOURCE_MAX_BYTES = max(
     1024 * 1024,
@@ -72,8 +73,16 @@ BROWSER_TIMEOUT_SECONDS = float(os.environ.get("FEISHU_BROWSER_TIMEOUT", 120))
 BROWSER_QUERY_TIMEOUT_SECONDS = max(
     QUERY_TIMEOUT_SECONDS, BROWSER_TIMEOUT_SECONDS + 20
 )
-BROWSER_MEMORY_HIGH = os.environ.get("FEISHU_BROWSER_MEMORY_HIGH", "384M")
-BROWSER_MEMORY_MAX = os.environ.get("FEISHU_BROWSER_MEMORY_MAX", "512M")
+# 2026-09-10: the authenticated Messenger SPA (now reachable again via
+# cookie injection) needs ~700MB; the old 384/512 budget got the worker
+# oom-killed on every real page load.  Later the same day systemd-oomd
+# started SIGKILLing whole units (rc=255) whenever the *session-wide*
+# memory pressure tripped its limit — the tight cgroup forces aggressive
+# reclaim inside our own unit, which itself drives session PSI up.
+# A roomier ceiling lowers reclaim stalls and makes the oomd kill rarer;
+# the absolute cap still bounds a runaway browser.
+BROWSER_MEMORY_HIGH = os.environ.get("FEISHU_BROWSER_MEMORY_HIGH", "1536M")
+BROWSER_MEMORY_MAX = os.environ.get("FEISHU_BROWSER_MEMORY_MAX", "2G")
 BROWSER_TASKS_MAX = os.environ.get("FEISHU_BROWSER_TASKS_MAX", "128")
 BROWSER_ARGS = [
     "--no-proxy-server",

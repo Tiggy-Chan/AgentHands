@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import os
 import re
@@ -13,8 +14,8 @@ from urllib.parse import quote, urlsplit
 
 from lark_bridge._urls import DRIVE_STREAM
 
-from . import config, gateway, media_store, transport
-from .errors import EndpointNotAdapted, ResourceError
+from . import auth, config, gateway, media_store, transport
+from .errors import EndpointNotAdapted, FeishuError, ResourceError, ResourceIsolationUnavailable
 from .message_model import public_message, public_resource
 
 
@@ -102,7 +103,13 @@ async def probe_metadata(msg_id: str) -> dict:
             if _resource_data(message, resource):
                 adapter = "inline"
             else:
-                _url_for({**resource, "_key": _resource_key(message, resource)})
+                keyed = {**resource, "_key": _resource_key(message, resource)}
+                if _is_browser_only_file(keyed):
+                    item["adapter"] = "browser_download"
+                    item["endpoint_status"] = "browser_only"
+                    adapters.append(item)
+                    continue
+                _url_for(keyed)
                 adapter = "drive_stream" if resource.get("kind") in _KNOWN_DOWNLOAD_KINDS else "direct_url"
             item["adapter"] = adapter
             item["endpoint_status"] = "registered"
@@ -150,6 +157,36 @@ def select_resource(message: dict, resource_id_value: str = "") -> dict:
     return selected
 
 
+def _is_browser_only_file(resource: dict) -> bool:
+    """Chat file messages (file_v3_ keys): no registered HTTP route works."""
+    key = str(resource.get("_key") or "")
+    return resource.get("kind") == "file" and key.startswith("file_v3_")
+
+
+def _iter_file_chunks(path: Path, size: int = 1024 * 1024):
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(size)
+            if not chunk:
+                return
+            yield chunk
+
+
+async def _download_file_via_browser(message: dict, resource: dict) -> dict:
+    from .browser_worker import run
+
+    return await run(
+        "media-file-download",
+        {
+            "msg_id": str(message.get("msg_id") or ""),
+            "chat_id": str(message.get("chat_id") or ""),
+            "resource_id": str(resource.get("resource_id") or ""),
+            "file_name": str(resource.get("name") or ""),
+        },
+        timeout=max(config.BROWSER_TIMEOUT_SECONDS, 180),
+    )
+
+
 def _url_for(resource: dict) -> str:
     kind = str(resource.get("kind") or "")
     key = str(resource.get("_key") or "")
@@ -160,6 +197,11 @@ def _url_for(resource: dict) -> str:
     # tokens.  Image/audio/media routes are intentionally not guessed: once a
     # tenant-specific route is observed by probe it must be added explicitly.
     if kind in _KNOWN_DOWNLOAD_KINDS:
+        if _is_browser_only_file(resource):
+            raise EndpointNotAdapted(
+                "聊天文件（file_v3_）没有可用的静态 HTTP 路由，走浏览器下载",
+                hint="media --action download 会自动用受限浏览器点击真实下载按钮",
+            )
         return f"{DRIVE_STREAM}/space/api/box/stream/download/all/{quote(key, safe='')}/"
 
     # Message media keys (img_v3_…/audio_v3_…/media_v3_…).  The trailing "~"
@@ -261,6 +303,29 @@ async def download_resource(
             total = len(inline)
             digest.update(inline)
             content_type = str(resource.get("mime") or "")
+        elif _is_browser_only_file(resource):
+            # Chat file_v3_ keys have no static HTTP route (2026-09-10:
+            # static-resource 400/404, drive-stream 404).  The web client
+            # mints a one-time URL through a channel invisible to request
+            # hooks (service worker), so the bounded browser clicks the real
+            # download button and harvests the download event instead.
+            browser = await _download_file_via_browser(message, resource)
+            saved = Path(browser["saved_path"])
+            try:
+                size = saved.stat().st_size
+                if size > config.MESSAGE_RESOURCE_MAX_BYTES:
+                    raise ResourceError("消息资源超过单文件大小上限")
+                with saved.open("rb") as src, temp.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                total = size
+                for chunk in _iter_file_chunks(temp):
+                    digest.update(chunk)
+                content_type = ""
+            finally:
+                try:
+                    saved.unlink()
+                except FileNotFoundError:
+                    pass
         else:
             url = _url_for(resource)
             headers = transport.session_headers({"accept-encoding": "identity"})
@@ -326,3 +391,405 @@ async def download_resource(
 
 def resource_from_message(message: dict, resource_id_value: str = "") -> dict:
     return select_resource(message, resource_id_value)
+
+
+# --- browser-based chat file download (worker only) -------------------------
+
+async def _download_file_browser_impl(msg_id: str, chat_id: str, file_name: str, headed: bool = False) -> dict:
+    """Download a chat file by clicking its real download button.
+
+    The web client mints a one-time download URL through a service-worker
+    channel invisible to request hooks (probe-observed 2026-09-10), so the
+    only honest route is driving the UI and harvesting the download event.
+    Saves under FEISHU_HOME; the parent process validates and installs it.
+    """
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("浏览器文件下载只能由受限 Browser Worker 执行")
+    if not chat_id or not file_name:
+        raise ResourceError("浏览器文件下载需要 chat_id 和文件名")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright", hint="先运行 feishu.py login") from exc
+
+    from . import browser_guard
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    fd, temp_name = tempfile.mkstemp(prefix="feishu-file-dl-", dir=str(config.HOME))
+    os.close(fd)
+    os.chmod(temp_name, 0o600)
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=not headed,
+            ignore_https_errors=False,
+            accept_downloads=True,
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await browser_guard.install(page)
+            # Mirror the probe's proven open sequence: plain messenger first,
+            # THEN the chatId deep link (the param only applies post-init).
+            await page.goto(f"https://{domain}/next/messenger/",
+                            wait_until="domcontentloaded", timeout=60000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2500)
+            await page.goto(f"https://{domain}/next/messenger/?chatId={chat_id}",
+                            wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(6000)
+            # The chatId deep link is unreliable on a warm SPA; clicking the
+            # sidebar feed card (keyed by chat_id) definitely opens the chat.
+            feed = page.locator(f'[data-feed-id="{chat_id}"]').first
+            if await feed.count():
+                try:
+                    await feed.click(timeout=3000)
+                    await page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
+            async def find_file_card():
+                # File messages render as div.messageFile containers; text
+                # matches alone also hit sidebar previews and earlier link
+                # messages (a name substring like test.txt ⊂ feishu_probe_test.txt).
+                files = page.locator("[class*=messageFile_filename]")
+                for i in range(min(await files.count(), 10)):
+                    cand = files.nth(i)
+                    try:
+                        if file_name[:30] not in (await cand.inner_text()):
+                            continue
+                        box = await cand.bounding_box()
+                    except Exception:
+                        continue
+                    if box and box['x'] > 350:
+                        row = cand.locator("xpath=ancestor::*[contains(@class,'message-content')][1]")
+                        if await row.count():
+                            return row.first
+                        wrapper = cand.locator("xpath=ancestor::*[contains(@class,'messageFile_wrapper')][1]")
+                        if await wrapper.count():
+                            return wrapper.first
+                        return cand
+                return page.locator('__never__')
+
+            card = await find_file_card()
+            # Position the mouse over the message list (rightmost tall
+            # scrollable) before wheeling — bare wheel events go nowhere.
+            region = await page.evaluate(
+                """() => {
+                  const els = Array.from(document.querySelectorAll('div'))
+                    .filter(e => e.scrollHeight > e.clientHeight + 100 && e.clientHeight > 300)
+                    .map(e => { const r = e.getBoundingClientRect();
+                        return {x: r.x, y: r.y, w: r.width, h: r.height}; })
+                    .filter(b => b.w > 200).sort((a, b) => b.x - a.x);
+                  return els[0] || null;
+                }"""
+            )
+            if region:
+                await page.mouse.move(region['x'] + region['w'] / 2,
+                                      region['y'] + region['h'] / 2)
+            for _ in range(30):  # the list may need a scroll to reveal the file
+                if await card.count():
+                    break
+                await page.mouse.wheel(0, -1600)
+                await page.wait_for_timeout(700)
+            if not await card.count():
+                # Search jump: messenger search for the file name, click the
+                # 消息 result — lands directly on the file message.
+                search_btn = page.get_by_text("搜索", exact=True).first
+                if await search_btn.count():
+                    await search_btn.click()
+                    await page.wait_for_timeout(1000)
+                for selector in ("[contenteditable=true]", "input[placeholder*=搜索]", "input"):
+                    box = page.locator(selector).first
+                    if not await box.count():
+                        continue
+                    try:
+                        await box.fill(file_name[:40])
+                        await box.press("Enter")
+                        break
+                    except Exception:
+                        continue
+                await page.wait_for_timeout(4000)
+                for label in ("文件", "消息", "Files", "Messages"):
+                    tab = page.get_by_text(label, exact=True).last
+                    if await tab.count():
+                        try:
+                            await tab.click()
+                            await page.wait_for_timeout(2000)
+                            break
+                        except Exception:
+                            pass
+                hit = page.get_by_text(file_name[:30], exact=False).first
+                if await hit.count():
+                    try:
+                        await hit.click()
+                        await page.wait_for_timeout(3000)
+                    except Exception:
+                        pass
+                card = await find_file_card()
+            if not await card.count():
+                diag_url = page.url
+                diag_feed = await page.locator("[data-feed-id]").count()
+                diag_title = await page.title()
+                raise ResourceError(
+                    f"浏览器里没找到文件消息：{file_name[:40]!r}"
+                    f"（url={diag_url[-80:]} title={diag_title[:40]!r} feed_cards={diag_feed}）",
+                )
+
+            async def dump_menu_items(active_page) -> list:
+                # Dropdowns render in portal layers — collect every visible
+                # menu-ish item text so the diag shows what actually opened.
+                try:
+                    return await active_page.evaluate(
+                        """() => {
+                          const seen = new Set();
+                          const out = [];
+                          const sels = '[role=menuitem], [role=option], [class*=dropdown] li, [class*=menu] li, [class*=menuItem], [class*=menu-item]';
+                          document.querySelectorAll(sels).forEach(e => {
+                            const r = e.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                              const t = (e.textContent || '').trim().slice(0, 30);
+                              if (t && !seen.has(t) && out.length < 15) { seen.add(t); out.push(t); }
+                            }
+                          });
+                          return out;
+                        }"""
+                    )
+                except Exception:
+                    return []
+
+            async def click_download_targets(active_page) -> str:
+                # File cards carry ud__button--icon actions (options/download)
+                # at their right edge; the global navItem-download is the
+                # download-the-app button — never click that.
+                n_icon = await card.locator(".ud__button--icon").count()
+                clicked_log.append(f'icon_btns_in_card={n_icon}')
+                for bi in range(min(n_icon, 3)):
+                    scoped = card.locator(".ud__button--icon").nth(bi)
+                    try:
+                        await scoped.click(timeout=2500)
+                        clicked_log.append(f'card-icon-btn#{bi}')
+                        await page.wait_for_timeout(800)
+                        items = await dump_menu_items(active_page)
+                        clicked_log.append(f'menu#{bi}={items}')
+                        hit = None
+                        for sel in ('[role=menuitem]', '[class*=menuItem]', '[class*=menu-item]', '[class*=dropdown] li', '[class*=menu] li'):
+                            loc = active_page.locator(sel).filter(has_text="下载")
+                            if await loc.count():
+                                hit = loc.last
+                                break
+                        if hit is not None:
+                            await hit.click(timeout=2500)
+                            clicked_log.append(f'icon-menu#bi:下载')
+                            return f'card-icon-btn#{bi}:menu'
+                        # No download entry — dismiss and try the next button.
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                    except Exception as e:
+                        clicked_log.append(f'icon#{bi}-fail:{type(e).__name__}')
+                for sel in ('[class*=download]', '[aria-label*="下载"]', '[data-tip*="下载"]'):
+                    for i in range(min(await active_page.locator(sel).count(), 3)):
+                        btn = active_page.locator(sel).nth(i)
+                        try:
+                            cls = (await btn.get_attribute('class')) or ''
+                            if 'navItem' in cls:
+                                continue  # download-the-app navbar button
+                            if await btn.is_visible():
+                                await btn.click(timeout=2000)
+                                return f'{sel}#{i}:visible'
+                        except Exception:
+                            continue
+                # Toolbar buttons can be display:none until the row hover
+                # lands; force-click ignores actionability but still fires.
+                for sel in ('[class*=download]', '[aria-label*="下载"]', '[data-tip*="下载"]'):
+                    btn = active_page.locator(sel).first
+                    try:
+                        cls = (await btn.get_attribute('class')) or ''
+                        if 'navItem' in cls:
+                            continue
+                        if await btn.count():
+                            await btn.click(force=True, timeout=2000)
+                            return f'{sel}:force'
+                    except Exception:
+                        continue
+                return
+
+            download = None
+            clicked_log = []
+            await card.hover(timeout=3000)
+            await page.wait_for_timeout(1200)
+            toolbar_diag = await page.evaluate(
+                """() => {
+                  const file = Array.from(document.querySelectorAll('[class*=messageFile_filename]'))
+                    .find(e => e.getBoundingClientRect().x > 350);
+                  if (!file) return null;
+                  let row = file;
+                  for (let d = 0; d < 8 && row; d++, row = row.parentElement) {
+                    if ((row.className || '').toString().includes('MessageActionPermissionWrapper')) break;
+                  }
+                  if (!row) return null;
+                  const out = [];
+                  row.querySelectorAll('[role=button], button, [class*=icon], [data-tip], [aria-label]').forEach(b => {
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && out.length < 25) {
+                      out.push({cls: (b.className.toString().match(/[a-zA-Z][a-zA-Z0-9_-]{2,50}/g) || []).slice(0,3).join('.'),
+                                tip: b.getAttribute('data-tip') || '', aria: b.getAttribute('aria-label') || '',
+                                x: r.x|0, y: r.y|0});
+                    }
+                  });
+                  return out;
+                }"""
+            )
+            pass  # toolbar_diag reported at the end
+            try:
+                async with page.expect_download(timeout=8000) as dl_info:
+                    r = await click_download_targets(page)
+                    if r:
+                        clicked_log.append('hover-icon:' + r)
+                download = await dl_info.value
+            except Exception:
+                pass
+            if download is None:
+                # Hover toolbar may hide 下载 under the ⋯ overflow menu.
+                try:
+                    more = page.locator("[class*=more], [aria-label*=更多], [data-tip*=更多]").last
+                    if await more.count() and await more.is_visible():
+                        async with page.expect_download(timeout=8000) as dl_info:
+                            await more.click(timeout=2500)
+                            await page.wait_for_timeout(600)
+                            item = page.get_by_text("下载", exact=True).last
+                            if await item.count() and await item.is_visible():
+                                await item.click(timeout=2500)
+                                clicked_log.append("menu:下载")
+                        download = await dl_info.value
+                except Exception:
+                    pass
+            if download is None:
+                # Right-click context menu → 下载.
+                try:
+                    async with page.expect_download(timeout=8000) as dl_info:
+                        await card.click(button="right", timeout=2500)
+                        await page.wait_for_timeout(600)
+                        item = page.get_by_text("下载", exact=True).last
+                        if await item.count() and await item.is_visible():
+                            await item.click(timeout=2500)
+                            clicked_log.append("ctx:下载")
+                    download = await dl_info.value
+                except Exception:
+                    pass
+            if download is None:
+                # Card body opens a preview popup; its page has the button.
+                before = set(ctx.pages)
+                try:
+                    await card.click(timeout=2500)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(2000)
+                if len(ctx.pages) == len(before):
+                    try:
+                        await card.dblclick(timeout=2500)
+                        clicked_log.append('dblclick')
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(2500)
+                n_popups = len(ctx.pages) - len(before)
+                clicked_log.append(f'popups={n_popups}')
+                if n_popups == 0:
+                    # Same-page preview overlay/dialog: its download button is
+                    # on the main page now.
+                    try:
+                        async with page.expect_download(timeout=10000) as dl_info:
+                            r = await click_download_targets(page)
+                            if r:
+                                clicked_log.append('dialog-icon:' + r)
+                        download = await dl_info.value
+                    except Exception:
+                        pass
+                for popup in ctx.pages:
+                    if popup in before:
+                        continue
+                    try:
+                        async with popup.expect_download(timeout=15000) as dl_info:
+                            r = await click_download_targets(popup)
+                            if r:
+                                clicked_log.append('popup-icon:' + r)
+                        download = await dl_info.value
+                    except Exception:
+                        continue
+                    break
+            if download is None:
+                try:
+                    (config.HOME / '.last-file-download-diag.json').write_text(json.dumps({
+                        'clicked': clicked_log, 'toolbar': toolbar_diag,
+                    }, ensure_ascii=False, indent=1))
+                except Exception:
+                    pass
+                try:
+                    btn_info = await page.evaluate(
+                        """() => Array.from(document.querySelectorAll('[class*=download], [aria-label*=下载], [data-tip*=下载]')).slice(0,6).map(b => {
+                          const r = b.getBoundingClientRect();
+                          const chain = [];
+                          let el = b;
+                          for (let d = 0; d < 5 && el; d++, el = el.parentElement) {
+                            chain.push(el.tagName.toLowerCase() + '.' + Array.from(el.classList).filter(c => /^[a-zA-Z][a-zA-Z0-9_-]{1,40}$/.test(c)).slice(0,2).join('.'));
+                          }
+                          return {cls: b.className.toString().slice(0,80), vis: r.width > 0 && r.height > 0, x: r.x|0, y: r.y|0, chain};
+                        })"""
+                    )
+                    clicked_log.append(json.dumps(btn_info, ensure_ascii=False)[:600])
+                except Exception as e:
+                    clicked_log.append('btninfo-fail:' + type(e).__name__)
+                try:
+                    btn_count = 0
+                    for sel in ('[class*=download]', '[aria-label*=下载]', '[data-tip*=下载]'):
+                        btn_count += await page.locator(sel).count()
+                    clicked_log.append(f'dl_btns_on_page={btn_count}')
+                    for pg in ctx.pages:
+                        clicked_log.append(f'page:{pg.url[-60:]}')
+                except Exception:
+                    pass
+                dom_diag = await page.evaluate(
+                    """(fname) => {
+                      const matches = Array.from(document.querySelectorAll('*'))
+                        .filter(e => e.children.length === 0 && (e.textContent || '').includes(fname));
+                      return matches.slice(0, 4).map(m => {
+                        const chain = [];
+                        let el = m;
+                        for (let d = 0; d < 6 && el; d++, el = el.parentElement) {
+                          chain.push(el.tagName.toLowerCase() + '.' +
+                            Array.from(el.classList).filter(c => /^[a-zA-Z][a-zA-Z0-9_-]{1,40}$/.test(c)).slice(0,3).join('.'));
+                        }
+                        const r = m.getBoundingClientRect();
+                        return {chain, x: r.x|0, y: r.y|0};
+                      });
+                    }""", file_name[:40])
+                raise ResourceError("未触发文件下载。"
+                                    f" clicked={clicked_log} toolbar={json.dumps(toolbar_diag, ensure_ascii=False)[:700]}")
+            await download.save_as(temp_name)
+            suggested = download.suggested_filename or ""
+        finally:
+            await ctx.close()
+
+    size = os.path.getsize(temp_name)
+    if size == 0:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise ResourceError("浏览器下载得到空文件")
+    if size > config.MESSAGE_RESOURCE_MAX_BYTES:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise ResourceError("消息资源超过单文件大小上限")
+    return {
+        "saved_path": temp_name,
+        "size": size,
+        "suggested_name": suggested,
+    }

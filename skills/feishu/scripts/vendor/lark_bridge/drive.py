@@ -17,7 +17,7 @@ async def create_folder(
 
     Returns {"token": "...", "url": "..."} or None.
     """
-    _http.write_disabled("create_folder")  # agenthands: read-only policy
+    _http.require_write_allowed()
     try:
         headers = {
             "Cookie": cookie,
@@ -57,7 +57,7 @@ async def upload_file(
 
     Returns {"file_token": "...", "node_token": "..."} or None.
     """
-    _http.write_disabled("upload_file")  # agenthands: read-only policy
+    _http.require_write_allowed()
     try:
         checksum = zlib.adler32(file_content) & 0xFFFFFFFF
         params = {
@@ -125,7 +125,7 @@ async def import_document(
 
     Returns {"token": "...", "url": "..."} on success, None on failure.
     """
-    _http.write_disabled("import_document")  # agenthands: read-only policy
+    _http.require_write_allowed()
     import asyncio
     import zlib
 
@@ -201,7 +201,7 @@ async def import_document(
                     "point": {"mount_type": 1, "mount_key": folder_token},
                     "event_source": "1",
                 },
-                headers={**headers, "content-type": "multipart/form-data"},
+                headers={**headers, "content-type": "application/json"},
             )
             result = resp.json()
             if result.get("code") != 0:
@@ -214,6 +214,7 @@ async def import_document(
                 await asyncio.sleep(1)
                 resp = await client.get(
                     f"https://{domain}/space/api/import/result/{ticket}",
+                    headers=headers,
                 )
                 result = resp.json()
                 if result.get("code") != 0:
@@ -465,7 +466,7 @@ async def list_children(cookie: str, cookies: dict[str, str], folder_token: str,
 
 async def delete_nodes(cookie: str, cookies: dict[str, str], tokens: list[str], domain: str = "") -> bool:
     """Delete files/folders by their node tokens. Returns True on success."""
-    _http.write_disabled("delete_nodes")  # agenthands: read-only policy
+    _http.require_write_allowed()
     headers = {
         "Cookie": cookie,
         "content-type": "application/json",

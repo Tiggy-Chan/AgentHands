@@ -62,12 +62,15 @@ def _build_event(m: dict, my_id: str) -> dict:
         sources.append("message.atOutChatterIds")
     if my_id and my_id in dec.get("mention_user_ids", []):
         sources.append("rich_text")
+    at_all = "all" in (dec.get("mention_user_ids") or [])
     if sources:
         at_me, confidence = True, "confirmed"
     elif dec.get("decode_status") == "undecoded":
         at_me, confidence = None, "unknown"
     else:
         at_me, confidence = False, "none"
+    if at_all:
+        sources.append("rich_text.at_all")
     if not raw:
         raw = {
             "type": m.get("type", 0),
@@ -102,6 +105,7 @@ def _build_event(m: dict, my_id: str) -> dict:
         "at_me": at_me,
         "at_me_confidence": confidence,
         "at_me_sources": sources,
+        "at_all": at_all,
         "is_from_me": bool(my_id) and m.get("from_id") == my_id,
         "decode_status": dec.get("decode_status", "unknown"),
         "resources": envelope.get("resources", []),
@@ -114,7 +118,13 @@ def _build_event(m: dict, my_id: str) -> dict:
 
 
 def _should_store(m: dict, my_id: str) -> bool:
-    """Persist only inbound P2P or group/topic messages that address me."""
+    """Persist only inbound P2P or group/topic messages that address me.
+
+    @所有人 decodes to the literal mention id ``"all"`` (verified 2026-09-10:
+    ``<at user_id="all">@所有人</at>``); it addresses every member, so those
+    messages are stored too — an @all announcement is exactly the kind of
+    event a user expects ``events`` to surface.
+    """
     if not m.get("msg_id") or m.get("from_id") == my_id or m.get("is_removed"):
         return False
     chat_type = int(m.get("chat_type") or 0)
@@ -128,6 +138,7 @@ def _should_store(m: dict, my_id: str) -> bool:
         m.get("at_me")
         or my_id in (m.get("at_out_chatter_ids") or [])
         or my_id in dec.get("mention_user_ids", [])
+        or "all" in dec.get("mention_user_ids", [])
     )
 
 
@@ -322,7 +333,9 @@ async def run_async() -> None:
                     )
                     if ev["at_me"]:
                         _notify(f"有人在群里 @ 了你：{ev['text'][:80] or '[非文本消息]'}")
-                    if ev["at_me"] or ev.get("chat_type") == 1:
+                    elif ev.get("at_all"):
+                        _notify(f"群里有人 @ 了所有人：{ev['text'][:80] or '[非文本消息]'}")
+                    if ev["at_me"] or ev.get("at_all") or ev.get("chat_type") == 1:
                         try:
                             context_queue.put_nowait(ev)
                         except asyncio.QueueFull:

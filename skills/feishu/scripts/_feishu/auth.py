@@ -156,6 +156,50 @@ async def touch(cookies: dict, domain: str = "") -> dict:
     return me
 
 
+# --- browser session bridge --------------------------------------------------
+
+def playwright_cookie_jar() -> list[dict]:
+    """cookies.json → Playwright cookie dicts for ``ctx.add_cookies``.
+
+    The persistent browser profile loses its login state long before the
+    saved web-session cookie dies (the daemon keep-alive slides ``session``
+    while the profile's own storage goes stale, observed 2026-09-10: every
+    browser op landed on accounts.feishu.cn login).  Browser operations
+    inject these before navigating instead of trusting the profile alone.
+    """
+    data = load_cookies()
+    domain = (data.get("domain") or config.DOMAIN).lstrip(".")
+    apex = "." + ".".join(domain.split(".")[-2:])
+    jar = []
+    for name, value in (data.get("cookies") or {}).items():
+        jar.append({
+            "name": name,
+            "value": value,
+            "domain": apex,
+            "path": "/",
+            "secure": True,
+        })
+    return jar
+
+
+async def raise_if_login_redirect(page) -> None:
+    """Fail loudly when a browser op got bounced to the login page.
+
+    A login redirect used to surface later as a misleading EndpointNotAdapted
+    ("页面没渲染出卡片"), sending maintainers off to re-reverse a protocol
+    that had not changed.
+    """
+    try:
+        url = page.url or ""
+    except Exception:
+        return
+    if "/accounts/page/login" in url or "/accounts/page/" in url:
+        raise AuthRequired(
+            "浏览器操作被重定向到登录页（profile 与注入 cookie 均未生效）",
+            hint="重新运行 feishu.py login 扫码；若刚扫码过，检查 cookies.json 的 session 是否还有效",
+        )
+
+
 # --- login ------------------------------------------------------------------
 
 async def login_playwright() -> dict:

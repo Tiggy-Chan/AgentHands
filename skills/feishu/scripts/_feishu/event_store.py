@@ -302,7 +302,7 @@ def read_events(
             continue
         if chat_id and ev.get("chat_id") != chat_id:
             continue
-        if mentions_only and not ev.get("at_me"):
+        if mentions_only and not (ev.get("at_me") or ev.get("at_all")):
             continue
         if not include_mine and ev.get("is_from_me"):
             continue

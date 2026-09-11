@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -29,9 +30,20 @@ async def run(
     keyword: str = "测试",
     headed: bool = False,
     msg_id: str = "",
+    interact: bool = False,
+    capture: bool = False,
 ) -> dict:
     from .browser_worker import run as run_worker
 
+    if capture:
+        if scope not in {"calendar", "mail"}:
+            raise ValueError("--capture 只支持 --scope calendar|mail")
+        if not headed:
+            raise ValueError("--capture 必须加 --headed（需要你在浏览器里手动操作）")
+        return await run_worker(
+            "probe", {"scope": f"{scope}-capture", "keyword": keyword, "headed": True},
+            timeout=300,
+        )
     if scope == "message-media":
         if not msg_id:
             raise ValueError("message-media probe 需要 --msg-id")
@@ -39,11 +51,15 @@ async def run(
     if scope == "media-observe":
         if not msg_id:
             raise ValueError("media-observe probe 需要 --msg-id")
-        return await run_worker("media-observe", {"msg_id": msg_id, "headed": headed})
+        return await run_worker(
+            "media-observe",
+            {"msg_id": msg_id, "headed": headed, "interact": interact},
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 240 if interact else 120),
+        )
     return await run_worker("probe", {"scope": scope, "keyword": keyword, "headed": headed})
 
 
-async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
+async def _media_observe_impl(msg_id: str, headed: bool = False, interact: bool = False) -> dict:
     """Watch the real web client load a message's media resources.
 
     Opens the chat containing ``msg_id`` in the Messenger page and records
@@ -52,6 +68,11 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
     path template is what a later resource adapter may register — nothing
     else.  Bodies, cookies and query values are never collected; resource
     keys are redacted to ``<key:resource_id>`` in every recorded field.
+
+    With ``interact=True`` the probe additionally CLICKS the file card (files
+    never auto-fetch, which is why the file_v3_ route was never observed) and
+    captures download events / attachment responses.  With ``headed`` the user
+    is asked to click the download button by hand as a last resort.
     """
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("media-observe 只能由受限 Browser Worker 执行")
@@ -117,6 +138,9 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
 
     matched: list[dict] = []
     media_responses: list[dict] = []
+    attachment_responses: list[dict] = []
+    downloads: list[dict] = []
+    ws_frames: list[dict] = []
     diag: dict[str, object] = {}
     domain = auth.load_cookies().get("domain") or config.DOMAIN
     async with async_playwright() as pw:
@@ -130,7 +154,8 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            await browser_guard.install(page)
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            blocked_requests = await browser_guard.install(page)
 
             def on_request(request) -> None:
                 if len(matched) >= 100:
@@ -173,12 +198,78 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
                             "status": response.status,
                             "content_type": ctype,
                         })
+                    return
+                # A real file download surfaces as octet-stream and/or an
+                # attachment disposition — record those on ANY host (the CDN
+                # may be a non-feishu object store), plus redirects out of
+                # feishu hosts (location captured host+path only).
+                host = parsed.netloc
+                disposition = response.headers.get("content-disposition", "")
+                is_attachment = (ctype.startswith("application/octet-stream")
+                                 or "attachment" in disposition)
+                is_redirect = response.status in (301, 302, 303, 307, 308) and (
+                    "feishu" in host or "feishucdn" in host or "lark" in host)
+                if is_attachment or is_redirect:
+                    if len(attachment_responses) < 100:
+                        entry = {
+                            "host": host,
+                            "path": redact(parsed.path)[:160],
+                            "status": response.status,
+                            "content_type": ctype,
+                            "content_disposition": "attachment" if "attachment" in disposition else "",
+                            "query_keys": tuple(sorted({k for k, _ in parse_qsl(parsed.query)})),
+                        }
+                        if is_redirect:
+                            loc = response.headers.get("location", "")
+                            if loc:
+                                lp = urlsplit(loc)
+                                entry["redirect_to"] = f"{lp.netloc}{redact(lp.path)[:120]}"
+                        attachment_responses.append(entry)
+
+            def on_download(download) -> None:
+                # Metadata only: the download is cancelled before any byte
+                # lands on disk.  Filename is message content → extension only.
+                if len(downloads) < 20:
+                    downloads.append({
+                        "url": redact(urlsplit(download.url).netloc + urlsplit(download.url).path)[:200],
+                        "suggested_ext": os.path.splitext(download.suggested_filename or "")[1],
+                    })
+                asyncio.ensure_future(download.cancel())
+
+            page.on("download", on_download)
+
+            import base64 as _b64
+
+            def _on_ws(ws):
+                def _sent(payload):
+                    if len(ws_frames) >= 40:
+                        return
+                    raw = payload if isinstance(payload, bytes) else str(payload).encode()
+                    # Frames referencing the msg/file by ANY handle: resource
+                    # key, msg id, file name, or a download marker.  The mint
+                    # call for the one-time download URL turned out not to
+                    # carry the raw key (2026-09-10).
+                    needles = [f.encode() for f in fragments]
+                    needles.append(msg_id.encode())
+                    needles += [str(i.get('name') or '').encode() for i in message.get('resources', []) if i.get('name')]
+                    needles.append(b'download')
+                    if not any(n and n in raw for n in needles):
+                        return
+                    ws_frames.append({
+                        "host": urlsplit(ws.url).netloc,
+                        "path": urlsplit(ws.url).path,
+                        "body_b64": _b64.b64encode(raw[:2048]).decode(),
+                    })
+                ws.on("framesent", _sent)
+
+            page.on("websocket", _on_ws)
 
             page.on("request", on_request)
             page.on("response", on_response)
 
             gateway_commands: dict[str, int] = {}
             scroll_phase_requests: list[dict] = []
+            download_route_requests: list[dict] = []
             in_scroll_phase = False
 
             def on_any_request(request) -> None:
@@ -193,8 +284,47 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
                         "path": redact(parsed.path)[:160],
                         "x_command": request.headers.get("x-command", ""),
                     })
+                # Download-ish routes never carry the resource key in the URL
+                # (authcode-minted), so watch the route shape directly.
+                if ("download" in parsed.path or "drive-stream" in parsed.netloc
+                        or "lark-file" in parsed.netloc or "imfile" in parsed.netloc):
+                    if len(download_route_requests) < 100:
+                        download_route_requests.append({
+                            "method": request.method,
+                            "host": parsed.netloc,
+                            "path": redact(parsed.path)[:160],
+                            "query_keys": tuple(sorted({k for k, _ in parse_qsl(parsed.query)})),
+                        })
 
             page.on("request", on_any_request)
+
+            popup_requests: list[dict] = []
+
+            def on_popup_request(request) -> None:
+                """Preview popups mint the one-time download URL via their own
+                API calls; record all feishu-host popup traffic (bounded)."""
+                parsed = urlsplit(request.url)
+                if "feishu" not in parsed.netloc and "feishucdn" not in parsed.netloc:
+                    return
+                if len(popup_requests) >= 150:
+                    return
+                popup_requests.append({
+                    "method": request.method,
+                    "host": parsed.netloc,
+                    "path": redact(parsed.path)[:160],
+                    "query_keys": tuple(sorted({k for k, _ in parse_qsl(parsed.query)})),
+                    "x_command": request.headers.get("x-command", ""),
+                })
+
+            def attach_popup_watchers(popup) -> None:
+                popup.on("request", on_request)
+                popup.on("response", on_response)
+                popup.on("request", on_any_request)
+                popup.on("request", on_popup_request)
+                popup.on("download", on_download)
+                popup.on("websocket", _on_ws)
+
+            ctx.on("page", attach_popup_watchers)
             await page.goto(f"https://{domain}/next/messenger/",
                             wait_until="domcontentloaded", timeout=60000)
 
@@ -366,6 +496,77 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
                 diag["scroll_phase_requests"] = scroll_phase_requests[:80]
                 await wait_keys(3000)
 
+            # Interact phase: files never auto-fetch, so click the file card
+            # (and its download affordance) to make the client issue the real
+            # download request.  Headed mode offers a manual window instead.
+            if interact and found_chat:
+                in_scroll_phase = True  # record interact-phase traffic too
+                file_names = [
+                    str(item.get("name") or "")
+                    for item in message.get("resources", [])
+                    if item.get("kind") in ("file", "cloud_file") and item.get("name")
+                ]
+                diag["interact_file_names"] = len(file_names)
+                for name in file_names[:2]:
+                    card = page.get_by_text(name[:40], exact=False).first
+                    if not await card.count():
+                        continue
+                    try:
+                        await card.hover(timeout=3000)
+                        await page.wait_for_timeout(800)
+                        # Prefer an explicit download button/icon revealed by
+                        # the hover; otherwise click the card body (preview).
+                        clicked = ""
+                        for sel in ('[class*=download]', '[aria-label*="下载"]',
+                                    '[data-tip*="下载"]'):
+                            btn = page.locator(sel).first
+                            if await btn.count() and await btn.is_visible():
+                                await btn.click(timeout=2500)
+                                clicked = sel
+                                break
+                        if not clicked:
+                            await card.click(timeout=2500)
+                            clicked = "card"
+                        diag.setdefault("interact_clicks", []).append(clicked)
+                        await page.wait_for_timeout(1500)
+                        # The click may open a hover menu or a preview tab —
+                        # both carry a further 下载 action.
+                        menu = page.get_by_text("下载", exact=True).last
+                        if await menu.count() and await menu.is_visible():
+                            await menu.click(timeout=2500)
+                            diag.setdefault("interact_clicks", []).append("menu:下载")
+                            await page.wait_for_timeout(1500)
+                        # A preview popup page has its own download button.
+                        for popup in ctx.pages:
+                            if popup is page:
+                                continue
+                            for sel in ('[class*=download]', '[aria-label*="下载"]',
+                                        '[data-tip*="下载"]'):
+                                btn = popup.locator(sel).first
+                                try:
+                                    if await btn.count() and await btn.is_visible():
+                                        await btn.click(timeout=2500)
+                                        diag.setdefault("interact_clicks", []).append("popup" + sel)
+                                        break
+                                except Exception:
+                                    continue
+                        await page.wait_for_timeout(4000)
+                    except Exception as exc:
+                        diag.setdefault("interact_clicks", []).append(f"fail:{type(exc).__name__}")
+                    if downloads or attachment_responses:
+                        break
+                if headed and not downloads and not attachment_responses:
+                    print("请在打开的浏览器里手动点击该文件消息的下载按钮（120 秒窗口）",
+                          file=sys.stderr)
+                    for _ in range(120):
+                        if downloads or attachment_responses:
+                            break
+                        await page.wait_for_timeout(1000)
+                diag["interact_downloads"] = len(downloads)
+                diag["interact_attachments"] = len(attachment_responses)
+                in_scroll_phase = False
+                diag["interact_phase_requests"] = scroll_phase_requests[-80:]
+
             # Candidate verification: when the client never fetched the key
             # (old message in a virtualized list), verify the observed
             # /static-resource/v1/<key>~ route directly with the message's
@@ -401,17 +602,391 @@ async def _media_observe_impl(msg_id: str, headed: bool = False) -> dict:
         "resource_ids": sorted(keys),
         "observed": matched,
         "media_responses": media_responses[:50],
+        "attachment_responses": attachment_responses[:50],
+        "downloads": downloads[:20],
+        "ws_frames_sent": ws_frames[:40],
         "endpoint_templates": templates,
         "candidate_checks": candidate_checks,
-        "diag": {**diag, "gateway_commands": dict(sorted(gateway_commands.items()))},
+        "diag": {**diag, "gateway_commands": dict(sorted(gateway_commands.items())),
+                 "blocked_requests": blocked_requests[:50],
+                 "download_route_requests": download_route_requests[:50],
+                 "popup_requests": popup_requests[:80]},
         "note": "只记录了携带资源 key 的请求元数据；路径中的 key 已脱敏。"
                 "guard 拦截了页面可能发出的写类 command（如已读回执）。",
-        "contains_bodies": False,
+        "contains_bodies": bool(ws_frames),
         "contains_credentials": False,
     }
 
 
+async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> None:
+    """Browser-level CDP network sniffer across ALL targets (page + workers).
+
+    Page-level Playwright hooks miss worker-internal connections — 2026-09-11:
+    the calendar SPA listed and created events with ZERO page-visible traffic
+    (no POSTs, no meaningful page WS frames, no service workers).  With CDP
+    flatten auto-attach every target (page/iframe/dedicated+shared worker)
+    gets Network.enable, so worker-held fetches and WebSockets surface here.
+    Bounded like the rest of capture mode: metadata + ≤4 KiB bodies only.
+    """
+    import base64 as b64
+
+    import websockets  # already a venv dep (WS daemon uses it)
+
+    port_file = profile / "DevToolsActivePort"
+    for _ in range(150):
+        if stop.is_set() or port_file.exists():
+            break
+        await asyncio.sleep(0.2)
+    if not port_file.exists():
+        records["cdp_error"] = "DevToolsActivePort 未出现"
+        return
+    lines = port_file.read_text().splitlines()
+    ws_url = f"ws://127.0.0.1:{lines[0].strip()}{lines[1].strip()}"
+    next_id = 0
+    sessions: set[str] = set()
+    targets: dict[str, str] = {}  # sessionId -> target type
+
+    async def send(ws, method: str, params: dict | None = None, session_id: str = "") -> None:
+        nonlocal next_id
+        next_id += 1
+        msg: dict = {"id": next_id, "method": method, "params": params or {}}
+        if session_id:
+            msg["sessionId"] = session_id
+        await ws.send(json.dumps(msg))
+
+    def clip_body(text: str | None) -> tuple[str, str, bool]:
+        if not text:
+            return "", "utf-8", False
+        raw = text.encode("utf-8", errors="replace")
+        truncated = len(raw) > 4096
+        return raw[:4096].decode("utf-8", errors="replace"), "utf-8", truncated
+
+    try:
+        async with websockets.connect(ws_url, max_size=2**22) as ws:
+            await send(ws, "Target.setDiscoverTargets", {"discover": True})
+            await send(ws, "Target.setAutoAttach",
+                       {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
+            while not stop.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    m = json.loads(raw)
+                except ValueError:
+                    continue
+                method = m.get("method", "")
+                params = m.get("params") or {}
+                if method == "Target.attachedToTarget":
+                    t = params.get("targetInfo") or {}
+                    # This Chromium delivers sessionId inside params even in
+                    # flatten mode (verified 2026-09-11); commands to the
+                    # child must still carry it top-level.
+                    sid = str(params.get("sessionId") or m.get("sessionId") or "")
+                    ttype = str(t.get("type") or "")
+                    if len(records["targets"]) < 50:
+                        records["targets"].append(
+                            {"type": ttype, "url": str(t.get("url") or "")[:120]})
+                    if sid and sid not in sessions:
+                        sessions.add(sid)
+                        targets[sid] = ttype
+                        await send(ws, "Network.enable", session_id=sid)
+                    continue
+                sid = str(m.get("sessionId") or params.get("sessionId") or "")
+                if method == "Network.requestWillBeSent":
+                    req = params.get("request") or {}
+                    url = str(req.get("url") or "")
+                    parsed = urlsplit(url)
+                    if "feishu" not in parsed.netloc:
+                        continue
+                    rmethod = str(req.get("method") or "")
+                    if len(records["requests"]) < 300:
+                        records["requests"].append({
+                            "method": rmethod, "host": parsed.netloc,
+                            "path": parsed.path, "target": targets.get(sid, "?"),
+                        })
+                    if rmethod.upper() in {"GET", "HEAD", "OPTIONS"}:
+                        continue
+                    body, enc, trunc = clip_body(req.get("postData"))
+                    if len(records["writes"]) < 60:
+                        records["writes"].append({
+                            "method": rmethod, "host": parsed.netloc,
+                            "path": parsed.path, "target": targets.get(sid, "?"),
+                            "body_encoding": enc, "body_truncated": trunc,
+                            "body": body,
+                        })
+                elif method == "Network.webSocketCreated":
+                    parsed = urlsplit(str(params.get("url") or ""))
+                    if len(records["ws_sockets"]) < 30:
+                        records["ws_sockets"].append({
+                            "host": parsed.netloc, "path": parsed.path,
+                            "target": targets.get(sid, "?"),
+                        })
+                elif method in ("Network.webSocketFrameSent",):
+                    resp = params.get("response") or {}
+                    payload = str(resp.get("payloadData") or "")
+                    raw_b = payload.encode("utf-8", errors="replace")
+                    try:
+                        payload.encode("utf-8").decode("utf-8")
+                        body, enc = payload[:4096], "utf-8"
+                    except UnicodeDecodeError:
+                        body, enc = b64.b64encode(raw_b[:4096]).decode(), "base64"
+                    if len(records["ws_frames"]) < 200:
+                        records["ws_frames"].append({
+                            "target": targets.get(sid, "?"),
+                            "opcode": resp.get("opcode"),
+                            "encoding": enc,
+                            "truncated": len(raw_b) > 4096,
+                            "body": body,
+                        })
+    except Exception as exc:
+        records["cdp_error"] = f"{type(exc).__name__}: {exc}"
+
+
+async def _capture_impl(app: str) -> dict:
+    """Headed write-endpoint capture: watch while the USER performs one write.
+
+    Policy relaxation, deliberate and bounded: non-GET request bodies on
+    feishu hosts are recorded (≤4 KiB each, base64 when binary) because the
+    payload shape is exactly what we need to register.  The result sets
+    contains_bodies=true and the CLI refuses it without --out.  Capture files
+    must be deleted once the endpoint is registered (protocol.md).
+    """
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("capture 只能由受限 Browser Worker 执行")
+    auth.load_cookies()
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright", hint="先运行 feishu.py login") from exc
+
+    import base64
+
+    if app == "calendar":
+        from .calendar_ops import _calendar_url as app_url
+    else:
+        from .mail import _mail_url as app_url
+    domain = auth.load_cookies().get("domain") or config.DOMAIN
+
+    requests_meta: list[dict] = []
+    captured_writes: list[dict] = []
+    ws_frames: list[dict] = []
+    # Page-load noise that must never count as "the user did the write".
+    _NOISE_HOSTS = ("mcs-bd.feishu.cn", "slardar-bd.feishu.cn",
+                    "internal-api-security.feishu.cn", "accounts.feishu.cn")
+    # Header allowlist for write capture (credentials NEVER recorded) —
+    # 2026-09-11: replaying the exact captured cmd-1002003 body got a
+    # payloadType-5 rejection, so the differentiator must be in these headers.
+    _HEADER_ALLOWLIST = ("x-command", "x-command-version", "x-web-version",
+                         "x-appid", "x-source", "x-lgw-os-type",
+                         "x-lgw-req-sdk-type", "x-lgw-terminal-type",
+                         "x-lsc-bizid", "x-lsc-version", "x-lsc-terminal",
+                         "content-type", "locale", "x-tt-env",
+                         "x-request-id", "x-b3-traceid")
+    first_interesting_at = 0.0
+
+    def is_noise(method: str, host: str, path: str, x_command: str) -> bool:
+        if host in _NOISE_HOSTS:
+            return True
+        if path == "/im/gateway/":
+            try:
+                return int(x_command or "0") in browser_guard.READ_GATEWAY_COMMANDS
+            except ValueError:
+                return False
+        return False
+
+    async with async_playwright() as pw:
+        # The debug port is loopback-only and lives only for this headed
+        # capture window; it exists so the CDP sniffer can see worker-held
+        # connections that page hooks structurally miss.
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=False,
+            ignore_https_errors=False,
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=list(config.BROWSER_ARGS) + ["--remote-debugging-port=0"],
+        )
+        cdp_records: dict = {"targets": [], "requests": [], "writes": [],
+                             "ws_sockets": [], "ws_frames": []}
+        cdp_stop = asyncio.Event()
+        cdp_task = asyncio.create_task(_cdp_capture(config.PROFILE, cdp_records, cdp_stop))
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            would_block = await browser_guard.install(page, observe=True)
+
+            def on_request(request) -> None:
+                nonlocal first_interesting_at
+                parsed = urlsplit(request.url)
+                if "feishu" not in parsed.netloc:
+                    return
+                entry = {
+                    "method": request.method,
+                    "host": parsed.netloc,
+                    "path": parsed.path,
+                    "x_command": request.headers.get("x-command", ""),
+                    "query_keys": tuple(sorted({k for k, _ in parse_qsl(parsed.query)})),
+                }
+                if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                    entry["headers"] = {
+                        k: v for k, v in request.headers.items()
+                        if k.lower() in _HEADER_ALLOWLIST
+                    }
+                    # 名字全量（值按白名单）——2026-09-11：日历头指纹修正后仍被
+                    # 拒，需要确认有没有白名单外的签名类头（x-gorgon 等）。
+                    entry["header_names"] = sorted(k.lower() for k in request.headers)
+                if len(requests_meta) < 300:
+                    requests_meta.append(entry)
+                if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+                    return
+                body = request.post_data_buffer or b""
+                if not body:
+                    return
+                noise = is_noise(request.method, parsed.netloc, parsed.path,
+                                 request.headers.get("x-command", ""))
+                # Page-load telemetry must not crowd out the one write we are
+                # hunting (2026-09-11: a 40-entry cap filled with boot noise
+                # before the user ever clicked 保存).
+                if noise or len(captured_writes) >= 200:
+                    return
+                sample = bytes(body[:4096])
+                try:
+                    text = sample.decode("utf-8")
+                    encoded, enc = text, "utf-8"
+                except UnicodeDecodeError:
+                    encoded, enc = base64.b64encode(sample).decode(), "base64"
+                captured_writes.append({**entry, "noise": False,
+                                        "body_encoding": enc,
+                                        "body_truncated": len(body) > 4096,
+                                        "body": encoded})
+                if not noise and not first_interesting_at:
+                    first_interesting_at = time.monotonic()  # diagnostic only
+
+            page.on("request", on_request)
+
+            # 2026-09-11: 重放抓到的创建包被网关回 payloadType=5 空响应，
+            # 需要对照真实客户端成功时的响应形状。只记非 GET 网关调用的
+            # 状态码 + ≤4KiB 截断响应体，与请求体同策略（--out、用后删除）。
+            captured_responses: list[dict] = []
+
+            def on_response(response) -> None:
+                try:
+                    req = response.request
+                    parsed = urlsplit(req.url)
+                    if "feishu" not in parsed.netloc:
+                        return
+                    if req.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+                        return
+                    if parsed.path != "/im/gateway/":
+                        return
+                    xc = req.headers.get("x-command", "")
+                    if is_noise(req.method, parsed.netloc, parsed.path, xc):
+                        return
+                    if len(captured_responses) >= 60:
+                        return
+
+                    async def read_body(resp=response, xcmd=xc):
+                        try:
+                            body = await resp.body()
+                        except Exception:
+                            body = b""
+                        sample = body[:4096]
+                        captured_responses.append({
+                            "x_command": xcmd,
+                            "status": resp.status,
+                            "body_encoding": "base64",
+                            "body_truncated": len(body) > 4096,
+                            "body": base64.b64encode(sample).decode(),
+                        })
+
+                    asyncio.get_event_loop().create_task(read_body())
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            def on_websocket(ws) -> None:
+                # Calendar/docs sync mutations over WS frames — HTTP request
+                # hooks never see them (learned the hard way 2026-09-10:
+                # a manually created event produced zero captured POSTs).
+                def on_sent(payload) -> None:
+                    if len(ws_frames) >= 40:
+                        return
+                    raw = payload if isinstance(payload, bytes) else str(payload).encode()
+                    sample = raw[:4096]
+                    try:
+                        encoded, enc = sample.decode("utf-8"), "utf-8"
+                    except UnicodeDecodeError:
+                        encoded, enc = base64.b64encode(sample).decode(), "base64"
+                    ws_frames.append({
+                        "url_host": urlsplit(ws.url).netloc,
+                        "url_path": urlsplit(ws.url).path,
+                        "direction": "sent",
+                        "encoding": enc,
+                        "truncated": len(raw) > 4096,
+                        "body": encoded,
+                    })
+
+                ws.on("framesent", on_sent)
+
+            page.on("websocket", on_websocket)
+            await page.goto(app_url(domain), wait_until="domcontentloaded", timeout=60000)
+            await auth.raise_if_login_redirect(page)
+            # Fixed 240s window — no early-exit heuristics (page-load traffic
+            # made every "first write" check exit before the user ever acted).
+            # The user may also just close the window to finish early.
+            closed_early = False
+            window_s = float(os.environ.get("FEISHU_CAPTURE_WINDOW", 240))
+            deadline = time.monotonic() + window_s
+            while time.monotonic() < deadline:
+                try:
+                    await page.wait_for_timeout(1000)
+                except Exception:
+                    closed_early = True
+                    break
+            try:
+                await asyncio.wait_for(asyncio.sleep(2), timeout=3)  # 收尾 response 任务
+            except Exception:
+                pass
+        finally:
+            cdp_stop.set()
+            try:
+                await asyncio.wait_for(cdp_task, timeout=5)
+            except Exception:
+                cdp_task.cancel()
+            try:
+                # The user closing the whole browser counts as a valid early
+                # finish — never let it destroy the captured data.
+                await ctx.close()
+            except Exception:
+                pass
+    return {
+        "schema": 2,
+        "scope": f"{app}-capture",
+        "requests": requests_meta,
+        "captured_writes": captured_writes,
+        "captured_responses": captured_responses,
+        "ws_frames_sent": ws_frames,
+        "cdp_targets": cdp_records["targets"],
+        "cdp_requests": cdp_records["requests"],
+        "cdp_writes": cdp_records["writes"],
+        "cdp_ws_sockets": cdp_records["ws_sockets"],
+        "cdp_ws_frames": cdp_records["ws_frames"],
+        "cdp_error": cdp_records.get("cdp_error", ""),
+        "would_block": would_block,
+        "pages": [],
+        "closed_early": closed_early,
+        "contains_bodies": bool(captured_writes or ws_frames or cdp_records["writes"]
+                                or cdp_records["ws_frames"]),
+        "contains_credentials": False,
+        "note": "写接口抓包结果。登记进 transport 白名单后请删除此文件。",
+    }
+
+
 async def _run_impl(scope: str, keyword: str = "测试", headed: bool = False) -> dict:
+    if scope.endswith("-capture"):
+        return await _capture_impl(scope[: -len("-capture")])
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("网页 probe 只能由受限 Browser Worker 执行")
     if scope not in {"chats", "docs-search", "mail", "calendar", "all"}:
@@ -438,6 +1013,7 @@ async def _run_impl(scope: str, keyword: str = "测试", headed: bool = False) -
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
             blocked_requests = await browser_guard.install(page)
 
             def request_meta(request) -> dict | None:

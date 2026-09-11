@@ -7,16 +7,25 @@ from .output import note
 
 
 def classify_hit(msg: dict, my_id: str) -> dict:
-    """Combine server hit + local text evidence into a confidence label."""
+    """Combine server hit + local text evidence into a confidence label.
+
+    @所有人 decodes to the literal mention id ``"all"``; the server mention
+    filter already returns those (verified 2026-09-10), so they are reported
+    with ``at_all=True`` and confirmed confidence instead of ``server_only``.
+    """
     server_hit = True  # caller only feeds us cmd=11021 mention hits
     text_hit = my_id in msg.get("mention_user_ids", [])
+    at_all = "all" in msg.get("mention_user_ids", [])
     if server_hit and text_hit:
         conf, sources = "confirmed", ["search_mention", "rich_text"]
+    elif server_hit and at_all:
+        conf, sources = "confirmed", ["search_mention", "rich_text.at_all"]
     elif server_hit:
         conf, sources = "server_only", ["search_mention"]
     else:
         conf, sources = "text_only", ["rich_text"]
-    return {**msg, "at_me": True, "at_me_confidence": conf, "at_me_sources": sources}
+    return {**msg, "at_me": True, "at_all": at_all,
+            "at_me_confidence": conf, "at_me_sources": sources}
 
 
 async def find_mentions(

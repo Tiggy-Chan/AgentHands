@@ -56,11 +56,15 @@ def _is_safe_request(request) -> bool:
     return parsed.netloc in {config.DOMAIN, "www.feishu.cn"} and parsed.path.startswith("/accounts/")
 
 
-async def install(page) -> list[dict]:
+async def install(page, observe: bool = False) -> list[dict]:
     """Abort non-read requests before the page can send them.
 
     Return only bounded request metadata for diagnostics; never retain a URL
     query, header value, request body, or response body.
+
+    With ``observe=True`` (capture mode, headed-only by caller contract),
+    would-block requests are RECORDED but CONTINUED so a human can perform
+    the real write action in a headed window for endpoint capture.
     """
     blocked: list[dict] = []
 
@@ -76,7 +80,10 @@ async def install(page) -> list[dict]:
                     "path": parsed.path,
                     "x_command": route.request.headers.get("x-command", ""),
                 })
-            await route.abort()
+            if observe:
+                await route.continue_()
+            else:
+                await route.abort()
 
     await page.route("**/*", handler)
     return blocked

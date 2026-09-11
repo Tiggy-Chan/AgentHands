@@ -47,16 +47,382 @@ async def get_event(event_id: str) -> dict:
     return await _browser("get", {"event_id": event_id})
 
 
-async def create_event(title: str, start: str, end: str, confirm_write: str = "") -> dict:
-    payload = {"title": title, "start": start, "end": end}
-    if not all(str(payload[key]).strip() for key in payload):
+# --- 日历写接口 wire 编码（2026-09-11 headed 抓包实测登记） -----------------
+#
+# 创建日程 = gateway cmd 1002003，body 即 Packet{cmd, payload}；payload 内层
+# 结构（抓包样本逐字段核对）：
+#   f1 "0"  f2 客户端生成的 event UUID  f3 0
+#   f4/f5/f6 calendar_id（字符串 ×3）  f7/f8 空  f9..f12 0
+#   f15 1  f16 -1(int64)  f17 1  f18 0  f20 0  f21 1  f22 1  f23 0  f24 2
+#   f25 start_epoch  f26 时区  f27 end_epoch  f28 时区
+#   f29 标题  f30 标题  f31 描述富文本 JSON  f32 {f4: f32 360.0, f5: f32 360.0}
+#   f34 {f2 5, f3 3}  f35 0  f36 0
+# 创建后客户端紧跟 cmd 1010023 {f1 uuid, f2 calendar_id}（疑似订阅/关联）。
+
+def _ev(v: int) -> bytes:
+    """protobuf varint（支持负 int64 的十字节形式）。"""
+    if v < 0:
+        v += 1 << 64
+    out = bytearray()
+    while v > 0x7F:
+        out.append((v & 0x7F) | 0x80)
+        v >>= 7
+    out.append(v & 0x7F)
+    return bytes(out)
+
+
+def _key(field: int, wire: int) -> bytes:
+    return _ev((field << 3) | wire)
+
+
+def _fv(field: int, v: int) -> bytes:
+    return _key(field, 0) + _ev(v)
+
+
+def _fb(field: int, data: bytes) -> bytes:
+    return _key(field, 2) + _ev(len(data)) + data
+
+
+def _fs(field: int, s: str) -> bytes:
+    return _fb(field, s.encode("utf-8"))
+
+
+def _description_json(text: str) -> str:
+    """描述富文本 JSON，形状逐字节对齐 2026-09-11 抓包样本（单 plain 行）。
+
+    apool 必须带 1 个 author + 7 个随机 lineguid（nextNum=8）：抓包样本里
+    单行描述也是这个形状，attribs 的 *1 引用要能在 numToAttrib 里解析，
+    最小化 apool 会被网关以 payloadType=5 拒绝（实测）。
+    """
+    import random
+    import string
+
+    line = " ".join(text.split())  # 只支持单行；多行压平
+    body = (line + "\n") if line else ""
+    attrib = f"*1+{len(line)}|1+{len(body) - len(line)}" if line else "*0|1+0"
+    guids = ["".join(random.choices(string.ascii_letters + string.digits, k=6))
+             for _ in range(7)]
+    num_to_attrib = {"0": ["author", "0"]}
+    num_to_attrib.update({str(i + 1): ["lineguid", g] for i, g in enumerate(guids)})
+    return json.dumps({
+        "initialAttributedText": {"text": body, "attribs": attrib},
+        "initialAttributedTexts": {
+            "rows": {}, "cols": {},
+            "text": {"0": body}, "attribs": {"0": attrib},
+        },
+        "apool": {"numToAttrib": num_to_attrib, "nextNum": 8},
+        "style": {},
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_create_payload(calendar_id: str, title: str, start_epoch: int,
+                          end_epoch: int, tz: str = "Asia/Shanghai",
+                          description: str = "") -> tuple[bytes, str]:
+    """构造 cmd 1002003 payload；返回 (payload, client_event_uuid)。"""
+    import struct
+    import uuid as _uuid
+
+    event_uuid = str(_uuid.uuid4())
+    inner = b""
+    inner += _fs(1, "0")
+    inner += _fs(2, event_uuid)
+    inner += _fv(3, 0)
+    for f in (4, 5, 6):
+        inner += _fs(f, calendar_id)
+    inner += _fb(7, b"") + _fb(8, b"")
+    for f in (9, 10, 11, 12):
+        inner += _fv(f, 0)
+    inner += _fv(15, 1)
+    inner += _fv(16, -1)
+    inner += _fv(17, 1) + _fv(18, 0) + _fb(20, b"")
+    inner += _fv(21, 1) + _fv(22, 1) + _fv(23, 0) + _fv(24, 2)
+    inner += _fv(25, start_epoch)
+    inner += _fs(26, tz)
+    inner += _fv(27, end_epoch)
+    inner += _fs(28, tz)
+    inner += _fs(29, title)
+    inner += _fs(30, title)
+    inner += _fs(31, _description_json(description))
+    f32 = _fb(1, b"") + _fb(2, b"")
+    f32 += _key(4, 5) + struct.pack("<f", 360.0)
+    f32 += _key(5, 5) + struct.pack("<f", 360.0)
+    inner += _fb(32, f32)
+    inner += _fb(34, _fb(1, b"") + _fv(2, 5) + _fv(3, 3))
+    inner += _fv(35, 0) + _fv(36, 0)
+    return _fb(1, inner), event_uuid
+
+
+def _build_attach_payload(event_uuid: str, calendar_id: str) -> bytes:
+    """cmd 1010023：创建后紧跟的关联包（抓包样本 f1 uuid / f2 calendar_id / f3 0）。"""
+    return _fb(1, _fs(1, event_uuid) + _fs(2, calendar_id) + _fv(3, 0))
+
+
+def _parse_create_reply(resp: bytes, event_uuid: str) -> tuple[str, str]:
+    """解析 1002003 应答 → (status, detail)。
+
+    2026-09-11 实测应答形态：
+    - 成功：payloadType=1 的短 ack（回显 cid，不回显 event uuid）
+    - 幂等去重：payloadType=0 + f1 错误串 "event already exist"（视为成功）
+    - 拒绝：payloadType=5 + 空 payload（边缘 401，多为会话未绑定/过期）
+    """
+    try:
+        from lark_bridge.proto import proto_pb2 as pb
+
+        pkt = pb.Packet()
+        pkt.ParseFromString(resp)
+        err = ""
+        try:
+            err = pkt.payload.decode("utf-8", "replace") if pkt.payload else ""
+        except Exception:
+            err = ""
+        # f1 错误串在有些应答里直接落在 payload 字段上
+        if "already exist" in err:
+            return "created", "dedup: event already exist"
+        if pkt.payloadType == 1:
+            return "created", "ack"
+        if pkt.payloadType == 5:
+            return "rejected", "payloadType=5（边缘拒绝；多半是请求未带登录态）"
+        # 兜底：原始字节里找错误串
+        raw = resp.decode("utf-8", "replace")
+        if "already exist" in raw:
+            return "created", "dedup: event already exist"
+        if "failed" in raw or "err" in raw[:120].lower():
+            return "rejected", raw[:200]
+        return "sent_unverified", f"payloadType={pkt.payloadType}"
+    except Exception:
+        raw = resp.decode("utf-8", "replace")
+        if "already exist" in raw:
+            return "created", "dedup: event already exist"
+        return "sent_unverified", f"unparsed {len(resp)}B"
+
+
+async def create_event(title: str, start: str, end: str, confirm_write: str = "",
+                       calendar_id: str = "", description: str = "") -> dict:
+    from .output import parse_when
+
+    payload = {"title": title, "start": start, "end": end,
+               "calendar_id": calendar_id, "description": description}
+    if not all(str(payload[key]).strip() for key in ("title", "start", "end")):
         raise ValueError("calendar create 需要标题、开始和结束时间")
+    start_ms, end_ms = parse_when(start), parse_when(end)
+    if not start_ms or not end_ms or end_ms <= start_ms:
+        raise ValueError("calendar create 的结束时间必须晚于开始时间")
+    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
     draft = _draft("calendar_create", payload)
     _require_write(draft, confirm_write)
-    transport.arm_write_once()
-    from lark_bridge import _http
-    _http.require_write_allowed()
-    raise EndpointNotAdapted("日历创建写接口尚未适配；草稿未执行", hint="先运行 feishu.py probe --scope calendar")
+    if not calendar_id:
+        raise ValueError(
+            "缺少 calendar_id（--calendar-id 或 FEISHU_CALENDAR_ID）；"
+            "主日历 id 可在日历页抓包或设置页查看"
+        )
+
+    wire, event_uuid = _build_create_payload(
+        calendar_id, title, start_ms // 1000, end_ms // 1000,
+        description=description)
+    # 一次创建 = 两个 gateway 请求（1002003 + 1010023），而传输层每次写检查
+    # 都会走闸门——用 operation 作用域包住整个创建动作（fingerprint+env 已验）。
+    async with transport.allow_write_operation():
+        resp = await transport.gateway_call(1002003, wire, _new_rid(), header_overrides=_CALENDAR_HEADERS)
+        if os.environ.get("FEISHU_DEBUG_CALENDAR") == "1":
+            try:
+                (config.HOME / ".last-calendar-create-resp.bin").write_bytes(resp[:8192])
+            except Exception:
+                pass
+        status, detail = _parse_create_reply(resp, event_uuid)
+        # 抓包中客户端无论结果都紧跟 1010023 关联包，照做。
+        try:
+            await transport.gateway_call(1010023, _build_attach_payload(event_uuid, calendar_id), _new_rid(), header_overrides=_CALENDAR_HEADERS)
+            attached = True
+        except Exception:
+            attached = False
+    return {
+        "kind": "calendar_create", "status": status,
+        "sent": True, "fingerprint": draft["fingerprint"],
+        "event_uuid": event_uuid, "calendar_id": calendar_id,
+        "attach_ack": attached if status == "created" else None,
+        "detail": detail,
+        "title": title, "start_epoch": start_ms // 1000, "end_epoch": end_ms // 1000,
+    }
+
+
+def _new_rid() -> str:
+    return hashlib.md5(f"calendar-create-{os.getpid()}-{id(object())}".encode()).hexdigest()[:10]
+
+
+# 日历 SPA 的 gateway 头指纹（2026-09-11 capture7 实测）。空字符串 = 真实客户端
+# 没有该头，直接移除。注：Messenger 默认头实测也能过边缘校验（此前认为的
+# 「错版头被 payloadType=5 拒」实为未绑会话的 401），此处仍保持真实指纹。
+_CALENDAR_HEADERS = {
+    "locale": "zh_CN",
+    "x-command-version": "2.7.0",
+    "x-lgw-os-type": "2",
+    "x-lgw-req-sdk-type": "",
+    "x-lsc-bizid": "3",
+    "x-lsc-terminal": "web",
+    "x-web-version": "3.40.0+1a01f3756ef",
+}
+
+
+# --- 删除 / 增量同步（2026-09-11 同批抓包登记） ------------------------------
+#
+# 删除日程 = cmd 1002005，payload = f1 calendar_id, f2 客户端 event uuid,
+# f3 0, f4 0, f5 start_epoch（f5 用于定位重复日程的具体实例）。
+# 成功应答 = payloadType=1 短 ack（同创建）。
+#
+# 增量同步 = cmd 1002002（读），payload = f1{ f1 calendar_id, f2 微秒时间戳
+# 字符串, f3 上限(100) }；响应 f5.f1.f2 里重复 f1 事件记录：f1 服务端 id、
+# f2 客户端 uuid、f25 start、f27 end、f29 标题。
+
+
+def _build_delete_payload(calendar_id: str, event_uuid: str, start_epoch: int) -> bytes:
+    return (_fs(1, calendar_id) + _fs(2, event_uuid)
+            + _fv(3, 0) + _fv(4, 0) + _fv(5, start_epoch))
+
+
+def _build_sync_payload(calendar_id: str, since_micros: int = 0, limit: int = 100) -> bytes:
+    return _fb(1, _fs(1, calendar_id) + _fs(2, str(since_micros)) + _fv(3, limit))
+
+
+def _parse_sync_events(resp: bytes) -> list[dict]:
+    """从 1002002 响应提取事件记录（schema-less 字段遍历，只取已确认字段）。"""
+    from lark_bridge.proto import proto_pb2 as pb
+
+    def walk(buf: bytes, depth: int = 0):
+        i = 0
+        while i < len(buf):
+            key = 0
+            shift = 0
+            while True:
+                b = buf[i]
+                i += 1
+                key |= (b & 0x7F) << shift
+                if not b & 0x80:
+                    break
+                shift += 7
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                v = 0
+                shift = 0
+                while True:
+                    b = buf[i]
+                    i += 1
+                    v |= (b & 0x7F) << shift
+                    if not b & 0x80:
+                        break
+                    shift += 7
+                yield field, wire, v
+            elif wire == 2:
+                ln = 0
+                shift = 0
+                while True:
+                    b = buf[i]
+                    i += 1
+                    ln |= (b & 0x7F) << shift
+                    if not b & 0x80:
+                        break
+                    shift += 7
+                yield field, wire, buf[i:i + ln]
+                i += ln
+            elif wire == 5:
+                yield field, wire, buf[i:i + 4]
+                i += 4
+            else:
+                return
+
+    pkt = pb.Packet()
+    pkt.ParseFromString(resp)
+    events: list[dict] = []
+    # 事件记录特征：同时含 19 位服务端 id (f1) 和 36 字符 uuid (f2) 和
+    # 标题 (f29) 的子消息。直接在 payload 里找所有这样的记录块。
+    def scan(buf: bytes) -> None:
+        fields = {}
+        try:
+            for f, w, v in walk(buf):
+                fields.setdefault(f, []).append((w, v))
+        except Exception:
+            return
+        f1s = fields.get(1, [])
+        f2s = fields.get(2, [])
+        if f29 := fields.get(29):
+            rec = {"server_id": "", "uuid": "", "title": "", "start": 0, "end": 0}
+            for w, v in f1s:
+                if w == 2 and v.isdigit() and len(v) == 19:
+                    rec["server_id"] = v.decode()
+            for w, v in f2s:
+                if w == 2 and len(v) == 36 and v.count(b"-") == 4:
+                    rec["uuid"] = v.decode()
+            try:
+                rec["title"] = f29[0][1].decode()
+            except Exception:
+                pass
+            for fname, key in ((25, "start"), (27, "end")):
+                for w, v in fields.get(fname, []):
+                    if w == 0:
+                        rec[key] = v
+            if rec["uuid"] or rec["server_id"]:
+                events.append(rec)
+        # 递归扫描子消息
+        for f, vals in fields.items():
+            for w, v in vals:
+                if w == 2 and len(v) > 8 and not (
+                        v[:1].isalpha() or all(32 <= c < 127 for c in v[:16])):
+                    try:
+                        scan(v)
+                    except Exception:
+                        pass
+
+    scan(pkt.payload)
+    # 去重（f37/f38 里的 uuid 不含标题，不会误收）
+    seen, out = set(), []
+    for e in events:
+        k = (e["server_id"], e["uuid"])
+        if k not in seen:
+            seen.add(k)
+            out.append(e)
+    return out
+
+
+async def sync_events(calendar_id: str = "", since_micros: int = 0) -> dict:
+    """cmd 1002002 增量同步（读）。since_micros=0 拉全量可见事件。"""
+    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
+    if not calendar_id:
+        raise ValueError("calendar sync 需要 calendar_id（--calendar-id 或 FEISHU_CALENDAR_ID）")
+    resp = await transport.gateway_call(
+        1002002, _build_sync_payload(calendar_id, since_micros),
+        _new_rid(), header_overrides=_CALENDAR_HEADERS)
+    items = _parse_sync_events(resp)
+    return {
+        "kind": "calendar_sync", "items": items, "total": len(items),
+        "calendar_id": calendar_id, "source": "gateway_1002002", "complete": True,
+    }
+
+
+async def delete_event(event_uuid: str, start_epoch: int, confirm_write: str = "",
+                       calendar_id: str = "") -> dict:
+    """cmd 1002005 删除日程（双闸门）。start_epoch 必须与创建时一致。"""
+    if not re.fullmatch(r"[0-9a-f-]{36}", event_uuid or ""):
+        raise ValueError("calendar delete 需要创建时返回的 event_uuid")
+    if not start_epoch:
+        raise ValueError("calendar delete 需要事件的 start_epoch")
+    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
+    payload = {"event_uuid": event_uuid, "start_epoch": start_epoch,
+               "calendar_id": calendar_id}
+    draft = _draft("calendar_delete", payload)
+    _require_write(draft, confirm_write)
+    if not calendar_id:
+        raise ValueError("缺少 calendar_id（--calendar-id 或 FEISHU_CALENDAR_ID）")
+    async with transport.allow_write_operation():
+        resp = await transport.gateway_call(
+            1002005, _build_delete_payload(calendar_id, event_uuid, start_epoch),
+            _new_rid(), header_overrides=_CALENDAR_HEADERS)
+    status, detail = _parse_create_reply(resp, event_uuid)
+    return {
+        "kind": "calendar_delete",
+        "status": "deleted" if status == "created" else status,
+        "sent": True, "fingerprint": draft["fingerprint"],
+        "event_uuid": event_uuid, "calendar_id": calendar_id,
+        "start_epoch": start_epoch, "detail": detail,
+    }
 
 
 async def update_event(event_id: str, title: str = "", start: str = "", end: str = "", confirm_write: str = "") -> dict:
@@ -100,8 +466,10 @@ async def browser_operation(action: str, payload: dict) -> dict:
         )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
             blocked = await browser_guard.install(page)
             await page.goto(_calendar_url(domain), wait_until="domcontentloaded", timeout=60000)
+            await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(8000)
             rows = await _event_rows(page, int(payload.get("limit", 50)), len(blocked))
             if action == "get":

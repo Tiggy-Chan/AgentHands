@@ -49,6 +49,113 @@ class TestTransportPolicy(unittest.TestCase):
             self.t.classify("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", 5),
             "send")
 
+    def test_calendar_write_cmds_gated(self):
+        # 2026-09-11 capture: 1002003=创建日程, 1010023=创建后关联包, 1002005=删除。
+        for cmd in (1002003, 1010023, 1002005):
+            self.assertEqual(
+                self.t.classify("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", cmd),
+                "write", f"cmd={cmd}")
+        # 1002002 增量同步 / 1002006 事件详情 = 读
+        for cmd in (1002002, 1002006):
+            self.assertEqual(
+                self.t.classify("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", cmd),
+                "allow", f"cmd={cmd}")
+
+    def test_calendar_delete_wire_layout(self):
+        # 2026-09-11 抓包：1002005 payload = f1 calendar_id, f2 uuid, f3 0, f4 0, f5 start
+        from _feishu import calendar_ops
+        p = calendar_ops._build_delete_payload("cal-1", "abcd-uuid", 1788769800)
+        self.assertIn(b"cal-1", p)
+        self.assertIn(b"abcd-uuid", p)
+        self.assertIn(calendar_ops._ev(1788769800), p)
+        draft = calendar_ops._draft("calendar_delete", {
+            "event_uuid": "abcd-uuid", "start_epoch": 1788769800, "calendar_id": "cal-1"})
+        import asyncio
+        from _feishu.errors import SendBlocked
+        with self.assertRaises(SendBlocked):
+            asyncio.run(calendar_ops.delete_event("abcd0000-aaaa-bbbb-cccc-ddddeeee0000", 1788769800,
+                                                  calendar_id="cal-1"))
+
+    def test_calendar_sync_parse(self):
+        # 构造最小 1002002 响应：f5{f1{f1 cal, f2{f1{事件记录}}}}
+        import sys
+        from _feishu import calendar_ops
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[1] / "scripts" / "vendor"))
+        from lark_bridge.proto import proto_pb2 as pb
+        _fs, _fv, _fb = calendar_ops._fs, calendar_ops._fv, calendar_ops._fb
+        rec = (_fs(1, "7000000000000000002") + _fs(2, "00000000-0000-0000-0000-000000000001")
+               + _fv(25, 1789146195) + _fv(27, 1789149795) + _fs(29, "测试事件"))
+        inner = _fs(1, "7000000000000000001") + _fb(2, _fb(1, rec))
+        pkt = pb.Packet(); pkt.payloadType = 1
+        pkt.payload = _fb(5, _fb(1, inner))
+        events = calendar_ops._parse_sync_events(pkt.SerializeToString())
+        self.assertEqual(len(events), 1)
+        e = events[0]
+        self.assertEqual(e["uuid"], "00000000-0000-0000-0000-000000000001")
+        self.assertEqual(e["server_id"], "7000000000000000002")
+        self.assertEqual(e["title"], "测试事件")
+        self.assertEqual(e["start"], 1789146195)
+        self.assertEqual(e["end"], 1789149795)
+
+    def test_calendar_create_wire_layout(self):
+        from _feishu import calendar_ops
+        payload, event_uuid = calendar_ops._build_create_payload(
+            "7000000000000000001", "测试会议", 1788771800, 1788773600,
+            description="讨论一下")
+        self.assertGreater(len(payload), 100)
+        self.assertEqual(payload.count(b"7000000000000000001"), 3)
+        self.assertEqual(payload.count("测试会议".encode()), 2)
+        self.assertIn(event_uuid.encode(), payload)
+        self.assertIn(b"Asia/Shanghai", payload)
+        self.assertIn(b"initialAttributedText", payload)
+        # f32 里的两个 float32 360.0（抓包样本原样）
+        import struct
+        self.assertEqual(payload.count(struct.pack("<f", 360.0)), 2)
+        # 起止时间差 1800 秒（30 分钟）应以 varint 形式各出现一次
+        ev = calendar_ops._ev
+        self.assertIn(ev(1788771800), payload)
+        self.assertIn(ev(1788773600), payload)
+
+    def test_calendar_create_requires_gate(self):
+        import asyncio
+        from _feishu import calendar_ops
+        from _feishu.errors import SendBlocked
+        with self.assertRaises(SendBlocked):
+            asyncio.run(calendar_ops.create_event(
+                "t", "2026-09-12 10:00", "2026-09-12 10:30",
+                calendar_id="123"))
+        with self.assertRaises(ValueError):
+            asyncio.run(calendar_ops.create_event(  # 结束早于开始
+                "t", "2026-09-12 10:30", "2026-09-12 10:00",
+                calendar_id="123"))
+
+    def test_calendar_attach_wire_layout(self):
+        # 2026-09-11 抓包：1010023 payload = f1{f1 uuid, f2 calendar_id, f3 0}
+        from _feishu import calendar_ops
+        p = calendar_ops._build_attach_payload("uuid-x", "cal-1")
+        self.assertTrue(p.endswith(b"\x18\x00"))  # f3=0 收尾，漏了会被回 PB unmarshal 错
+        self.assertIn(b"uuid-x", p)
+        self.assertIn(b"cal-1", p)
+
+    def test_calendar_create_reply_parse(self):
+        # 2026-09-11 实测三种应答：payloadType=1 ack / 去重错误串 / 5=边缘401
+        import sys
+        from _feishu import calendar_ops
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[1] / "scripts" / "vendor"))
+        from lark_bridge.proto import proto_pb2 as pb
+
+        ack = pb.Packet(); ack.payloadType = 1; ack.cmd = 1; ack.cid = "x"
+        self.assertEqual(calendar_ops._parse_create_reply(ack.SerializeToString(), "u")[0], "created")
+
+        dup = pb.Packet(); dup.payloadType = 0
+        dup.payload = b"KE.KITE/2 - Remote or network err/119: Internal error processing PreprocessWebCreateEvent: KE.UNREGISTERED/0 - ?/0: event already exist, web create event failed"
+        self.assertEqual(calendar_ops._parse_create_reply(dup.SerializeToString(), "u")[0], "created")
+
+        rej = pb.Packet(); rej.payloadType = 5
+        status, detail = calendar_ops._parse_create_reply(rej.SerializeToString(), "u")
+        self.assertEqual(status, "rejected")
+        self.assertIn("payloadType=5", detail)
+
     def test_unknown_and_create_chat_denied(self):
         for cmd in (13, 1, 9999):
             self.assertEqual(
@@ -72,17 +179,22 @@ class TestTransportPolicy(unittest.TestCase):
         self.assertEqual(self.t.classify("GET", f"https://{d}/space/api/export/result/abc"), "allow")
         self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/export/create/"), "allow")
 
-    def test_domain_writes_denied(self):
+    def test_domain_writes_gated(self):
         from _feishu import config
         d = config.DOMAIN
-        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/explorer/v3/remove/"), "deny")
-        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/import/create/"), "deny")
+        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/explorer/v3/remove/"), "write")
+        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/import/create/"), "write")
+        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/box/upload/prepare/"), "write")
+        self.assertEqual(self.t.classify("POST", f"https://{d}/space/api/box/upload/finish/"), "write")
+        self.assertEqual(self.t.classify("GET", f"https://{d}/space/api/import/result/t123"), "allow")
         self.assertEqual(self.t.classify("GET", f"https://{d}/other/path"), "deny")
+        self.assertEqual(self.t.classify("POST", f"https://{d}/other/path"), "deny")
 
-    def test_stream_download_allowed_upload_denied(self):
+    def test_stream_download_allowed_upload_gated(self):
         base = "https://internal-api-drive-stream.feishu.cn"
         self.assertEqual(self.t.classify("GET", f"{base}/space/api/box/stream/download/all/tk/"), "allow")
-        self.assertEqual(self.t.classify("POST", f"{base}/space/api/box/stream/upload/all/"), "deny")
+        self.assertEqual(self.t.classify("POST", f"{base}/space/api/box/stream/upload/all/"), "write")
+        self.assertEqual(self.t.classify("POST", f"{base}/space/api/box/stream/upload/merge_block/"), "write")
 
     def test_unknown_host_denied(self):
         self.assertEqual(self.t.classify("GET", "https://evil.example.com/"), "deny")
@@ -114,6 +226,21 @@ class TestTransportPolicy(unittest.TestCase):
             _http.require_write_allowed()
             with self.assertRaises(Exception):
                 _http.require_write_allowed()
+        finally:
+            os.environ.pop("FEISHU_ALLOW_WRITE", None)
+
+    def test_allow_write_operation_context_manager(self):
+        import asyncio
+        from lark_bridge import _http
+        os.environ["FEISHU_ALLOW_WRITE"] = "1"
+        try:
+            async def run():
+                async with self.t.allow_write_operation(direct=False):
+                    _http.require_write_allowed()
+                    _http.require_write_allowed()
+                with self.assertRaises(Exception):
+                    _http.require_write_allowed()
+            asyncio.run(run())
         finally:
             os.environ.pop("FEISHU_ALLOW_WRITE", None)
 
@@ -187,6 +314,28 @@ class TestTransportPolicy(unittest.TestCase):
         ))
 
 
+class TestDocumentWrites(unittest.TestCase):
+    def test_replace_draft_preserves_target_token(self):
+        from _feishu import documents
+
+        draft = documents.make_doc_replace_draft(
+            "https://example.feishu.cn/docx/DocToken123", "/tmp/body.md", b"# body\n"
+        )
+        self.assertEqual(draft["action"], "replace_document")
+        self.assertEqual(draft["document_token"], "DocToken123")
+        self.assertEqual(draft["status"], "draft_not_replaced")
+        self.assertEqual(len(draft["fingerprint"]), 16)
+
+    def test_replace_rejects_non_docx_target(self):
+        from _feishu import documents
+        from _feishu.errors import FeishuError
+
+        with self.assertRaises(FeishuError):
+            documents.make_doc_replace_draft(
+                "https://example.feishu.cn/wiki/WikiToken123", "/tmp/body.md", b"# body\n"
+            )
+
+
 class TestQueryGuards(unittest.TestCase):
     def test_query_lock_rejects_second_process(self):
         import tempfile
@@ -253,10 +402,22 @@ class TestQueryGuards(unittest.TestCase):
         from _feishu import browser_worker
         cmd = browser_worker.build_command("chats", "feishu-browser-test", 12.2)
         joined = " ".join(cmd)
-        self.assertIn("--property=MemoryHigh=384M", joined)
-        self.assertIn("--property=MemoryMax=512M", joined)
+        # 2026-09-10: raised from 384M/512M — the authenticated Messenger SPA
+        # needs ~700MB and the old budget got the worker oom-killed.  Raised
+        # again to 1536M/2G: tight cgroups drive session PSI up and trip
+        # systemd-oomd into killing the whole unit.
+        self.assertIn("--property=MemoryHigh=1536M", joined)
+        self.assertIn("--property=MemoryMax=2G", joined)
         self.assertIn("--property=TasksMax=128", joined)
         self.assertIn("--property=RuntimeMaxSec=13s", joined)
+        self.assertNotIn("--eval", joined)
+
+    def test_doc_replace_worker_is_bounded_and_has_no_eval(self):
+        from _feishu import browser_worker
+        cmd = browser_worker.build_command("doc-replace", "feishu-browser-doc-replace", 180)
+        joined = " ".join(cmd)
+        self.assertIn("--property=MemoryMax=2G", joined)
+        self.assertIn("--property=RuntimeMaxSec=180s", joined)
         self.assertNotIn("--eval", joined)
 
     def test_browser_without_systemd_fails_closed(self):
@@ -302,6 +463,84 @@ class TestQueryGuards(unittest.TestCase):
                 self.assertTrue(process.killed)
 
         asyncio.run(check())
+
+    def test_browser_worker_retries_once_on_oomd_kill(self):
+        # systemd-run exits 255 with no worker output when systemd-oomd
+        # SIGKILLs the whole unit; run() must retry that signature once.
+        import asyncio
+        from _feishu import browser_worker
+
+        class Process:
+            def __init__(self, returncode, out=b""):
+                self.returncode = returncode
+                self._out = out
+
+            async def communicate(self, _input=b""):
+                return self._out, b""
+
+            def kill(self):
+                pass
+
+        async def check():
+            calls = []
+            good = json.dumps({"ok": True}).encode()
+
+            async def fake_exec(*_args, **_kwargs):
+                calls.append(1)
+                if len(calls) == 1:
+                    return Process(255)  # oomd kill: signal exit, no output
+                return Process(0, good)
+
+            with patch.object(browser_worker, "_systemd_user_available", return_value=True), \
+                 patch.object(browser_worker.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+                result = await browser_worker.run("chats", timeout=5)
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(len(calls), 2)
+
+            # A second consecutive kill surfaces as an error, not a loop.
+            calls.clear()
+
+            async def always_killed(*_args, **_kwargs):
+                calls.append(1)
+                return Process(255)
+
+            with patch.object(browser_worker, "_systemd_user_available", return_value=True), \
+                 patch.object(browser_worker.asyncio, "create_subprocess_exec", side_effect=always_killed):
+                from _feishu.errors import BrowserWorkerError
+                with self.assertRaises(BrowserWorkerError):
+                    await browser_worker.run("chats", timeout=5)
+            self.assertEqual(len(calls), 2)
+
+            # Non-kill failures (with worker stderr) do not retry.
+            calls.clear()
+
+            async def plain_failure(*_args, **_kwargs):
+                calls.append(1)
+                proc = Process(1)
+                proc.communicate = lambda _input=b"": _fail()
+                return proc
+
+            async def _fail():
+                return b"", b"boom"
+
+            with patch.object(browser_worker, "_systemd_user_available", return_value=True), \
+                 patch.object(browser_worker.asyncio, "create_subprocess_exec", side_effect=plain_failure):
+                from _feishu.errors import BrowserWorkerError
+                with self.assertRaises(BrowserWorkerError):
+                    await browser_worker.run("chats", timeout=5)
+            self.assertEqual(len(calls), 1)
+
+        asyncio.run(check())
+
+    def test_worker_output_with_u2028_inside_json_string(self):
+        # json.dumps leaves U+2028/U+2029/NEL raw inside strings; str.splitlines()
+        # breaks on them and shattered a valid 150KB worker result (2026-09-11).
+        from _feishu import browser_worker
+        text = "first\u2028second\u2029third\u0085"
+        payload = json.dumps({"text": text}, ensure_ascii=False).encode() + b"\n"
+        self.assertIn("\u2028".encode("utf-8"), payload)  # json keeps them raw
+        result = browser_worker._decode_worker_output(payload)
+        self.assertEqual(result["text"], text)
 
     def test_ten_processes_only_one_gets_query_lock(self):
         import subprocess
@@ -972,6 +1211,52 @@ class TestDaemonFiltering(unittest.TestCase):
         from _feishu.daemon import _should_store
         self.assertFalse(_should_store({"msg_id": "m", "from_id": "me", "chat_type": 1}, "me"))
 
+    def test_group_at_all_is_relevant(self):
+        # @所有人 decodes to the literal mention id "all"; those announcements
+        # address every member and must land in the event pool (2026-09-10).
+        from _feishu import daemon
+        fake_dec = {"mention_user_ids": ["all"], "decode_status": "decoded"}
+        with patch.object(daemon, "decode_message", return_value=fake_dec):
+            self.assertTrue(daemon._should_store(
+                {"msg_id": "m", "from_id": "other", "chat_type": 2, "raw": {"x": 1}}, "me"))
+
+    def test_build_event_marks_at_all_separately_from_at_me(self):
+        from _feishu import daemon
+        fake_dec = {
+            "text": "<at user_id=\"all\">@所有人</at> 周六升级",
+            "mention_user_ids": ["all"], "decode_status": "decoded",
+            "semantic_status": "decoded", "msg_type": 1,
+            "structured": {}, "resources": [], "nested_messages": [], "errors": [],
+        }
+        with patch.object(daemon, "decode_message", return_value=fake_dec):
+            event = daemon._build_event(
+                {"msg_id": "m1", "from_id": "other", "chat_id": "c1", "chat_type": 2,
+                 "type": 1, "create_time": 1, "raw": {"x": 1}}, "me")
+        self.assertTrue(event["at_all"])
+        self.assertFalse(event["at_me"])
+        self.assertIn("rich_text.at_all", event["at_me_sources"])
+
+    def test_mentions_classify_confirms_at_all(self):
+        from _feishu.mentions import classify_hit
+        hit = classify_hit({"msg_id": "m", "mention_user_ids": ["all"]}, "me")
+        self.assertTrue(hit["at_all"])
+        self.assertEqual(hit["at_me_confidence"], "confirmed")
+        self.assertIn("rich_text.at_all", hit["at_me_sources"])
+
+    def test_global_flags_work_after_subcommand(self):
+        import feishu
+        found, rest = feishu._split_global_flags(
+            ["message", "m1", "--format", "json", "--resolve-resources"])
+        self.assertEqual(found, {"format": "json"})
+        self.assertEqual(rest, ["message", "m1", "--resolve-resources"])
+        found, rest = feishu._split_global_flags(["--json", "whoami"])
+        self.assertEqual(found, {"json": True})
+        self.assertEqual(rest, ["whoami"])
+        # A value belonging to another option is never eaten.
+        found, rest = feishu._split_global_flags(["send", "--text", "--format-ish"])
+        self.assertEqual(found, {})
+        self.assertEqual(rest, ["send", "--text", "--format-ish"])
+
     def test_build_event_contains_safe_schema2_message_envelope(self):
         from _feishu import daemon
         from lark_bridge._proto_utils import proto_to_dict
@@ -1131,8 +1416,10 @@ class TestSendGate(unittest.TestCase):
         a = fingerprint("c1", "正文", "", ["u1"])
         b = fingerprint("c1", "正文", "", ["u1"])
         c = fingerprint("c1", "改动", "", ["u1"])
+        d = fingerprint("c1", "正文", "", ["u1"], file_sha256="abcd")
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
+        self.assertNotEqual(a, d)
 
     def test_send_without_confirm_blocked(self):
         import asyncio
@@ -1140,6 +1427,14 @@ class TestSendGate(unittest.TestCase):
         from _feishu.send import send
         with self.assertRaises(SendBlocked):
             asyncio.run(send("c1", "正文"))
+
+    def test_send_file_draft_contains_file_info(self):
+        from _feishu.send import make_draft
+        d = make_draft("c1", "说明", file_path="/path/test.bin", file_name="test.bin", file_size=123, file_sha256="abc")
+        self.assertEqual(d["file_name"], "test.bin")
+        self.assertEqual(d["file_size"], 123)
+        self.assertEqual(d["file_sha256"], "abc")
+        self.assertTrue(d["fingerprint"])
 
     def test_wrong_fingerprint_blocked(self):
         import asyncio
@@ -1454,6 +1749,130 @@ class TestSearchPageLimit(unittest.TestCase):
             res = asyncio.run(gateway.search_msg_ids("c1", 0, 0, limit=30))
         self.assertFalse(res["page_limit_hit"])
         self.assertFalse(res["has_more"])
+
+
+class TestMdHtml(unittest.TestCase):
+    def convert(self, md):
+        from _feishu.md_html import markdown_to_html
+        return markdown_to_html(md)
+
+    def test_headings_and_hr(self):
+        html, plain = self.convert("# 标题一\n\n### 标题三\n\n---\n")
+        self.assertIn("<h1>标题一</h1>", html)
+        self.assertIn("<h3>标题三</h3>", html)
+        self.assertIn("<hr>", html)
+        self.assertIn("标题一", plain)
+
+    def test_fenced_code_with_language(self):
+        html, plain = self.convert("```python\nprint('a<b')\n```\n")
+        self.assertIn('<pre><code class="language-python">', html)
+        self.assertIn("print('a&lt;b')", html)
+        self.assertIn("print('a<b')", plain)
+
+    def test_unclosed_fence_does_not_raise(self):
+        html, plain = self.convert("```bash\nls\n")
+        self.assertIn("<pre>", html)
+        self.assertIn("ls", plain)
+
+    def test_table(self):
+        html, plain = self.convert("| 模块 | 状态 |\n| --- | --- |\n| 模块A | 完成 |\n")
+        # Feishu's own clipboard table shape (ace-table), captured 2026-09-10.
+        self.assertIn('<table class="ace-table"', html)
+        self.assertIn('data-ace-table-col-widths="200;200"', html)
+        self.assertIn('<div style="text-align:left" class="ace-line">模块</div>', html)
+        self.assertIn('<div style="text-align:left" class="ace-line">完成</div>', html)
+        self.assertIn("模块", plain)
+
+    def test_table_pipe_escaped_and_in_code_span(self):
+        html, _ = self.convert("| a\\|b | `x|y` |\n| --- | --- |\n| 1 | 2 |\n")
+        self.assertIn('class="ace-line">a|b</div>', html)
+        self.assertIn('class="ace-line"><code>x|y</code></div>', html)
+
+    def test_lists_nested_and_tasks(self):
+        html, plain = self.convert("- 一\n  - 一甲\n- 二\n\n- [x] 已做\n- [ ] 未做\n")
+        self.assertEqual(html.count("<ul>"), 3)
+        self.assertIn("<li>一甲</li>", html)
+        self.assertIn('type="checkbox" disabled checked', html)
+        self.assertIn("[x] 已做", plain)
+
+    def test_ordered_list(self):
+        html, _ = self.convert("1. 甲\n2. 乙\n")
+        self.assertIn("<ol>", html)
+        self.assertIn("<li>乙</li>", html)
+
+    def test_inline_formats(self):
+        html, plain = self.convert("**粗** *斜* ~~删~~ `码` [链](https://a.b/c) 以及 https://d.e/f。\n")
+        for frag in ("<strong>粗</strong>", "<em>斜</em>", "<del>删</del>", "<code>码</code>",
+                     '<a href="https://a.b/c">链</a>', '<a href="https://d.e/f">https://d.e/f</a>'):
+            self.assertIn(frag, html)
+        for frag in ("粗", "斜", "删", "码", "链"):
+            self.assertIn(frag, plain)
+        self.assertNotIn("**", plain)
+
+    def test_relative_link_degrades_to_label(self):
+        html, _ = self.convert("[内部](./local/path.md)\n")
+        self.assertNotIn("href", html)
+        self.assertIn("内部", html)
+
+    def test_raw_html_is_escaped(self):
+        html, plain = self.convert("段落 <script>alert(1)</script> 结束\n")
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_image_degrades_to_alt(self):
+        html, plain = self.convert("![架构图](https://x/y.png)\n")
+        self.assertIn("[图片:架构图]", html)
+        self.assertIn("架构图", plain)
+        self.assertNotIn("<img", html)
+
+    def test_frontmatter_stripped(self):
+        html, plain = self.convert("---\ntitle: x\n---\n# 正文\n")
+        self.assertNotIn("title", html)
+        self.assertIn("<h1>正文</h1>", html)
+
+    def test_blockquote(self):
+        html, plain = self.convert("> 引用一句\n> 接一句\n")
+        self.assertIn("<blockquote>", html)
+        self.assertIn("引用一句 接一句", html)
+
+    def test_empty_and_blank_input(self):
+        self.assertEqual(self.convert(""), ("", ""))
+        self.assertEqual(self.convert("\n\n\n"), ("", ""))
+
+
+class TestExportFallbackMarker(unittest.TestCase):
+    def test_dom_fallback_is_marked_and_strict_reraises(self):
+        import asyncio
+        from _feishu import documents
+        from _feishu.errors import FeishuError
+
+        async def boom(*a, **kw):
+            raise FeishuError("导出失败")
+
+        async def fake_worker(op, payload, timeout=None):
+            return {"title": "T", "content": "正文"}
+
+        with patch.object(documents.drive, "export_document", boom), \
+             patch.object(documents, "_cache_export", lambda *a, **kw: None), \
+             patch.object(documents.auth, "load_cookies",
+                          lambda: {"cookies": {"session": "x", "passport_web_did": "y"}, "domain": "www.feishu.cn"}), \
+             patch("_feishu.browser_worker.run", fake_worker):
+            data = asyncio.run(documents.export_document("Abc123", "markdown"))
+            self.assertTrue(data.startswith(b"<!-- feishu:export-fallback"))
+            self.assertIn("正文", data.decode())
+            with self.assertRaises(FeishuError):
+                asyncio.run(documents.export_document("Abc123", "markdown", fallback=False))
+
+
+    def test_construct_texts_extracts_code_and_cells(self):
+        from _feishu.md_html import construct_texts
+        out = construct_texts("```py\nx = 1\ny = 2\n```\n\n| 甲 | 乙 |\n| --- | --- |\n| 1 | 2 |\n")
+        self.assertEqual(out["code_lines"], ["x = 1", "y = 2"])
+        self.assertEqual(out["table_cells"], ["甲", "乙", "1", "2"])
+
+    def test_normalize_for_compare(self):
+        from _feishu.documents import _normalize_for_compare
+        self.assertEqual(_normalize_for_compare("# 标题 A-1\n\n正文"), "标题a1正文")
 
 
 if __name__ == "__main__":

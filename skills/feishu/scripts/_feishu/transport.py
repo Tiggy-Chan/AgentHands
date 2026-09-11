@@ -26,8 +26,14 @@ from . import config
 from .errors import PolicyViolation, SendBlocked
 from .output import note, scrub, scrubbed_exc
 
-READ_GATEWAY_CMDS = frozenset({8, 64, 5023, 11021})
+READ_GATEWAY_CMDS = frozenset({8, 64, 5023, 11021, 1002002, 1002006})
 SEND_CMD = 5
+# Calendar write commands captured live 2026-09-11 (headed --capture, user
+# created test events by hand): 1002003 = create event, 1010023 = follow-up
+# attach/subscribe referencing the same client event UUID.
+# 1002005 = delete event (same capture batch, user deleted test events):
+# payload f1=calendar_id f2=client event uuid f3=0 f4=0 f5=start_epoch.
+WRITE_GATEWAY_CMDS = frozenset({1002003, 1002005, 1010023})
 DENIED_GATEWAY_CMDS = frozenset({13})  # create chat — never automated
 
 _INTERNAL_HOST = urlsplit(INTERNAL_API).netloc
@@ -40,6 +46,8 @@ _ALLOW_SEND_ENV = "FEISHU_ALLOW_SEND"
 _send_armed = False
 _direct_send_armed = False
 _write_armed = False
+_direct_write_armed = False
+_write_depth = 0
 
 # Bound session for the current process (set by the CLI after auth load).
 _cookie_header = ""
@@ -81,21 +89,46 @@ def arm_direct_send_once() -> None:
 
 
 def arm_write_once() -> None:
-    """Arm exactly one explicitly confirmed mail/calendar write."""
+    """Arm exactly one explicitly confirmed mail/calendar/doc write."""
     global _write_armed
     _write_armed = True
 
 
+def arm_direct_write_once() -> None:
+    """Arm one explicitly requested direct write without the draft flow."""
+    global _write_armed, _direct_write_armed
+    _write_armed = True
+    _direct_write_armed = True
+
+
+@asynccontextmanager
+async def allow_write_operation(direct: bool = False):
+    """Context manager scoping an authorized multi-request write operation."""
+    global _write_depth, _direct_write_armed
+    _write_depth += 1
+    old_direct = _direct_write_armed
+    if direct:
+        _direct_write_armed = True
+    try:
+        yield
+    finally:
+        _write_depth -= 1
+        _direct_write_armed = old_direct
+
+
 def _write_gate_check() -> None:
-    global _write_armed
-    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+    global _write_armed, _direct_write_armed, _write_depth
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1" and not _direct_write_armed:
         raise SendBlocked(
             "写入被拦截：需要环境变量 FEISHU_ALLOW_WRITE=1",
-            hint="邮件/日历写入必须同时匹配 fingerprint 并使用该环境变量",
+            hint="文档/邮件/日历写入必须同时匹配 fingerprint 并使用 FEISHU_ALLOW_WRITE=1，或使用 --direct",
         )
-    if not _write_armed:
+    if _write_depth > 0:
+        return
+    if not _write_armed and not _direct_write_armed:
         raise SendBlocked("写入被拦截：当前进程没有为本次请求武装一次性闸门")
-    _write_armed = False
+    if not _direct_write_armed:
+        _write_armed = False
 
 
 def _send_gate_check() -> None:
@@ -127,6 +160,8 @@ def classify(method: str, url: str, gateway_cmd: int = 0) -> str:
                 return "allow"
             if gateway_cmd == SEND_CMD:
                 return "send"
+            if gateway_cmd in WRITE_GATEWAY_CMDS:
+                return "write"
             return "deny"
         return "deny"
 
@@ -138,6 +173,8 @@ def classify(method: str, url: str, gateway_cmd: int = 0) -> str:
     if host == _DRIVE_STREAM_HOST:
         if path.startswith("/space/api/box/stream/download/") and method == "GET":
             return "allow"
+        if path.startswith("/space/api/box/stream/upload/") and method == "POST":
+            return "write"
         return "deny"
 
     # Message media (image/audio/video keys) — route shape observed from the
@@ -148,17 +185,25 @@ def classify(method: str, url: str, gateway_cmd: int = 0) -> str:
             return "allow"
         return "deny"
 
-    if host == _domain:
+    if host == _domain or host == config.DOMAIN:
         if method == "GET" and (
             path.startswith("/space/api/explorer/")
             or path.startswith("/space/api/wiki/")
             or path.startswith("/space/api/export/result/")
+            or path.startswith("/space/api/import/result/")
         ):
             return "allow"
         # Export creation is a read in spirit: it renders a document the
         # account can already see into a downloadable file.
         if method == "POST" and path == "/space/api/export/create/":
             return "allow"
+        if method == "POST" and (
+            path.startswith("/space/api/box/upload/")
+            or path == "/space/api/import/create/"
+            or path.startswith("/space/api/explorer/v2/create/")
+            or path == "/space/api/explorer/v3/remove/"
+        ):
+            return "write"
         return "deny"
 
     return "deny"
@@ -173,10 +218,13 @@ def check_allowed(method: str, url: str, gateway_cmd: int = 0) -> None:
         # check; reaching it means the caller went through sender.py.
         _http.require_send_allowed()
         return
+    if verdict == "write":
+        _http.require_write_allowed()
+        return
     raise PolicyViolation(
         f"传输层拦截 {method} {urlsplit(url).netloc}{urlsplit(url).path}"
         + (f" (cmd={gateway_cmd})" if gateway_cmd else ""),
-        hint="该请求不在只读白名单内；如确属新读接口，先抓包验证再登记到 transport.classify",
+        hint="该请求不在允许白名单内；如确属新接口，先抓包验证再登记到 transport.classify",
     )
 
 
@@ -213,7 +261,8 @@ async def request(
 
         raise FeishuError("网络请求已被 FEISHU_NO_NETWORK=1 禁用")
     check_allowed(method, url, gateway_cmd)
-    if gateway_cmd == SEND_CMD:
+    # Sending/creating must not duplicate on a lost response — no retries.
+    if gateway_cmd == SEND_CMD or gateway_cmd in WRITE_GATEWAY_CMDS:
         retries = 0
     last_exc = None
     for attempt in range(retries + 1):
@@ -266,7 +315,8 @@ async def stream_request(
             await response.aclose()
 
 
-async def gateway_call(cmd: int, payload: bytes, rid: str, timeout: float = 15):
+async def gateway_call(cmd: int, payload: bytes, rid: str, timeout: float = 15,
+                       header_overrides: dict | None = None):
     """POST a protobuf Packet to the IM gateway. Returns raw response bytes."""
     import hashlib
     import time
@@ -296,6 +346,14 @@ async def gateway_call(cmd: int, payload: bytes, rid: str, timeout: float = 15):
             "x-web-version": "7.68.5",
         }
     )
+    # Calendar 等非 Messenger 子应用的 gateway 命令有自己的头指纹
+    # （2026-09-11 抓包：cmd 1002003 要求 x-command-version=2.7.0、
+    # x-lsc-bizid=3 等，错版会被回 payloadType=5 空响应）。
+    # 空字符串 = 该头在真实客户端中不存在，直接移除。
+    if header_overrides:
+        headers.update(header_overrides)
+        for k in [k for k, v in headers.items() if v == ""]:
+            headers.pop(k)
     resp = await request(
         "POST",
         f"{INTERNAL_API}/im/gateway/",

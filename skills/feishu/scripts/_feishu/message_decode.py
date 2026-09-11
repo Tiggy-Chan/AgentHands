@@ -194,9 +194,14 @@ def _plausible_media_key(key: str) -> bool:
 def _file_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """FILE (type 3) layout, tenant-verified 2026-09-07:
     f1 str = key (file_v3_…), f2 str = name, f3 varint = size, f4 str = mime.
+    2026-09-10: f7 str = region tag (e.g. eu_nc) now captured; f5/f6 (if
+    present) recorded as presence+length only — if file payloads turn out to
+    be AES-256-GCM like images, the crypto material lives in one of those.
     """
     key = name = mime = ""
     size = 0
+    region = ""
+    unknown: dict[str, int] = {}
     for fn, wire_type, value in _wire_fields(content):
         if fn == 1 and wire_type == 2:
             key = _try_str(value)
@@ -206,6 +211,10 @@ def _file_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]
             size = int(value)
         elif fn == 4 and wire_type == 2:
             mime = _try_str(value)
+        elif fn == 7 and wire_type == 2:
+            region = _try_str(value)
+        elif fn in (5, 6) and wire_type == 2:
+            unknown[f"f{fn}"] = len(value)  # presence+length only, never content
     structured: dict[str, Any] = {}
     if name:
         structured["fileName"] = _clip(name, 512)
@@ -213,6 +222,10 @@ def _file_details(content: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]
         structured["fileMime"] = _clip(mime, 256)
     if size:
         structured["fileSize"] = size
+    if region:
+        structured["fileRegion"] = _clip(region, 64)
+    if unknown:
+        structured["fileUnknownFields"] = unknown
     structured["field_mapping"] = "tenant-verified-2026-09-07"
     resources: list[dict[str, Any]] = []
     if key:
