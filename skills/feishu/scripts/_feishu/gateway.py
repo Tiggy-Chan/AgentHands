@@ -4,6 +4,7 @@ cmd 8     fetch messages by id
 cmd 64    group name
 cmd 5023  user name
 cmd 11021 message search (time window / sender / mention filters)
+cmd 1001001 calendar bootstrap (read-only calendar ID discovery)
 
 cmd 5/13 live in send.py behind the send gate.
 """

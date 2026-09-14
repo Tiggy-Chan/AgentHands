@@ -26,7 +26,10 @@ from . import config
 from .errors import PolicyViolation, SendBlocked
 from .output import note, scrub, scrubbed_exc
 
-READ_GATEWAY_CMDS = frozenset({8, 64, 5023, 11021, 1002002, 1002006})
+# 1001001 is emitted by the calendar SPA while loading the calendar list; it
+# is read-only and is used as a bounded fallback when a Browser Worker is not
+# available for calendar ID discovery.
+READ_GATEWAY_CMDS = frozenset({8, 64, 5023, 11021, 1001001, 1002002, 1002006})
 SEND_CMD = 5
 # Calendar write commands captured live 2026-09-11 (headed --capture, user
 # created test events by hand): 1002003 = create event, 1010023 = follow-up

@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from . import auth, browser_guard, config, transport
 from .dom_utils import bounded_inner_text, clip, first_match, lines, normalize_time
@@ -39,6 +39,173 @@ async def list_events(start_time: int = 0, end_time: int = 0, limit: int = 50) -
     if not 1 <= limit <= 200:
         raise ValueError("calendar limit 必须在 1..200 之间")
     return await _browser("list", {"start_time": start_time, "end_time": end_time, "limit": limit})
+
+
+async def list_calendars(my_id: str = "", my_name: str = "") -> dict:
+    """List calendar IDs visible in the authenticated calendar page."""
+    if not my_id or not my_name:
+        me = await auth.prepare()
+        my_id = my_id or me.get("user_id", "")
+        my_name = my_name or me.get("name", "")
+    try:
+        return await _browser("calendars", {"my_id": my_id, "my_name": my_name})
+    except ResourceIsolationUnavailable:
+        # Calendar page loading also emits a read-only 1001001 response.  Use
+        # it when the host has no systemd user session for Browser Worker;
+        # this keeps automatic calendar selection inside the skill.
+        return await _gateway_list_calendars(my_id=my_id, my_name=my_name)
+
+
+async def resolve_calendar_id(calendar_id: str = "", my_id: str = "", my_name: str = "") -> tuple[str, str]:
+    """Resolve explicit ID > environment > the user's managed calendar."""
+    explicit = str(calendar_id or "").strip()
+    configured = os.environ.get("FEISHU_CALENDAR_ID", "").strip()
+    if explicit and explicit.lower() != "auto":
+        return explicit, "explicit"
+    if configured and configured.lower() != "auto":
+        return configured, "environment"
+
+    result = await list_calendars(my_id=my_id, my_name=my_name)
+    items = list(result.get("items") or [])
+    source = str(result.get("source") or "auto")
+    managed = [item for item in items if item.get("managed")]
+    if len(managed) == 1:
+        return str(managed[0]["calendar_id"]), f"{source}_managed"
+    if len(items) == 1:
+        return str(items[0]["calendar_id"]), f"{source}_single"
+    if managed:
+        return str(managed[0]["calendar_id"]), f"{source}_first_managed"
+    raise EndpointNotAdapted(
+        "未能自动确定本人管理的主日历 ID",
+        hint="先运行 feishu.py calendar calendars，或显式提供 --calendar-id",
+    )
+
+
+def _wire_fields(data: bytes):
+    """Bounded top-level protobuf walk used for calendar bootstrap replies."""
+    i = 0
+    count = 0
+    while i < len(data) and count < 256:
+        count += 1
+        try:
+            key = 0
+            shift = 0
+            while True:
+                b = data[i]
+                i += 1
+                key |= (b & 0x7F) << shift
+                if not b & 0x80:
+                    break
+                shift += 7
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                value = 0
+                shift = 0
+                while True:
+                    b = data[i]
+                    i += 1
+                    value |= (b & 0x7F) << shift
+                    if not b & 0x80:
+                        break
+                    shift += 7
+                yield field, wire, value
+            elif wire == 2:
+                length = 0
+                shift = 0
+                while True:
+                    b = data[i]
+                    i += 1
+                    length |= (b & 0x7F) << shift
+                    if not b & 0x80:
+                        break
+                    shift += 7
+                end = i + length
+                if end > len(data):
+                    return
+                yield field, wire, data[i:end]
+                i = end
+            elif wire == 1:
+                if i + 8 > len(data):
+                    return
+                yield field, wire, data[i:i + 8]
+                i += 8
+            elif wire == 5:
+                if i + 4 > len(data):
+                    return
+                yield field, wire, data[i:i + 4]
+                i += 4
+            else:
+                return
+        except (IndexError, ValueError):
+            return
+
+
+def _ascii_field(fields: list[tuple[int, int, object]], number: int) -> str:
+    for field, wire, value in fields:
+        if field != number or wire != 2 or not isinstance(value, (bytes, bytearray)):
+            continue
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if text.isprintable() and text:
+            return text[:256]
+    return ""
+
+
+async def _gateway_list_calendars(my_id: str = "", my_name: str = "") -> dict:
+    """Parse the observed read-only calendar bootstrap command 1001001."""
+    if not my_id or not my_name:
+        me = await auth.prepare()
+        my_id = my_id or me.get("user_id", "")
+        my_name = my_name or me.get("name", "")
+    response = await transport.gateway_call(
+        1001001, b"", _new_rid(), header_overrides=_CALENDAR_HEADERS
+    )
+    return _parse_calendar_bootstrap(response, my_id=my_id, my_name=my_name)
+
+
+def _parse_calendar_bootstrap(response: bytes, my_id: str = "", my_name: str = "") -> dict:
+    """Parse a 1001001 response without returning raw protobuf fields."""
+    from lark_bridge.proto import proto_pb2 as pb
+
+    packet = pb.Packet()
+    packet.ParseFromString(response)
+    if packet.status or packet.payloadType == 5 or not packet.payload:
+        raise EndpointNotAdapted("日历 bootstrap 读取被网关拒绝")
+    items: list[dict] = []
+    seen: set[str] = set()
+    for field, wire, value in _wire_fields(packet.payload):
+        if field != 1 or wire != 2:
+            continue
+        nested = list(_wire_fields(bytes(value)))
+        calendar_id = _ascii_field(nested, 1)
+        owner_id = _ascii_field(nested, 2)
+        if not calendar_id or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", calendar_id):
+            continue
+        if calendar_id in seen:
+            continue
+        seen.add(calendar_id)
+        name = _ascii_field(nested, 15)
+        items.append({
+            "calendar_id": calendar_id,
+            "name": name,
+            "managed": bool((my_name and name == my_name) or (my_id and owner_id == my_id)),
+            "source": "gateway_1001001",
+            "complete": True,
+        })
+    if not items:
+        raise EndpointNotAdapted(
+            "日历 bootstrap 响应中未发现可用 calendar ID",
+            hint="运行 feishu.py probe --scope calendar 检查当前租户协议",
+        )
+    return {
+        "kind": "calendar_calendars",
+        "items": items,
+        "total": len(items),
+        "source": "gateway_1001001",
+        "complete": True,
+    }
 
 
 async def get_event(event_id: str) -> dict:
@@ -113,6 +280,30 @@ def _description_json(text: str) -> str:
         "apool": {"numToAttrib": num_to_attrib, "nextNum": 8},
         "style": {},
     }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _timezone_for_input(value: str) -> str:
+    """Use an explicit input timezone when available, else tenant default."""
+    configured = os.environ.get("FEISHU_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return configured
+    if parsed.tzinfo is None:
+        return configured
+    key = str(getattr(parsed.tzinfo, "key", "") or "")
+    if key:
+        return key
+    offset = parsed.utcoffset()
+    if offset is None:
+        return configured
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    if sign == "+" and hours == 8 and minutes == 0:
+        return "Asia/Shanghai"
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
 
 
 def _build_create_payload(calendar_id: str, title: str, start_epoch: int,
@@ -196,28 +387,57 @@ def _parse_create_reply(resp: bytes, event_uuid: str) -> tuple[str, str]:
         return "sent_unverified", f"unparsed {len(resp)}B"
 
 
+async def _verify_created_event(
+    calendar_id: str,
+    event_uuid: str,
+    title: str,
+    start_epoch: int,
+    end_epoch: int,
+) -> tuple[bool, str, str, str]:
+    """Use the bounded gateway sync to verify a successful create ack."""
+    try:
+        synced = await sync_events(calendar_id)
+    except Exception as exc:
+        return False, "gateway_1002002", f"sync_failed_{type(exc).__name__}", ""
+    for item in synced.get("items", []):
+        if item.get("uuid") == event_uuid:
+            return True, "gateway_1002002", "matched_uuid", str(item.get("server_id") or "")
+    # Some tenant responses omit the client UUID.  Match all immutable fields
+    # before accepting a server record as the newly created event.
+    candidates = [
+        item for item in synced.get("items", [])
+        if item.get("title") == title
+        and int(item.get("start") or 0) == int(start_epoch)
+        and int(item.get("end") or 0) == int(end_epoch)
+    ]
+    if len(candidates) == 1:
+        return True, "gateway_1002002", "matched_title_time", str(candidates[0].get("server_id") or "")
+    return False, "gateway_1002002", "created_event_not_found", ""
+
+
 async def create_event(title: str, start: str, end: str, confirm_write: str = "",
-                       calendar_id: str = "", description: str = "") -> dict:
+                       calendar_id: str = "", description: str = "",
+                       my_id: str = "", my_name: str = "") -> dict:
     from .output import parse_when
 
-    payload = {"title": title, "start": start, "end": end,
-               "calendar_id": calendar_id, "description": description}
-    if not all(str(payload[key]).strip() for key in ("title", "start", "end")):
+    if not all(str(value).strip() for value in (title, start, end)):
         raise ValueError("calendar create 需要标题、开始和结束时间")
     start_ms, end_ms = parse_when(start), parse_when(end)
     if not start_ms or not end_ms or end_ms <= start_ms:
         raise ValueError("calendar create 的结束时间必须晚于开始时间")
-    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
+    calendar_id, calendar_source = await resolve_calendar_id(
+        calendar_id, my_id=my_id, my_name=my_name
+    )
+    timezone_name = _timezone_for_input(start)
+    payload = {"title": title, "start": start, "end": end,
+               "calendar_id": calendar_id, "description": description,
+               "timezone": timezone_name}
     draft = _draft("calendar_create", payload)
     _require_write(draft, confirm_write)
-    if not calendar_id:
-        raise ValueError(
-            "缺少 calendar_id（--calendar-id 或 FEISHU_CALENDAR_ID）；"
-            "主日历 id 可在日历页抓包或设置页查看"
-        )
 
     wire, event_uuid = _build_create_payload(
         calendar_id, title, start_ms // 1000, end_ms // 1000,
+        tz=timezone_name,
         description=description)
     # 一次创建 = 两个 gateway 请求（1002003 + 1010023），而传输层每次写检查
     # 都会走闸门——用 operation 作用域包住整个创建动作（fingerprint+env 已验）。
@@ -235,12 +455,27 @@ async def create_event(title: str, start: str, end: str, confirm_write: str = ""
             attached = True
         except Exception:
             attached = False
+    verified = False
+    verification_source = ""
+    verification_detail = "not_attempted"
+    server_id = ""
+    if status == "created":
+        verified, verification_source, verification_detail, server_id = await _verify_created_event(
+            calendar_id, event_uuid, title, start_ms // 1000, end_ms // 1000
+        )
     return {
         "kind": "calendar_create", "status": status,
-        "sent": True, "fingerprint": draft["fingerprint"],
+        "sent": status == "created", "request_sent": True,
+        "fingerprint": draft["fingerprint"],
         "event_uuid": event_uuid, "calendar_id": calendar_id,
+        "calendar_source": calendar_source,
         "attach_ack": attached if status == "created" else None,
         "detail": detail,
+        "verified": verified,
+        "verification_source": verification_source,
+        "verification_detail": verification_detail,
+        "server_id": server_id,
+        "timezone": timezone_name,
         "title": title, "start_epoch": start_ms // 1000, "end_epoch": end_ms // 1000,
     }
 
@@ -382,18 +617,20 @@ def _parse_sync_events(resp: bytes) -> list[dict]:
     return out
 
 
-async def sync_events(calendar_id: str = "", since_micros: int = 0) -> dict:
+async def sync_events(calendar_id: str = "", since_micros: int = 0,
+                      my_id: str = "", my_name: str = "") -> dict:
     """cmd 1002002 增量同步（读）。since_micros=0 拉全量可见事件。"""
-    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
-    if not calendar_id:
-        raise ValueError("calendar sync 需要 calendar_id（--calendar-id 或 FEISHU_CALENDAR_ID）")
+    calendar_id, calendar_source = await resolve_calendar_id(
+        calendar_id, my_id=my_id, my_name=my_name
+    )
     resp = await transport.gateway_call(
         1002002, _build_sync_payload(calendar_id, since_micros),
         _new_rid(), header_overrides=_CALENDAR_HEADERS)
     items = _parse_sync_events(resp)
     return {
         "kind": "calendar_sync", "items": items, "total": len(items),
-        "calendar_id": calendar_id, "source": "gateway_1002002", "complete": True,
+        "calendar_id": calendar_id, "calendar_source": calendar_source,
+        "source": "gateway_1002002", "complete": True,
     }
 
 
@@ -404,7 +641,7 @@ async def delete_event(event_uuid: str, start_epoch: int, confirm_write: str = "
         raise ValueError("calendar delete 需要创建时返回的 event_uuid")
     if not start_epoch:
         raise ValueError("calendar delete 需要事件的 start_epoch")
-    calendar_id = (calendar_id or os.environ.get("FEISHU_CALENDAR_ID", "")).strip()
+    calendar_id, calendar_source = await resolve_calendar_id(calendar_id)
     payload = {"event_uuid": event_uuid, "start_epoch": start_epoch,
                "calendar_id": calendar_id}
     draft = _draft("calendar_delete", payload)
@@ -419,8 +656,10 @@ async def delete_event(event_uuid: str, start_epoch: int, confirm_write: str = "
     return {
         "kind": "calendar_delete",
         "status": "deleted" if status == "created" else status,
-        "sent": True, "fingerprint": draft["fingerprint"],
+        "sent": status == "created", "request_sent": True,
+        "fingerprint": draft["fingerprint"],
         "event_uuid": event_uuid, "calendar_id": calendar_id,
+        "calendar_source": calendar_source,
         "start_epoch": start_epoch, "detail": detail,
     }
 
@@ -446,7 +685,7 @@ async def _browser(action: str, payload: dict) -> dict:
 async def browser_operation(action: str, payload: dict) -> dict:
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("日历网页读取只能由受限 Browser Worker 执行")
-    if action not in {"list", "get"}:
+    if action not in {"list", "get", "calendars"}:
         raise EndpointNotAdapted(f"日历操作未适配：{action}")
     try:
         from playwright.async_api import async_playwright
@@ -471,6 +710,13 @@ async def browser_operation(action: str, payload: dict) -> dict:
             await page.goto(_calendar_url(domain), wait_until="domcontentloaded", timeout=60000)
             await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(8000)
+            if action == "calendars":
+                return await _calendar_rows(
+                    page,
+                    my_id=str(payload.get("my_id") or ""),
+                    my_name=str(payload.get("my_name") or ""),
+                    blocked_count=len(blocked),
+                )
             rows = await _event_rows(page, int(payload.get("limit", 50)), len(blocked))
             if action == "get":
                 return await _event_detail(page, str(payload.get("event_id", "")), rows)
@@ -487,6 +733,79 @@ async def browser_operation(action: str, payload: dict) -> dict:
             }
         finally:
             await ctx.close()
+
+
+async def _calendar_rows(page, my_id: str = "", my_name: str = "", blocked_count: int = 0) -> dict:
+    """Extract visible calendar IDs from calendar controls, not event cards."""
+    locator = page.locator("[data-calendar-id]")
+    count = min(await locator.count(), config.MAX_BROWSER_CARDS)
+    items: list[dict] = []
+    event_fallbacks: dict[str, dict] = {}
+    seen: set[str] = set()
+    for index in range(count):
+        row = locator.nth(index)
+        item = await row.evaluate(
+            """e => {
+              const r = e.getBoundingClientRect();
+              return {
+                id: e.getAttribute('data-calendar-id') || '',
+                text: (e.innerText || '').slice(0, 512),
+                aria: e.getAttribute('aria-label') || '',
+                title: e.getAttribute('title') || '',
+                cls: String(e.className || ''),
+                visible: r.width > 0 && r.height > 0
+              };
+            }"""
+        )
+        calendar_id = str(item.get("id") or "").strip()
+        if not calendar_id or calendar_id in seen or not item.get("visible"):
+            continue
+        seen.add(calendar_id)
+        cls = str(item.get("cls") or "")
+        text = str(item.get("text") or "").strip()
+        # Event instances carry the same calendar ID, but their class/text
+        # describes an event rather than a calendar control.  Prefer sidebar
+        # controls; retain an event-only ID as a last-resort unnamed calendar.
+        is_event = "event-instance" in cls or "event-instance" in text.lower()
+        if is_event:
+            event_fallbacks.setdefault(calendar_id, {
+                "calendar_id": calendar_id,
+                "name": "",
+                "managed": False,
+                "source": "browser_dom_event_fallback",
+                "complete": False,
+            })
+            continue
+        name = str(item.get("aria") or item.get("title") or text).splitlines()[0].strip()
+        managed = bool(
+            (my_name and name == my_name)
+            or "calendar-item" in cls
+            or "calendars-group" in cls and "subscribed" not in cls.lower()
+        )
+        items.append({
+            "calendar_id": calendar_id,
+            "name": name,
+            "managed": managed,
+            "source": "browser_dom",
+            "complete": False,
+        })
+    if not items:
+        items = list(event_fallbacks.values())
+    if not items:
+        raise EndpointNotAdapted(
+            "日历页未发现可用的 calendar ID",
+            hint=f"请运行 feishu.py probe --scope calendar 检查当前租户网页结构（blocked={blocked_count}）",
+        )
+    # If the page exposes the same ID on an event and a sidebar control, the
+    # first control metadata wins; otherwise a single event-only ID is still
+    # safe to use because no alternate calendar was visible.
+    return {
+        "kind": "calendar_calendars",
+        "items": items,
+        "total": len(items),
+        "source": "browser_dom",
+        "complete": False,
+    }
 
 
 async def _event_rows(page, limit: int, blocked_count: int = 0) -> list[dict]:
@@ -556,6 +875,11 @@ async def _event_rows(page, limit: int, blocked_count: int = 0) -> list[dict]:
         if rows:
             break
     if not rows:
+        # An otherwise-rendered calendar with no event cards is a valid empty
+        # result.  Keep endpoint failures distinct from an empty date view.
+        shell = await page.locator(".calendars, .calendar-view, [data-calendar-id]").count()
+        if shell:
+            return []
         raise EndpointNotAdapted(
             "日历页面未发现带稳定 id 的会议项",
             hint=f"运行 feishu.py probe --scope calendar 检查当前租户网页结构（blocked={blocked_count}）",
@@ -641,6 +965,16 @@ async def _event_detail(page, event_id: str, rows: list[dict]) -> dict:
 
 
 def render_markdown(result: dict) -> str:
+    if result.get("kind") == "calendar_calendars":
+        lines_out = [
+            f"# 可用日历（{result.get('total', 0)}，来源 {result.get('source', '?')}，完整 {result.get('complete', False)}）"
+        ]
+        for item in result.get("items", []):
+            managed = "本人管理" if item.get("managed") else "订阅/共享"
+            lines_out.append(
+                f"- `{item.get('calendar_id', '?')}` **{item.get('name') or '(未命名)'}**（{managed}）"
+            )
+        return "\n".join(lines_out)
     if result.get("kind") == "calendar_event":
         lines_out = [f"# 会议：{result.get('title') or result.get('id', '?')}"]
         for key, label in (("start", "开始"), ("end", "结束"), ("timezone", "时区"),

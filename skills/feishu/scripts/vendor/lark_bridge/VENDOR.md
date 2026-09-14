@@ -57,6 +57,11 @@
    f2 是嵌套描述符而非字符串）。skill 侧 `_feishu/message_decode.py` 已对
    type=3/5 走自验证的 wire 级解析，proto 派生的媒体 key 一律过合理性检查；
    上游 proto 未改，升级时注意不要把这套 workaround 删了。
+13. **`sender.py`**：在原有文本发送器上增加统一的 type-3 文件、type-10
+   sticker wire builder 和结构化 gateway 回执；发送请求仍保持一次性闸门、无自动重试，
+   HTTP 200 但非 protobuf ack 时返回 `unverified`，不能宣称已送达。
+14. **`drive.py`**：`upload_file` 保留 `file_token` 兼容字段，同时返回等价的
+   `file_key`，供 skill 构造原生 type=3 文件消息，不把云盘 URL 拼成文本发送。
 
 ## 升级步骤
 

@@ -50,14 +50,14 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `doc replace <文档链接或token> <本地Markdown> [--direct]` | 保持原 token/链接，原地替换已有 docx 正文；md 先本地转 HTML 再走富文本剪贴板粘贴（表格/代码块/任务列表保真），粘贴后自动导出逐行校验（`verified` 字段）。语法对照见 `references/docx-format.md` |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
-| `probe --scope chats|docs-search|mail|calendar|message-media|media-observe|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证；media-observe 加 `--interact` 会点击文件卡片抓真实下载路由；calendar/mail 加 `--headed --capture --out 文件` 抓写接口（需本人手动操作一次） |
+| `probe --scope chats|docs-search|mail|calendar|message-media|message-send|media-observe|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证；media-observe 加 `--interact` 会点击文件卡片抓真实下载路由；calendar/mail/message-send 加 `--headed --capture --out 文件` 抓写接口（需本人手动操作一次） |
 | `mail list|search|get` | 读邮件，结果来自稳定接口或受控 DOM，并带 source/complete |
 | `mail send|reply` | 默认只产邮件草稿；受控写接口确认后才可能执行 |
-| `calendar list|get` | 读会议和日历事件，默认不缓存正文 |
-| `calendar create|update|delete` | create/delete 已打通真写（gateway 1002003+1010023/1002005，双闸门）；update 未适配失败关闭 |
+| `calendar calendars|list|get` | 列可用日历 ID、读日程和详情，默认不缓存正文 |
+| `calendar create|update|delete` | create/delete 已打通真写（gateway 1002003+1010023/1002005，双闸门）；create 默认自动选择本人管理的主日历；update 未适配失败关闭 |
 | `calendar sync` | gateway 全量/增量同步事件（含 event_uuid 和服务端 id，删除前用它拿 uuid） |
 | `events status|migrate|purge` | 查看存储、迁移旧事件、显式可恢复清理 |
-| `send --chat-id … [--text-file …] [--file …]` | **默认只产草稿**；常规真发见〈发送是双重闸门〉，用户明确要求免确认测试时可加 `--direct`。支持通过 `--file` 上传并随消息发送文件链接 |
+| `send --chat-id … [--text-file …] [--file …] [--sticker-from-message …] [--sticker-set-id … --sticker-id …]` | **默认只产草稿**；支持文本、原生 type=3 文件和原生 type=10 sticker。常规真发见〈发送是双重闸门〉，用户明确要求免确认测试时可加 `--direct`；文件上传和发送必须作为同一次受控操作，协议未适配时失败关闭 |
 
 时间参数统一：`30m`/`2h`/`7d` 表示过去，`+7d` 表示未来，另支持 ISO 日期和 epoch 秒/毫秒。
 
@@ -124,7 +124,9 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 
 ## 发送是双重闸门（默认不变）
 
-`send` 默认只输出草稿（含指纹），退出码 3，**零网络请求**。真实发送必须同时满足：
+`send` 默认只输出草稿（含指纹），退出码 3；文本和本地文件路径不会发网络请求，
+`--sticker-from-message` 为了读取源消息的 type=10 元数据，会先执行一次受控读请求。
+真实发送必须同时满足：
 
 1. 用户看过草稿，显式说发；
 2. `FEISHU_ALLOW_SEND=1` 环境变量；
@@ -132,6 +134,10 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 4. transport 层一次性武装（发一次即解除）。
 
 少任何一条都在网络层之前拦下。cmd=5 **不自动重试**（请求成功但响应丢了会发重）。
+发送回执区分 `accepted`、`rejected`、`unverified`；取得 gateway ack 且可用消息 ID
+回读匹配时才标记 `verified=true`。
+`--file` 还会执行一次云盘上传，因此常规确认模式同时需要 `FEISHU_ALLOW_WRITE=1`；
+文件上传成功但消息未确认时不会自动补发或自动清理上传文件。
 daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）。
 邮件/日历写入另外要求 `FEISHU_ALLOW_WRITE=1` 和 `--confirm-write <指纹>`；本批不自动发送
 邮件或修改日程。
@@ -157,6 +163,11 @@ daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）
   drive-stream 404，真实下载 URL 由网页端经 service worker 一次性签发），`media --action
   download` 已改为受限浏览器打开会话、点文件卡片的下载按钮、捕获真实 download 事件落盘
   （2026-09-10 端到端验证：mime/size 对账一致）。
+- **sticker 已支持原生发送和解析**：`--sticker-from-message` 只提取源消息的
+  sticker file key/set/id，不重放入站 raw content；`type=10` 输出尺寸、区域、ID 和
+  内容摘要，资源下载仍需先观察并登记真实路由。
+- **文件发送是原生 type=3**：`--file` 先上传取得 file key，再发送文件消息；不会把
+  上传链接伪装成“已发送文件”。上传成功但消息被拒时不自动重试，也不自动清理云盘文件。
 - 消息量大的群搜索到 8 页上限时**降级为部分结果**并明确标记，不再整体失败；
   要拿全就收窄时间窗或设 `FEISHU_SEARCH_MAX_PAGES`。
 - `chats` 当前通过短生命周期 Messenger 浏览器读取会话卡片；结果会标记
@@ -170,7 +181,8 @@ daemon 永远不走发送路径。不给自动建私聊（cmd=13 永久拒绝）
   已验证的 static-resource 路由（含透明 AES-256-GCM 解密）；音频/视频/贴纸必须先
   经受控 probe 观察，未登记时明确失败关闭。
 - `probe` 只记录请求元数据；它可以发现新的 command，但不能把响应正文、Cookie、ticket
-  或 access key 写进 fixture。不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
+  或 access key 写进 fixture。`message-send --capture` 只保留 protobuf 字段结构、长度和摘要，
+  不保留 body。不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
 - WS 重连可能重发消息：写入端按 msg_id 去重，读取端 `events` 再去一次。
   事件池只保存私聊入站和群聊 @我/@所有人 消息，敏感，优先加密，权限降级时为 0600；轮转不覆盖旧代。
 - 事件池里 `at_me=null` 表示「这条消息编码没解开，判不出来」，不是「没@我」。

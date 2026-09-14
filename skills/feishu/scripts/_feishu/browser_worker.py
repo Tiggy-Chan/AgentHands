@@ -45,6 +45,7 @@ _OPERATIONS = frozenset({
     "mail-get",
     "calendar-list",
     "calendar-get",
+    "calendar-calendars",
 })
 
 

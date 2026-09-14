@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 from google.protobuf.internal.decoder import _DecodeVarint
 
 from .message_model import TYPE_NAMES, content_digest, resource_id, type_name as model_type_name
+from .stickers import parse_sticker_content, public_sticker_details
 from lark_bridge.decoder import decode_text, decode_type2_content
 from lark_bridge.proto import proto_pb2 as pb
 from lark_bridge._proto_utils import proto_to_dict
@@ -843,6 +844,34 @@ def decode_message(m: dict) -> dict:
             text = f"[视频: {structured['fileName']}]"
         elif not text:
             text = "[视频]"
+    elif msg_type == 10 and content:
+        # STICKER: tenants use both generic Content fields and an image-like
+        # type-10 payload.  Keep the key private while exposing enough
+        # metadata to distinguish a real sticker from an opaque attachment.
+        sticker = parse_sticker_content(content)
+        structured.update(public_sticker_details(sticker))
+        sticker_key = str(sticker.get("file_key") or "")
+        if sticker_key:
+            _append_resource(
+                resources,
+                _resource(
+                    "sticker",
+                    sticker_key,
+                    name=str(sticker.get("sticker_id") or ""),
+                    source="content.sticker",
+                ),
+            )
+        elif sticker.get("sticker_set_id") and sticker.get("sticker_id"):
+            _append_resource(
+                resources,
+                _resource(
+                    "sticker",
+                    f"{sticker['sticker_set_id']}:{sticker['sticker_id']}",
+                    name=str(sticker.get("sticker_id") or ""),
+                    source="content.sticker",
+                ),
+            )
+        parsed = bool(structured or resources)
     else:
         structured, content_resources, content_parsed, content_errors = _parse_content_proto(content)
         resources.extend(content_resources)
@@ -894,7 +923,7 @@ def decode_message(m: dict) -> dict:
     else:
         legacy_status = "undecoded"
 
-    return {
+    result = {
         "text": text,
         "mention_user_ids": sorted(set(mentions)),
         "decode_status": legacy_status,
@@ -907,3 +936,8 @@ def decode_message(m: dict) -> dict:
         "errors": errors[:16],
         "raw_summary": _wire_summary(content),
     }
+    # Keep raw content only for type-10 source-copy support.  Retaining every
+    # message's full payload would multiply memory use for large histories.
+    if msg_type == 10 and content:
+        result["_raw_content"] = content
+    return result

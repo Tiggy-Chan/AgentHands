@@ -103,6 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
   FEISHU_CA_BUNDLE     企业 CA 证书路径（默认严格系统 TLS，绝不关校验）
   FEISHU_ALLOW_SEND=1   聊天发送双重闸门之一
   FEISHU_ALLOW_WRITE=1  邮件/日历写入双重闸门之一
+  FEISHU_CALENDAR_ID    日历默认目标（命令显式 --calendar-id 优先）
+  FEISHU_TIMEZONE       日历无时区输入的默认时区，默认 Asia/Shanghai
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -180,13 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=30)
 
     p = sub.add_parser("probe", help="安全抓取网页接口元数据（不保存正文或凭证）")
-    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "media-observe", "all"], default="all")
+    p.add_argument("--scope", choices=["chats", "docs-search", "mail", "calendar", "message-media", "message-send", "media-observe", "all"], default="all")
     p.add_argument("--keyword", default="测试", help="docs-search probe 使用的搜索词")
     p.add_argument("--msg-id", default="", help="message-media probe 使用的消息 ID")
     p.add_argument("--interact", action="store_true",
                    help="media-observe：点击文件卡片触发真实下载（配合 --headed 可手动点）")
     p.add_argument("--capture", action="store_true",
-                   help="calendar/mail 写接口抓包：headed 浏览器里由用户手动操作一次，记请求元数据与截断 body")
+                   help="calendar/mail/message-send 写接口抓包：headed 浏览器里由用户手动操作一次，记脱敏元数据与截断 body")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
 
     p = sub.add_parser("send", help="默认只产草稿；--confirm-send 或用户明确指定 --direct 才真发")
@@ -194,6 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", default="", help="正文（慎用，会进 shell history；优先 --text-file）")
     p.add_argument("--text-file", default="", help="从文件读正文（- 表示 stdin）")
     p.add_argument("--file", default="", help="要发送的本地文件路径")
+    p.add_argument("--sticker-from-message", default="", metavar="MSG_ID",
+                   help="从账号可见的 type=10 sticker 消息复制发送")
+    p.add_argument("--sticker-set-id", default="", metavar="SET_ID",
+                   help="sticker set id（需与 --sticker-id 成对使用）")
+    p.add_argument("--sticker-id", default="", metavar="STICKER_ID",
+                   help="sticker id（需与 --sticker-set-id 成对使用）")
     p.add_argument("--reply-to", default="", help="被回复消息的 msg_id")
     p.add_argument("--at-user-id", action="append", default=[])
     p.add_argument("--confirm-send", default="", metavar="FINGERPRINT")
@@ -240,17 +248,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("calendar", help="读取日历；写操作默认只产草稿")
     cal_sub = p.add_subparsers(dest="calendar_action", required=True)
-    q = cal_sub.add_parser("list", help="列会议")
+    q = cal_sub.add_parser("calendars", help="列出可用日历及主日历 ID")
+    q = cal_sub.add_parser("list", help="列日程事件")
     q.add_argument("--since", default="24h")
     q.add_argument("--until", default="+7d", help="截止时间；+7d 表示未来 7 天")
     q.add_argument("--limit", type=int, default=50)
     q = cal_sub.add_parser("get", help="读取会议详情")
     q.add_argument("event_id")
-    q = cal_sub.add_parser("create", help="创建会议；默认只产草稿")
+    q = cal_sub.add_parser("create", help="创建日程事件；默认只产草稿")
     q.add_argument("--title", required=True)
     q.add_argument("--start", required=True)
     q.add_argument("--end", required=True)
-    q.add_argument("--calendar-id", default="", help="目标日历 id（或设 FEISHU_CALENDAR_ID）")
+    q.add_argument("--calendar-id", default="auto", help="目标日历 id；默认显式环境变量，否则自动选择主日历")
     q.add_argument("--description", default="")
     q.add_argument("--confirm-write", default="", metavar="FINGERPRINT")
     q = cal_sub.add_parser("update", help="修改会议；默认只产草稿")
@@ -284,8 +293,13 @@ async def _run(args) -> int:
             note("✗ --capture 结果含截断请求 body，必须用 --out 写文件，不落 stdout")
             return 2
         if capture:
-            what = "创建一个测试日程（标题如「测试会议」，今天，30 分钟）" if args.scope == "calendar" \
+            what = (
+                "创建一个测试日程（标题如「测试会议」，今天，30 分钟）"
+                if args.scope == "calendar"
+                else "在测试群发送一条 sticker（只做一次，不要重复操作）"
+                if args.scope == "message-send"
                 else "发送一封测试邮件（发给自己即可）"
+            )
             note(f"浏览器即将打开（有界面）。请在 240 秒内手动{what}；")
             note("抓到写请求后再等 20 秒窗口即自动结束。结果只写入 --out 文件。")
         with query_lock.acquire("probe"):
@@ -297,6 +311,13 @@ async def _run(args) -> int:
         if args.out:
             probe.save(result, args.out)
             note(f"✓ 已写入脱敏 probe 摘要：{args.out}")
+        if capture:
+            emit(
+                f"probe scope={result['scope']} requests={len(result.get('requests', []))} "
+                f"body_redacted={result.get('body_redacted', False)} "
+                f"credentials={result.get('contains_credentials', False)}"
+            )
+            return 0
         emit_json(result) if fmt == "json" else emit(
             f"probe scope={result['scope']} requests={len(result['requests'])} "
             f"bodies={result['contains_bodies']} credentials={result['contains_credentials']}"
@@ -413,13 +434,19 @@ async def _run(args) -> int:
         if args.text_file:
             text = (sys.stdin.read() if args.text_file == "-"
                     else open(args.text_file, encoding="utf-8").read())
-        if not text.strip() and not args.file:
-            note("正文和文件均为空，拒绝（空消息没有草稿价值）")
+        has_sticker = bool(
+            args.sticker_from_message or args.sticker_set_id or args.sticker_id
+        )
+        if not text.strip() and not args.file and not has_sticker:
+            note("正文、文件和 sticker 均为空，拒绝（空消息没有草稿价值）")
             return 1
         result = await send.send(
             args.chat_id, text, reply_id=args.reply_to,
             at_user_ids=args.at_user_id, file_path=args.file,
             confirm=args.confirm_send, direct=args.direct,
+            sticker_from_message=args.sticker_from_message,
+            sticker_set_id=args.sticker_set_id,
+            sticker_id=args.sticker_id,
         )
         emit_json(result)
         return 0
@@ -471,12 +498,14 @@ async def _run(args) -> int:
         return 0
 
     if args.cmd == "calendar" and args.calendar_action in {"create", "update", "delete"}:
+        me = {}
         if args.confirm_write:
-            await auth.prepare()  # 确认执行前必须绑定会话，否则网关 401（payloadType=5）
+            me = await auth.prepare()  # 确认执行前必须绑定会话，否则网关 401（payloadType=5）
         if args.calendar_action == "create":
             result = await calendar.create_event(
                 args.title, args.start, args.end, confirm_write=args.confirm_write,
                 calendar_id=args.calendar_id, description=args.description,
+                my_id=me.get("user_id", ""), my_name=me.get("name", ""),
             )
         elif args.calendar_action == "delete":
             result = await calendar.delete_event(
@@ -494,7 +523,8 @@ async def _run(args) -> int:
     if args.cmd == "calendar" and args.calendar_action == "sync":
         me = await auth.prepare()
         result = await calendar.sync_events(
-            calendar_id=args.calendar_id, since_micros=args.since_micros)
+            calendar_id=args.calendar_id, since_micros=args.since_micros,
+            my_id=me.get("user_id", ""), my_name=me.get("name", ""))
         emit_json(result)
         return 0
 
@@ -564,7 +594,14 @@ async def _run(args) -> int:
 
     if args.cmd == "calendar":
         with query_lock.acquire(f"calendar-{args.calendar_action}"):
-            if args.calendar_action == "list":
+            if args.calendar_action == "calendars":
+                result = await asyncio.wait_for(
+                    calendar.list_calendars(
+                        my_id=me["user_id"], my_name=me.get("name", "")
+                    ),
+                    timeout=config.BROWSER_QUERY_TIMEOUT_SECONDS,
+                )
+            elif args.calendar_action == "list":
                 result = await asyncio.wait_for(
                     calendar.list_events(
                         start_time=parse_when(args.since) // 1000 if parse_when(args.since) else 0,
@@ -620,8 +657,16 @@ async def _run(args) -> int:
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
         if fmt == "json":
-            emit_json({"messages": messages.render_json(res["messages"]), "has_more": res["has_more"],
-                       "page_limit_hit": res.get("page_limit_hit", False)})
+            emit_json({
+                "messages": messages.render_json(res["messages"]),
+                "has_more": res["has_more"],
+                "page_limit_hit": res.get("page_limit_hit", False),
+                "search_returned_count": res.get("search_returned_count", 0),
+                "returned_count": res.get("returned_count", len(res["messages"])),
+                "filtered_count": res.get("filtered_count", 0),
+                "source": res.get("source", "gateway_11021"),
+                "index_lag_suspected": res.get("index_lag_suspected", False),
+            })
         else:
             emit(messages.render_markdown(res["messages"], title=f"群 {args.chat_id} 历史"))
             if res.get("page_limit_hit"):
@@ -629,6 +674,8 @@ async def _run(args) -> int:
                      "收窄时间窗可拿全，或设 FEISHU_SEARCH_MAX_PAGES 提高页数上限）")
             elif res["has_more"]:
                 note("（还有更多，调大 --limit 或收窄时间窗）")
+            if res.get("index_lag_suspected"):
+                note("（搜索索引可能有延迟：返回的消息被时间窗过滤或暂未命中；不要据此断言刚发送失败）")
         return 0
 
     if args.cmd == "mentions":

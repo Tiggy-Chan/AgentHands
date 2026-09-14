@@ -1,12 +1,15 @@
 """Safe browser-side protocol probe.
 
-Only request metadata is retained.  Bodies, cookies, query strings, HAR files,
-and rendered message/document content are deliberately never collected.
+Read probes retain only request metadata.  Explicit headed capture may retain
+bounded bodies for calendar/mail protocol registration; message-send capture
+retains only protobuf field shapes, lengths and digests.  Cookies, query
+strings, HAR files, and rendered message/document content are never collected.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -25,6 +28,103 @@ _INTERESTING = (
 )
 
 
+def _wire_shape(data: bytes, depth: int = 0) -> list[dict]:
+    """Return field numbers/wire widths without exposing protobuf values."""
+    if depth > 2:
+        return []
+    raw = bytes(data or b"")[:4096]
+    out: list[dict] = []
+    pos = 0
+    while pos < len(raw) and len(out) < 64:
+        try:
+            tag = 0
+            shift = 0
+            while True:
+                if pos >= len(raw):
+                    return out
+                byte = raw[pos]
+                pos += 1
+                tag |= (byte & 0x7F) << shift
+                if not byte & 0x80:
+                    break
+                shift += 7
+                if shift > 63:
+                    return out
+            field, wire = tag >> 3, tag & 7
+            if not field:
+                return out
+            item = {"field": field, "wire_type": wire}
+            if wire == 0:
+                while True:
+                    if pos >= len(raw):
+                        return out
+                    byte = raw[pos]
+                    pos += 1
+                    if not byte & 0x80:
+                        break
+            elif wire == 2:
+                length = 0
+                shift = 0
+                while True:
+                    if pos >= len(raw):
+                        return out
+                    byte = raw[pos]
+                    pos += 1
+                    length |= (byte & 0x7F) << shift
+                    if not byte & 0x80:
+                        break
+                    shift += 7
+                    if shift > 63:
+                        return out
+                end = pos + length
+                if end > len(raw):
+                    return out
+                item["bytes"] = length
+                if length > 8 and depth < 2:
+                    item["children"] = _wire_shape(raw[pos:end], depth + 1)
+                pos = end
+            elif wire == 1:
+                if pos + 8 > len(raw):
+                    return out
+                item["bytes"] = 8
+                pos += 8
+            elif wire == 5:
+                if pos + 4 > len(raw):
+                    return out
+                item["bytes"] = 4
+                pos += 4
+            else:
+                return out
+            out.append(item)
+        except Exception:
+            return out
+    return out
+
+
+def _capture_body(body: bytes, *, redact: bool) -> dict:
+    raw = bytes(body or b"")
+    if redact:
+        return {
+            "body_encoding": "protobuf_or_binary",
+            "body_bytes": len(raw),
+            "body_sha256": hashlib.sha256(raw).hexdigest(),
+            "body_truncated": len(raw) > 4096,
+            "field_summary": _wire_shape(raw),
+        }
+    import base64
+
+    sample = raw[:4096]
+    try:
+        encoded, encoding = sample.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        encoded, encoding = base64.b64encode(sample).decode(), "base64"
+    return {
+        "body_encoding": encoding,
+        "body_truncated": len(raw) > 4096,
+        "body": encoded,
+    }
+
+
 async def run(
     scope: str,
     keyword: str = "测试",
@@ -36,8 +136,8 @@ async def run(
     from .browser_worker import run as run_worker
 
     if capture:
-        if scope not in {"calendar", "mail"}:
-            raise ValueError("--capture 只支持 --scope calendar|mail")
+        if scope not in {"calendar", "mail", "message-send"}:
+            raise ValueError("--capture 只支持 --scope calendar|mail|message-send")
         if not headed:
             raise ValueError("--capture 必须加 --headed（需要你在浏览器里手动操作）")
         return await run_worker(
@@ -618,7 +718,8 @@ async def _media_observe_impl(msg_id: str, headed: bool = False, interact: bool 
     }
 
 
-async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> None:
+async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
+                       *, redact_body: bool = False) -> None:
     """Browser-level CDP network sniffer across ALL targets (page + workers).
 
     Page-level Playwright hooks miss worker-internal connections — 2026-09-11:
@@ -628,8 +729,6 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> Non
     gets Network.enable, so worker-held fetches and WebSockets surface here.
     Bounded like the rest of capture mode: metadata + ≤4 KiB bodies only.
     """
-    import base64 as b64
-
     import websockets  # already a venv dep (WS daemon uses it)
 
     port_file = profile / "DevToolsActivePort"
@@ -653,13 +752,6 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> Non
         if session_id:
             msg["sessionId"] = session_id
         await ws.send(json.dumps(msg))
-
-    def clip_body(text: str | None) -> tuple[str, str, bool]:
-        if not text:
-            return "", "utf-8", False
-        raw = text.encode("utf-8", errors="replace")
-        truncated = len(raw) > 4096
-        return raw[:4096].decode("utf-8", errors="replace"), "utf-8", truncated
 
     try:
         async with websockets.connect(ws_url, max_size=2**22) as ws:
@@ -707,14 +799,15 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> Non
                         })
                     if rmethod.upper() in {"GET", "HEAD", "OPTIONS"}:
                         continue
-                    body, enc, trunc = clip_body(req.get("postData"))
+                    post_data = req.get("postData") or ""
+                    raw_body = post_data.encode("utf-8", errors="replace")
                     if len(records["writes"]) < 60:
-                        records["writes"].append({
+                        item = {
                             "method": rmethod, "host": parsed.netloc,
                             "path": parsed.path, "target": targets.get(sid, "?"),
-                            "body_encoding": enc, "body_truncated": trunc,
-                            "body": body,
-                        })
+                        }
+                        item.update(_capture_body(raw_body, redact=redact_body))
+                        records["writes"].append(item)
                 elif method == "Network.webSocketCreated":
                     parsed = urlsplit(str(params.get("url") or ""))
                     if len(records["ws_sockets"]) < 30:
@@ -726,19 +819,26 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> Non
                     resp = params.get("response") or {}
                     payload = str(resp.get("payloadData") or "")
                     raw_b = payload.encode("utf-8", errors="replace")
-                    try:
-                        payload.encode("utf-8").decode("utf-8")
-                        body, enc = payload[:4096], "utf-8"
-                    except UnicodeDecodeError:
-                        body, enc = b64.b64encode(raw_b[:4096]).decode(), "base64"
                     if len(records["ws_frames"]) < 200:
-                        records["ws_frames"].append({
+                        item = {
                             "target": targets.get(sid, "?"),
                             "opcode": resp.get("opcode"),
-                            "encoding": enc,
-                            "truncated": len(raw_b) > 4096,
-                            "body": body,
-                        })
+                        }
+                        if redact_body:
+                            item.update({
+                                "encoding": "protobuf_or_binary",
+                                "bytes": len(raw_b),
+                                "sha256": hashlib.sha256(raw_b).hexdigest(),
+                                "truncated": len(raw_b) > 4096,
+                                "field_summary": _wire_shape(raw_b),
+                            })
+                        else:
+                            item.update({
+                                "encoding": "utf-8",
+                                "truncated": len(raw_b) > 4096,
+                                "body": payload[:4096],
+                            })
+                        records["ws_frames"].append(item)
     except Exception as exc:
         records["cdp_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -746,11 +846,11 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> Non
 async def _capture_impl(app: str) -> dict:
     """Headed write-endpoint capture: watch while the USER performs one write.
 
-    Policy relaxation, deliberate and bounded: non-GET request bodies on
-    feishu hosts are recorded (≤4 KiB each, base64 when binary) because the
-    payload shape is exactly what we need to register.  The result sets
-    contains_bodies=true and the CLI refuses it without --out.  Capture files
-    must be deleted once the endpoint is registered (protocol.md).
+    Policy relaxation, deliberate and bounded: calendar/mail capture records
+    non-GET request bodies (≤4 KiB each, base64 when binary) because their
+    payload shape is exactly what we need to register.  message-send capture
+    records only field shapes, lengths and SHA-256 digests.  Capture files must
+    be written with --out and deleted once the endpoint is registered.
     """
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("capture 只能由受限 Browser Worker 执行")
@@ -760,12 +860,12 @@ async def _capture_impl(app: str) -> dict:
     except ImportError as exc:
         raise FeishuError("当前 venv 没有 playwright", hint="先运行 feishu.py login") from exc
 
-    import base64
-
     if app == "calendar":
         from .calendar_ops import _calendar_url as app_url
-    else:
+    elif app == "mail":
         from .mail import _mail_url as app_url
+    else:
+        app_url = lambda tenant: f"https://{tenant}/next/messenger/"
     domain = auth.load_cookies().get("domain") or config.DOMAIN
 
     requests_meta: list[dict] = []
@@ -810,7 +910,14 @@ async def _capture_impl(app: str) -> dict:
         cdp_records: dict = {"targets": [], "requests": [], "writes": [],
                              "ws_sockets": [], "ws_frames": []}
         cdp_stop = asyncio.Event()
-        cdp_task = asyncio.create_task(_cdp_capture(config.PROFILE, cdp_records, cdp_stop))
+        cdp_task = asyncio.create_task(
+            _cdp_capture(
+                config.PROFILE,
+                cdp_records,
+                cdp_stop,
+                redact_body=app == "message-send",
+            )
+        )
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await ctx.add_cookies(auth.playwright_cookie_jar())
@@ -850,16 +957,11 @@ async def _capture_impl(app: str) -> dict:
                 # before the user ever clicked 保存).
                 if noise or len(captured_writes) >= 200:
                     return
-                sample = bytes(body[:4096])
-                try:
-                    text = sample.decode("utf-8")
-                    encoded, enc = text, "utf-8"
-                except UnicodeDecodeError:
-                    encoded, enc = base64.b64encode(sample).decode(), "base64"
-                captured_writes.append({**entry, "noise": False,
-                                        "body_encoding": enc,
-                                        "body_truncated": len(body) > 4096,
-                                        "body": encoded})
+                captured_writes.append({
+                    **entry,
+                    "noise": False,
+                    **_capture_body(bytes(body), redact=app == "message-send"),
+                })
                 if not noise and not first_interesting_at:
                     first_interesting_at = time.monotonic()  # diagnostic only
 
@@ -891,14 +993,12 @@ async def _capture_impl(app: str) -> dict:
                             body = await resp.body()
                         except Exception:
                             body = b""
-                        sample = body[:4096]
-                        captured_responses.append({
+                        item = {
                             "x_command": xcmd,
                             "status": resp.status,
-                            "body_encoding": "base64",
-                            "body_truncated": len(body) > 4096,
-                            "body": base64.b64encode(sample).decode(),
-                        })
+                        }
+                        item.update(_capture_body(body, redact=app == "message-send"))
+                        captured_responses.append(item)
 
                     asyncio.get_event_loop().create_task(read_body())
                 except Exception:
@@ -914,19 +1014,27 @@ async def _capture_impl(app: str) -> dict:
                     if len(ws_frames) >= 40:
                         return
                     raw = payload if isinstance(payload, bytes) else str(payload).encode()
-                    sample = raw[:4096]
-                    try:
-                        encoded, enc = sample.decode("utf-8"), "utf-8"
-                    except UnicodeDecodeError:
-                        encoded, enc = base64.b64encode(sample).decode(), "base64"
-                    ws_frames.append({
+                    item = {
                         "url_host": urlsplit(ws.url).netloc,
                         "url_path": urlsplit(ws.url).path,
                         "direction": "sent",
-                        "encoding": enc,
-                        "truncated": len(raw) > 4096,
-                        "body": encoded,
-                    })
+                    }
+                    if app == "message-send":
+                        item.update({
+                            "encoding": "protobuf_or_binary",
+                            "bytes": len(raw),
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                            "truncated": len(raw) > 4096,
+                            "field_summary": _wire_shape(raw),
+                        })
+                    else:
+                        captured = _capture_body(raw, redact=False)
+                        item.update({
+                            "encoding": captured.get("body_encoding", "utf-8"),
+                            "truncated": captured.get("body_truncated", False),
+                            "body": captured.get("body", ""),
+                        })
+                    ws_frames.append(item)
 
                 ws.on("framesent", on_sent)
 
@@ -977,9 +1085,12 @@ async def _capture_impl(app: str) -> dict:
         "would_block": would_block,
         "pages": [],
         "closed_early": closed_early,
-        "contains_bodies": bool(captured_writes or ws_frames or cdp_records["writes"]
-                                or cdp_records["ws_frames"]),
+        "contains_bodies": bool(app != "message-send" and (
+            captured_writes or ws_frames or cdp_records["writes"]
+            or cdp_records["ws_frames"]
+        )),
         "contains_credentials": False,
+        "body_redacted": app == "message-send",
         "note": "写接口抓包结果。登记进 transport 白名单后请删除此文件。",
     }
 
@@ -989,8 +1100,8 @@ async def _run_impl(scope: str, keyword: str = "测试", headed: bool = False) -
         return await _capture_impl(scope[: -len("-capture")])
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("网页 probe 只能由受限 Browser Worker 执行")
-    if scope not in {"chats", "docs-search", "mail", "calendar", "all"}:
-        raise ValueError("probe scope 必须是 chats、docs-search、mail、calendar 或 all")
+    if scope not in {"chats", "docs-search", "mail", "calendar", "message-send", "all"}:
+        raise ValueError("probe scope 必须是 chats、docs-search、mail、calendar、message-send 或 all")
     # Check that the skill has a login profile without exposing its contents.
     auth.load_cookies()
     try:
@@ -1059,7 +1170,7 @@ async def _run_impl(scope: str, keyword: str = "测试", headed: bool = False) -
             page.on("response", on_response)
             domain = auth.load_cookies().get("domain") or config.DOMAIN
 
-            if scope in {"chats", "all"}:
+            if scope in {"chats", "message-send", "all"}:
                 requested = f"https://{domain}/next/messenger/"
                 await page.goto(requested, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(8000)

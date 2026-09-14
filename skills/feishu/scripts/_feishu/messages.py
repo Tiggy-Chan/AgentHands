@@ -212,11 +212,27 @@ async def history(chat_id: str, start_time: int = 0, end_time: int = 0, limit: i
     async def run() -> dict:
         res = await gateway.search_msg_ids(chat_id, start_time, end_time, limit=limit)
         msgs = await gateway.fetch_messages(res["msg_ids"])
+        fetched_count = len(msgs)
         msgs = [m for m in msgs if in_time_window(m, start_time, end_time)]
         msgs.sort(key=lambda m: (m.get("create_time") or 0, m["msg_id"]))
         await resolve_names(msgs, my_id=my_id, my_name=my_name)
         apply_direction(msgs, my_id)
-        return {"messages": msgs, "has_more": res["has_more"]}
+        # A search index can return IDs outside the requested window while
+        # still advertising more pages.  Preserve both counts so callers do
+        # not mistake an empty filtered result for a confirmed empty chat.
+        filtered_count = fetched_count - len(msgs)
+        return {
+            "messages": msgs,
+            "has_more": res["has_more"],
+            "page_limit_hit": bool(res.get("page_limit_hit", False)),
+            "search_returned_count": len(res.get("msg_ids", [])),
+            "returned_count": len(msgs),
+            "filtered_count": filtered_count,
+            "source": "gateway_11021",
+            "index_lag_suspected": bool(
+                not msgs and (filtered_count > 0 or res.get("has_more"))
+            ),
+        }
 
     # This is an end-to-end deadline, not just a per-request timeout.  It
     # prevents a sequence of slow/repeated pages from keeping a CLI process

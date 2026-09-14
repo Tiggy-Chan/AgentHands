@@ -93,6 +93,7 @@ async def upload_file(
             file_token = data.get("file_token", "")
             return {
                 "file_token": file_token,
+                "file_key": file_token,
                 "node_token": data.get("extra", {}).get("node_token", ""),
                 "url": f"https://{domain}/file/{file_token}",
             }

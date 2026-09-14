@@ -24,12 +24,13 @@ body 是 `Packet{cmd, payload, cid}` 序列化。
 
 | cmd | 用途 | payload | 状态 |
 |---|---|---|---|
-| 5 | 发消息 | `PutMessageRequest` | 已按 lark-bridge 实现；**双重闸门后可用** |
+| 5 | 发消息 | `PutMessageRequest` | 文本、原生 type=3 文件、原生 type=10 sticker；**双重闸门后可用**；回执需解析 |
 | 8 | 按 id 批量取消息 | 重复 field1 = msg_id | 已验证（开源实现 + 本租户实测） |
 | 13 | 建私聊 | `PutChatRequest` | **永久拒绝** |
 | 64 | 群名 | field1 string chatId | **2026-09-07 实测已失效**：当前租户回 `payloadType=5` 空 Packet |
 | 5023 | 用户名 | f1 varint userId, f2 varint chatId, f3=1 | 同上，**已失效**。名字改由 whoami（自己）+ Messenger DOM 会话名（chats 反哺缓存，p2p 会话名=对方名字）提供 |
 | 11021 | 消息搜索 | chat/时间段/发送人/**mention_user_id** | 分页 token 是 JSON；时间参数已在 2026-08-31 当前租户用 epoch 秒实测可用 |
+| 1001001 | 日历 bootstrap | 空 payload | 当前租户返回本人管理的日历 ID、所有者、时区和名称；只读 |
 
 **消息归属（2026-09-07 起）**：发送者角色不靠名字解析——`is_me`/`direction` 由
 whoami user_id 与 fromId 比对得出，p2p 会话渲染为「我/对方」，名字缺失只影响
@@ -49,6 +50,15 @@ denylist 与同名 ≥3 用户规则自动清除。
 - **消息媒体是 AES-256-GCM 加密的**（tag=密文最后 16B）。下载管线在
   `message_resources._decrypt_in_place` 透明解密；密钥只存在进程内
   `_resource_crypto`，绝不进公开输出/事件池/日志。
+- STICKER (type 10)：当前租户实测为 f4 str = sticker resource key、f5 varint = 宽、
+  f6 varint = 高、f8 str = 区域、f10 str = sticker id；解码器保留 key 为进程内私有值，
+  对外只输出 sticker ID、尺寸、区域和内容摘要。出站使用正式的 type=10 builder，
+  不能直接重放入站 raw content。
+- 出站消息：type=3 使用 `Content.fileKey/fileName/fileMime/fileSize`，type=10 使用
+  `Content.fileKey` 或 `Content.stickerSetId/stickerId`；两者都经过同一个 cmd=5
+  发送闸门和回执解析。
+- cmd=5 回执：payloadType=1 才是 `accepted`；HTTP 200 但 payloadType 未识别时为
+  `unverified`，payloadType=5 或非零 packet status 为 `rejected`，不自动重试。
 
 **媒体下载路由（2026-09-07 media-observe probe 实测）**：
 
@@ -105,6 +115,9 @@ denylist 与同名 ≥3 用户规则自动清除。
 - 日历入口：`GET https://<tenant>.feishu.cn/calendar/`，最终页面为 `/calendar/week`；
   会议项使用 `.event-instance` 和 `data-key`、`data-start-time` 等属性，当前 provider
   可读取标题、时间、地点等可见字段，结果固定标记 `source=browser_dom`、`complete=false`。
+- 日历页面 bootstrap：`cmd=1001001`，空 payload 即可取得当前账户管理的日历记录；当前租户
+  记录的 f1 为 calendar_id、f2 为 owner_id、f3 为时区、f15 为名称。已加入只读白名单，
+  Browser Worker 不可用时作为自动选择主日历的受限 fallback。
 - mail/calendar provider 只读取有界 DOM 文本；邮件和日历正文不写入事件池或长期缓存。
 
 ### 日历写接口（2026-09-11 headed 抓包登记，已实测打通）
@@ -206,17 +219,17 @@ md 后缀必须与内容严格一致（否则 1069910）；md 语法保真度无
 从未被观测到的原因），并记录 download 事件与 octet-stream/attachment 响应；
 `--headed` 时留出 120 秒窗口让用户手动点下载。
 
-写接口抓包（2026-09-10 新增）：`probe --scope calendar|mail --headed --capture --out <文件>`。
+写接口抓包（2026-09-10 新增）：`probe --scope calendar|mail|message-send --headed --capture --out <文件>`。
 headed 浏览器里由用户本人手动执行一次写操作（建测试日程/发测试邮件），probe 以
-observe 模式放行并记录非 GET 请求的元数据与 ≤4KiB 截断 body（结果
-`contains_bodies=true`，必须落 `--out` 文件）。**endpoint 登记进 transport 白名单后
-必须删除抓包文件**。observe 模式永不默认开启。
+observe 模式放行并记录非 GET 请求的元数据与 ≤4KiB 截断 body；message-send 只保存
+protobuf 字段结构、长度和 SHA-256 摘要，不保存 body（必须落 `--out` 文件）。
+**endpoint 登记进 transport 白名单后必须删除抓包文件**。observe 模式永不默认开启。
 
 抓包方法（别把凭证落盘）：
 
 ```
 1. feishu.py login 之后，FEISHU 浏览器 profile 已登录
-2. 用 `feishu.py probe --scope chats|docs-search|mail|calendar`，或
+2. 用 `feishu.py probe --scope chats|docs-search|mail|calendar|message-send`，或
    `feishu.py probe --scope message-media --msg-id <msg_id>`；不要直接启动 Playwright
 3. 只记录 method/host/path/x-command 头和结构摘要 —— 不记 Cookie、不存 HAR、
    WS URL 里的 ticket/access_key 不落盘

@@ -39,7 +39,7 @@ class TestTransportPolicy(unittest.TestCase):
         transport.configure()
 
     def test_read_gateway_cmds_allowed(self):
-        for cmd in (8, 64, 5023, 11021):
+        for cmd in (8, 64, 5023, 11021, 1001001):
             self.assertEqual(
                 self.t.classify("POST", "https://internal-api-lark-api.feishu.cn/im/gateway/", cmd),
                 "allow", f"cmd={cmd}")
@@ -155,6 +155,69 @@ class TestTransportPolicy(unittest.TestCase):
         status, detail = calendar_ops._parse_create_reply(rej.SerializeToString(), "u")
         self.assertEqual(status, "rejected")
         self.assertIn("payloadType=5", detail)
+
+    def test_sticker_type10_decode_keeps_key_private(self):
+        from _feishu import calendar_ops
+        from _feishu.message_decode import decode_message
+        from _feishu.message_model import build_envelope, public_message
+
+        content = (
+            calendar_ops._fs(4, "v3_0014v_01234567-89ab-cdef-0123-456789abcdefg")
+            + calendar_ops._fv(5, 495)
+            + calendar_ops._fv(6, 663)
+            + calendar_ops._fs(8, "eu_nc-cdn")
+            + calendar_ops._fs(10, "sticker-1")
+        )
+        decoded = decode_message({"type": 10, "content": content})
+        self.assertEqual(decoded["semantic_status"], "decoded")
+        self.assertEqual(decoded["structured"]["stickerId"], "sticker-1")
+        self.assertEqual(decoded["structured"]["width"], 495)
+        self.assertEqual(decoded["structured"]["height"], 663)
+        self.assertTrue(decoded["_raw_content"])
+        envelope = build_envelope(
+            "m-sticker", {"type": 10, "fromId": "u", "chatId": "c", "createTime": 1}, decoded
+        )
+        safe = public_message(envelope)
+        self.assertNotIn("_raw_content", safe)
+        self.assertEqual(safe["resources"][0]["kind"], "sticker")
+
+    def test_typed_outbound_packet_builders(self):
+        from lark_bridge import sender
+        from lark_bridge.proto import proto_pb2 as pb
+
+        sticker_payload, _ = sender._build_sticker_request(
+            file_key="v3_0014v_01234567-89ab-cdef-0123-456789abcdefg",
+            sticker_id="sticker-1",
+            chat_id="chat-1",
+        )
+        sticker = pb.PutMessageRequest()
+        sticker.ParseFromString(sticker_payload)
+        self.assertEqual(sticker.type, 10)
+        self.assertEqual(sticker.chatId, "chat-1")
+        self.assertEqual(sticker.content.fileKey, "v3_0014v_01234567-89ab-cdef-0123-456789abcdefg")
+        self.assertEqual(sticker.content.stickerId, "sticker-1")
+
+        file_payload, _ = sender._build_file_request(
+            "file_v3_00157_01234567-89ab-cdef-0123-456789abcdefg",
+            "report.txt", "text/plain", 12, "chat-1",
+        )
+        file_message = pb.PutMessageRequest()
+        file_message.ParseFromString(file_payload)
+        self.assertEqual(file_message.type, 3)
+        self.assertEqual(file_message.content.fileName, "report.txt")
+        self.assertEqual(file_message.content.fileMime, "text/plain")
+        self.assertEqual(file_message.content.fileSize, 12)
+
+    def test_send_reply_classification_does_not_equate_http_200_with_ack(self):
+        from lark_bridge import sender
+        from lark_bridge.proto import proto_pb2 as pb
+
+        ack = pb.Packet(); ack.payloadType = 1
+        self.assertEqual(sender._parse_send_reply(ack.SerializeToString())["status"], "accepted")
+        rejected = pb.Packet(); rejected.payloadType = 5
+        self.assertEqual(sender._parse_send_reply(rejected.SerializeToString())["status"], "rejected")
+        unknown = pb.Packet(); unknown.payloadType = 0
+        self.assertEqual(sender._parse_send_reply(unknown.SerializeToString())["status"], "unverified")
 
     def test_unknown_and_create_chat_denied(self):
         for cmd in (13, 1, 9999):
@@ -394,6 +457,31 @@ class TestQueryGuards(unittest.TestCase):
         self.assertTrue(res["page_limit_hit"])
         self.assertTrue(res["has_more"])
 
+    def test_history_reports_filtered_results_and_possible_index_lag(self):
+        import asyncio
+        from _feishu import messages
+
+        async def check():
+            with patch(
+                "_feishu.gateway.search_msg_ids",
+                new=AsyncMock(return_value={
+                    "msg_ids": ["m1"], "has_more": True, "page_limit_hit": False,
+                }),
+            ), patch(
+                "_feishu.gateway.fetch_messages",
+                new=AsyncMock(return_value=[{
+                    "msg_id": "m1", "create_time": 100, "chat_id": "c1", "from_id": "u1",
+                }]),
+            ), patch.object(messages, "resolve_names", new=AsyncMock()), patch.object(
+                messages, "apply_direction"
+            ):
+                return await messages.history("c1", start_time=200, limit=10)
+
+        result = asyncio.run(check())
+        self.assertEqual(result["returned_count"], 0)
+        self.assertEqual(result["filtered_count"], 1)
+        self.assertTrue(result["index_lag_suspected"])
+
     def test_wire_walk_advances_after_printable_string(self):
         from _feishu.gateway import _walk_strings
         self.assertEqual(_walk_strings(b"\x0a\x05hello\x12\x03bye"), ["hello", "bye"])
@@ -411,6 +499,21 @@ class TestQueryGuards(unittest.TestCase):
         self.assertIn("--property=TasksMax=128", joined)
         self.assertIn("--property=RuntimeMaxSec=13s", joined)
         self.assertNotIn("--eval", joined)
+
+    def test_message_send_probe_redacts_payload_values(self):
+        from _feishu import probe
+
+        captured = probe._capture_body(b"\x0a\x05secret", redact=True)
+        self.assertEqual(captured["body_encoding"], "protobuf_or_binary")
+        self.assertNotIn("body", captured)
+        self.assertIn("body_sha256", captured)
+        self.assertTrue(captured["field_summary"])
+
+    def test_message_send_probe_is_worker_allowlisted(self):
+        from _feishu import browser_worker
+
+        cmd = browser_worker.build_command("probe", "feishu-browser-probe", 10)
+        self.assertIn("--operation probe", " ".join(cmd))
 
     def test_doc_replace_worker_is_bounded_and_has_no_eval(self):
         from _feishu import browser_worker
@@ -1332,7 +1435,10 @@ class TestMailCalendarContracts(unittest.TestCase):
         from _feishu.errors import SendBlocked
         from _feishu import calendar_ops as calendar
         with self.assertRaises(SendBlocked) as caught:
-            asyncio.run(calendar.create_event("联调", "2026-08-31T10:00:00+08:00", "2026-08-31T11:00:00+08:00"))
+            asyncio.run(calendar.create_event(
+                "联调", "2026-08-31T10:00:00+08:00", "2026-08-31T11:00:00+08:00",
+                calendar_id="cal-1",
+            ))
         self.assertIn("calendar_create", caught.exception.hint)
 
     def test_ui_fingerprint_and_calendar_time_helpers(self):
@@ -1345,6 +1451,102 @@ class TestMailCalendarContracts(unittest.TestCase):
             calendar._end_from_title("例会, 10:40 - 11:10", "2026-08-31T10:40:00+08:00"),
             "2026-08-31T11:10:00+08:00",
         )
+
+    def test_calendar_id_precedence_and_auto_selection(self):
+        import asyncio
+        from _feishu import calendar_ops as calendar
+
+        async def check():
+            with patch.object(
+                calendar,
+                "list_calendars",
+                new=AsyncMock(return_value={"source": "browser_dom", "items": [
+                    {"calendar_id": "cal-main", "name": "号主", "managed": True},
+                    {"calendar_id": "cal-shared", "name": "共享", "managed": False},
+                ]}),
+            ):
+                os.environ.pop("FEISHU_CALENDAR_ID", None)
+                self.assertEqual(
+                    await calendar.resolve_calendar_id("auto", my_name="号主"),
+                    ("cal-main", "browser_dom_managed"),
+                )
+                os.environ["FEISHU_CALENDAR_ID"] = "cal-env"
+                try:
+                    self.assertEqual(
+                        await calendar.resolve_calendar_id("auto"),
+                        ("cal-env", "environment"),
+                    )
+                    self.assertEqual(
+                        await calendar.resolve_calendar_id("cal-cli"),
+                        ("cal-cli", "explicit"),
+                    )
+                finally:
+                    os.environ.pop("FEISHU_CALENDAR_ID", None)
+        asyncio.run(check())
+
+    def test_calendar_bootstrap_parser_returns_managed_calendar(self):
+        from _feishu import calendar_ops as calendar
+        from lark_bridge.proto import proto_pb2 as pb
+
+        record = (
+            calendar._fs(1, "cal-main")
+            + calendar._fs(2, "user-1")
+            + calendar._fs(3, "Asia/Shanghai")
+            + calendar._fs(15, "号主")
+        )
+        packet = pb.Packet(); packet.payloadType = 1; packet.payload = calendar._fb(1, record)
+        result = calendar._parse_calendar_bootstrap(
+            packet.SerializeToString(), my_id="user-1", my_name="号主"
+        )
+        self.assertEqual(result["source"], "gateway_1001001")
+        self.assertEqual(result["items"], [{
+            "calendar_id": "cal-main", "name": "号主", "managed": True,
+            "source": "gateway_1001001", "complete": True,
+        }])
+
+    def test_calendar_id_discovery_falls_back_when_browser_worker_is_unavailable(self):
+        import asyncio
+        from _feishu import calendar_ops as calendar
+        from _feishu.errors import ResourceIsolationUnavailable
+
+        async def check():
+            fallback = {"kind": "calendar_calendars", "items": [{
+                "calendar_id": "cal-main", "name": "号主", "managed": True,
+            }], "source": "gateway_1001001", "complete": True}
+            with patch.object(
+                calendar, "_browser",
+                new=AsyncMock(side_effect=ResourceIsolationUnavailable("no cgroup")),
+            ), patch.object(calendar, "_gateway_list_calendars", new=AsyncMock(return_value=fallback)):
+                return await calendar.list_calendars(my_id="u1", my_name="号主")
+
+        result = asyncio.run(check())
+        self.assertEqual(result["source"], "gateway_1001001")
+        self.assertEqual(result["items"][0]["calendar_id"], "cal-main")
+
+    def test_calendar_timezone_follows_explicit_offset(self):
+        from _feishu import calendar_ops as calendar
+
+        self.assertEqual(calendar._timezone_for_input("2026-09-12T10:00:00+08:00"), "Asia/Shanghai")
+        self.assertEqual(calendar._timezone_for_input("2026-09-12T10:00:00-05:00"), "UTC-05:00")
+
+    def test_calendar_create_verification_matches_uuid(self):
+        import asyncio
+        from _feishu import calendar_ops as calendar
+
+        async def check():
+            with patch.object(
+                calendar,
+                "sync_events",
+                new=AsyncMock(return_value={"items": [{
+                    "uuid": "event-uuid", "server_id": "server-1",
+                    "title": "测试", "start": 10, "end": 20,
+                }]}),
+            ):
+                self.assertEqual(
+                    await calendar._verify_created_event("cal", "event-uuid", "测试", 10, 20),
+                    (True, "gateway_1002002", "matched_uuid", "server-1"),
+                )
+        asyncio.run(check())
 
 
 class TestDrivePagination(unittest.TestCase):
@@ -1420,6 +1622,133 @@ class TestSendGate(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
         self.assertNotEqual(a, d)
+
+    def test_draft_fingerprint_binds_message_kind_and_sticker_identity(self):
+        from _feishu.send import fingerprint, make_draft
+
+        text = fingerprint("c1", "正文", "", [])
+        sticker = fingerprint("c1", "", "", [], message_kind="sticker", sticker_id="s1")
+        sticker_other = fingerprint("c1", "", "", [], message_kind="sticker", sticker_id="s2")
+        self.assertNotEqual(text, sticker)
+        self.assertNotEqual(sticker, sticker_other)
+        draft = make_draft(
+            "c1", "", message_kind="sticker", sticker_set_id="set-1", sticker_id="s1"
+        )
+        self.assertEqual(draft["message_kind"], "sticker")
+        self.assertEqual(draft["sticker_set_id"], "set-1")
+
+    def test_sticker_source_requires_type10_and_normalizes_private_content(self):
+        import asyncio
+        from _feishu import calendar_ops
+        from _feishu import message_resources, send
+
+        content = (
+            calendar_ops._fs(4, "v3_0014v_01234567-89ab-cdef-0123-456789abcdefg")
+            + calendar_ops._fv(5, 495)
+            + calendar_ops._fv(6, 663)
+            + calendar_ops._fs(8, "eu_nc-cdn")
+            + calendar_ops._fs(10, "sticker-1")
+        )
+        async def check():
+            with patch.object(
+                message_resources,
+                "fetch_message",
+                new=AsyncMock(return_value={
+                    "type": {"code": 10, "name": "sticker"},
+                    "_raw_content": content,
+                }),
+            ):
+                _message, spec = await send._sticker_from_message("m1")
+            self.assertEqual(spec["sticker_id"], "sticker-1")
+            self.assertTrue(spec["file_key"])
+        asyncio.run(check())
+
+    def test_sender_result_parses_ack_without_retry(self):
+        import asyncio
+        import httpx
+        from _feishu import transport
+        from lark_bridge import _http, sender
+        from lark_bridge.proto import proto_pb2 as pb
+
+        ack = pb.Packet(); ack.payloadType = 1
+
+        class Client:
+            calls = 0
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return False
+            async def post(self, *_args, **_kwargs):
+                self.calls += 1
+                return httpx.Response(200, content=ack.SerializeToString())
+
+        async def check():
+            client = Client()
+            transport.configure()
+            os.environ["FEISHU_ALLOW_SEND"] = "1"
+            try:
+                transport.arm_send_once()
+                with patch.object(_http, "make_client", return_value=client):
+                    result = await sender.send_payload_result("cookie", b"payload", "tenant.feishu.cn")
+                self.assertEqual(result["status"], "accepted")
+                self.assertTrue(result["sent"])
+                self.assertEqual(client.calls, 1)
+            finally:
+                os.environ.pop("FEISHU_ALLOW_SEND", None)
+        asyncio.run(check())
+
+    def test_send_result_verifies_server_message_id(self):
+        import asyncio
+        from _feishu import send
+
+        async def check():
+            with patch.object(send.auth, "prepare", new=AsyncMock(return_value={
+                "user_id": "me", "name": "我",
+            })), patch.object(send.auth, "load_cookies", return_value={
+                "cookies": {}, "domain": "tenant.feishu.cn",
+            }), patch.object(send.auth, "cookie_header", return_value="cookie"), \
+                    patch.object(send.transport, "bind_session"), \
+                    patch.object(send.transport, "arm_direct_send_once"), \
+                    patch.object(send.sender, "send_message_result", new=AsyncMock(return_value={
+                        "status": "accepted", "sent": True, "server_msg_id": "m1",
+                    })), patch.object(send.message_resources, "fetch_message", new=AsyncMock(return_value={
+                        "type": {"code": 4}, "chat_id": "c1", "from_id": "me",
+                    })):
+                result = await send.send("c1", "hello", direct=True)
+            self.assertEqual(result["status"], "accepted")
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["verification_source"], "gateway_cmd8")
+        asyncio.run(check())
+
+    def test_file_send_uses_native_message_without_link_fallback(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from _feishu import send
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "report.txt"
+                path.write_bytes(b"native file")
+                with patch.object(send.auth, "prepare", new=AsyncMock(return_value={
+                    "user_id": "me", "name": "我",
+                })), patch.object(send.auth, "load_cookies", return_value={
+                    "cookies": {}, "domain": "tenant.feishu.cn",
+                }), patch.object(send.auth, "cookie_header", return_value="cookie"), \
+                        patch.object(send.transport, "bind_session"), \
+                        patch.object(send.transport, "arm_direct_send_once"), \
+                        patch("lark_bridge.drive.upload_file", new=AsyncMock(return_value={
+                            "file_key": "file_v3_00157_01234567-89ab-cdef-0123-456789abcdefg",
+                            "file_token": "file_v3_00157_01234567-89ab-cdef-0123-456789abcdefg",
+                        })), patch.object(send.sender, "send_file_message_result", new=AsyncMock(return_value={
+                            "status": "accepted", "sent": True, "server_msg_id": "",
+                        })) as file_sender:
+                    result = await send.send("c1", file_path=str(path), direct=True)
+                self.assertEqual(result["message_kind"], "file")
+                self.assertTrue(result["upload_completed"])
+                self.assertNotIn("delivered_text", result)
+                self.assertEqual(file_sender.await_args.args[2], "file_v3_00157_01234567-89ab-cdef-0123-456789abcdefg")
+        asyncio.run(check())
 
     def test_send_without_confirm_blocked(self):
         import asyncio
