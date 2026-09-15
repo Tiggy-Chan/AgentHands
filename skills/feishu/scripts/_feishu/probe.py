@@ -101,27 +101,19 @@ def _wire_shape(data: bytes, depth: int = 0) -> list[dict]:
     return out
 
 
-def _capture_body(body: bytes, *, redact: bool) -> dict:
-    raw = bytes(body or b"")
-    if redact:
-        return {
-            "body_encoding": "protobuf_or_binary",
-            "body_bytes": len(raw),
-            "body_sha256": hashlib.sha256(raw).hexdigest(),
-            "body_truncated": len(raw) > 4096,
-            "field_summary": _wire_shape(raw),
-        }
-    import base64
+def _capture_body(body: bytes) -> dict:
+    """结构摘要，永不留正文：字段形状/长度/SHA-256，没有任何可读的 payload。
 
-    sample = raw[:4096]
-    try:
-        encoded, encoding = sample.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
-        encoded, encoding = base64.b64encode(sample).decode(), "base64"
+    capture 产物会被 --out 写盘、很容易被顺手 commit——日程标题、参会人、
+    邮件正文都不能进去。需要对照协议时看 field_summary，不是看原文。
+    """
+    raw = bytes(body or b"")
     return {
-        "body_encoding": encoding,
+        "body_encoding": "protobuf_or_binary",
+        "body_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
         "body_truncated": len(raw) > 4096,
-        "body": encoded,
+        "field_summary": _wire_shape(raw),
     }
 
 
@@ -338,8 +330,6 @@ async def _media_observe_impl(msg_id: str, headed: bool = False, interact: bool 
 
             page.on("download", on_download)
 
-            import base64 as _b64
-
             def _on_ws(ws):
                 def _sent(payload):
                     if len(ws_frames) >= 40:
@@ -355,10 +345,13 @@ async def _media_observe_impl(msg_id: str, headed: bool = False, interact: bool 
                     needles.append(b'download')
                     if not any(n and n in raw for n in needles):
                         return
+                    # 结构摘要，不留帧体——帧里可能带一次性签发的下载 URL。
                     ws_frames.append({
                         "host": urlsplit(ws.url).netloc,
                         "path": urlsplit(ws.url).path,
-                        "body_b64": _b64.b64encode(raw[:2048]).decode(),
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "field_summary": _wire_shape(raw),
                     })
                 ws.on("framesent", _sent)
 
@@ -713,13 +706,12 @@ async def _media_observe_impl(msg_id: str, headed: bool = False, interact: bool 
                  "popup_requests": popup_requests[:80]},
         "note": "只记录了携带资源 key 的请求元数据；路径中的 key 已脱敏。"
                 "guard 拦截了页面可能发出的写类 command（如已读回执）。",
-        "contains_bodies": bool(ws_frames),
+        "frames_matched": bool(ws_frames),
         "contains_credentials": False,
     }
 
 
-async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
-                       *, redact_body: bool = False) -> None:
+async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event) -> None:
     """Browser-level CDP network sniffer across ALL targets (page + workers).
 
     Page-level Playwright hooks miss worker-internal connections — 2026-09-11:
@@ -727,7 +719,7 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
     (no POSTs, no meaningful page WS frames, no service workers).  With CDP
     flatten auto-attach every target (page/iframe/dedicated+shared worker)
     gets Network.enable, so worker-held fetches and WebSockets surface here.
-    Bounded like the rest of capture mode: metadata + ≤4 KiB bodies only.
+    与其余 capture 路径同策略：只记元数据与结构摘要，不留正文。
     """
     import websockets  # already a venv dep (WS daemon uses it)
 
@@ -806,7 +798,7 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
                             "method": rmethod, "host": parsed.netloc,
                             "path": parsed.path, "target": targets.get(sid, "?"),
                         }
-                        item.update(_capture_body(raw_body, redact=redact_body))
+                        item.update(_capture_body(raw_body))
                         records["writes"].append(item)
                 elif method == "Network.webSocketCreated":
                     parsed = urlsplit(str(params.get("url") or ""))
@@ -824,20 +816,13 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
                             "target": targets.get(sid, "?"),
                             "opcode": resp.get("opcode"),
                         }
-                        if redact_body:
-                            item.update({
-                                "encoding": "protobuf_or_binary",
-                                "bytes": len(raw_b),
-                                "sha256": hashlib.sha256(raw_b).hexdigest(),
-                                "truncated": len(raw_b) > 4096,
-                                "field_summary": _wire_shape(raw_b),
-                            })
-                        else:
-                            item.update({
-                                "encoding": "utf-8",
-                                "truncated": len(raw_b) > 4096,
-                                "body": payload[:4096],
-                            })
+                        item.update({
+                            "encoding": "protobuf_or_binary",
+                            "bytes": len(raw_b),
+                            "sha256": hashlib.sha256(raw_b).hexdigest(),
+                            "truncated": len(raw_b) > 4096,
+                            "field_summary": _wire_shape(raw_b),
+                        })
                         records["ws_frames"].append(item)
     except Exception as exc:
         records["cdp_error"] = f"{type(exc).__name__}: {exc}"
@@ -846,11 +831,11 @@ async def _cdp_capture(profile: Path, records: dict, stop: asyncio.Event,
 async def _capture_impl(app: str) -> dict:
     """Headed write-endpoint capture: watch while the USER performs one write.
 
-    Policy relaxation, deliberate and bounded: calendar/mail capture records
-    non-GET request bodies (≤4 KiB each, base64 when binary) because their
-    payload shape is exactly what we need to register.  message-send capture
-    records only field shapes, lengths and SHA-256 digests.  Capture files must
-    be written with --out and deleted once the endpoint is registered.
+    All capture scopes record only metadata and field shapes — lengths,
+    SHA-256 digests and protobuf wire structure, never body content:
+    capture files are written with --out and are easy to commit by mistake,
+    so 日程标题/参会人/邮件正文 must never land in them.  Delete the file
+    once the endpoint is registered.
     """
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("capture 只能由受限 Browser Worker 执行")
@@ -915,7 +900,6 @@ async def _capture_impl(app: str) -> dict:
                 config.PROFILE,
                 cdp_records,
                 cdp_stop,
-                redact_body=app == "message-send",
             )
         )
         try:
@@ -960,7 +944,7 @@ async def _capture_impl(app: str) -> dict:
                 captured_writes.append({
                     **entry,
                     "noise": False,
-                    **_capture_body(bytes(body), redact=app == "message-send"),
+                    **_capture_body(bytes(body)),
                 })
                 if not noise and not first_interesting_at:
                     first_interesting_at = time.monotonic()  # diagnostic only
@@ -969,7 +953,7 @@ async def _capture_impl(app: str) -> dict:
 
             # 2026-09-11: 重放抓到的创建包被网关回 payloadType=5 空响应，
             # 需要对照真实客户端成功时的响应形状。只记非 GET 网关调用的
-            # 状态码 + ≤4KiB 截断响应体，与请求体同策略（--out、用后删除）。
+            # 状态码 + 结构摘要，与请求体同策略（--out、用后删除）。
             captured_responses: list[dict] = []
 
             def on_response(response) -> None:
@@ -997,7 +981,7 @@ async def _capture_impl(app: str) -> dict:
                             "x_command": xcmd,
                             "status": resp.status,
                         }
-                        item.update(_capture_body(body, redact=app == "message-send"))
+                        item.update(_capture_body(body))
                         captured_responses.append(item)
 
                     asyncio.get_event_loop().create_task(read_body())
@@ -1019,21 +1003,13 @@ async def _capture_impl(app: str) -> dict:
                         "url_path": urlsplit(ws.url).path,
                         "direction": "sent",
                     }
-                    if app == "message-send":
-                        item.update({
-                            "encoding": "protobuf_or_binary",
-                            "bytes": len(raw),
-                            "sha256": hashlib.sha256(raw).hexdigest(),
-                            "truncated": len(raw) > 4096,
-                            "field_summary": _wire_shape(raw),
-                        })
-                    else:
-                        captured = _capture_body(raw, redact=False)
-                        item.update({
-                            "encoding": captured.get("body_encoding", "utf-8"),
-                            "truncated": captured.get("body_truncated", False),
-                            "body": captured.get("body", ""),
-                        })
+                    item.update({
+                        "encoding": "protobuf_or_binary",
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "truncated": len(raw) > 4096,
+                        "field_summary": _wire_shape(raw),
+                    })
                     ws_frames.append(item)
 
                 ws.on("framesent", on_sent)
@@ -1085,13 +1061,10 @@ async def _capture_impl(app: str) -> dict:
         "would_block": would_block,
         "pages": [],
         "closed_early": closed_early,
-        "contains_bodies": bool(app != "message-send" and (
-            captured_writes or ws_frames or cdp_records["writes"]
-            or cdp_records["ws_frames"]
-        )),
+        "contains_bodies": False,
         "contains_credentials": False,
-        "body_redacted": app == "message-send",
-        "note": "写接口抓包结果。登记进 transport 白名单后请删除此文件。",
+        "body_redacted": True,
+        "note": "写接口抓包结果（只含元数据与结构摘要，无正文）。登记进 transport 白名单后请删除此文件。",
     }
 
 

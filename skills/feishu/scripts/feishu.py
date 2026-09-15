@@ -185,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interact", action="store_true",
                    help="media-observe：点击文件卡片触发真实下载（配合 --headed 可手动点）")
     p.add_argument("--capture", action="store_true",
-                   help="calendar/mail/message-send 写接口抓包：headed 浏览器里由用户手动操作一次，记脱敏元数据与截断 body")
+                   help="calendar/mail/message-send 写接口抓包：headed 浏览器里由用户手动操作一次，只记脱敏元数据与结构摘要，不留正文")
     p.add_argument("--out", default="", help="可选：写脱敏 JSON 摘要文件")
 
     p = sub.add_parser("send", help="默认只产草稿；--confirm-send 或用户明确指定 --direct 才真发")

@@ -186,8 +186,10 @@ transport 只放行一次，且不自动重试；
   已验证的 static-resource 路由（含透明 AES-256-GCM 解密）；音频/视频/贴纸必须先
   经受控 probe 观察，未登记时明确失败关闭。
 - `probe` 只记录请求元数据；它可以发现新的 command，但不能把响应正文、Cookie、ticket
-  或 access key 写进 fixture。`message-send --capture` 只保留 protobuf 字段结构、长度和摘要，
-  不保留 body。不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
+  或 access key 写进 fixture。**所有** `--capture` 范围（calendar/mail/message-send）都只保留
+  protobuf 字段结构、长度和摘要，不保留 body——capture 文件走 `--out` 落盘，
+  很容易被顺手 commit，日程标题/参会人/邮件正文绝不能进去。
+  不要在 skill 外直接启动 Playwright 或遍历 React 内部对象。
 - WS 重连可能重发消息：写入端按 msg_id 去重，读取端 `events` 再去一次。
   事件池只保存私聊入站和群聊 @我/@所有人 消息，敏感，优先加密，权限降级时为 0600；轮转不覆盖旧代。
 - 事件池里 `at_me=null` 表示「这条消息编码没解开，判不出来」，不是「没@我」。

@@ -521,7 +521,7 @@ class TestQueryGuards(unittest.TestCase):
     def test_message_send_probe_redacts_payload_values(self):
         from _feishu import probe
 
-        captured = probe._capture_body(b"\x0a\x05secret", redact=True)
+        captured = probe._capture_body(b"\x0a\x05secret")
         self.assertEqual(captured["body_encoding"], "protobuf_or_binary")
         self.assertNotIn("body", captured)
         self.assertIn("body_sha256", captured)
