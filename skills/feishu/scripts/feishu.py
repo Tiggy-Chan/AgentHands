@@ -9,46 +9,43 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FEISHU_HOME = os.environ.get("FEISHU_HOME", os.path.expanduser("~/.local/share/feishu"))
-VENV_PY = os.path.join(FEISHU_HOME, "venv", "bin", "python")
+
+# venv 自举与 other_tools 共用 lib/venv_bootstrap.py；resolve() 让 ~/.claude/skills
+# 下的软链指回本仓库再定位 lib/。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "lib"))
+
+from venv_bootstrap import VenvError, in_venv, ensure as _ensure_venv, reexec as _reexec, venv_python  # noqa: E402
+
+VENV_PY = str(venv_python(FEISHU_HOME))
+
+_PIP_PACKAGES = [
+    "playwright==1.62.0", "protobuf", "httpx", "websockets",
+    "keyring>=25,<27", "secretstorage>=3.3", "cryptography>=43,<47",
+]
+
 
 # PEP 668: system python can't pip-install; hop into our own venv which has
 # protobuf/httpx/websockets/playwright. Recreate it if the deps are missing.
-def _in_venv() -> bool:
-    # realpath resolves the venv's python symlink to the system interpreter,
-    # so compare the un-resolved argv0 path instead.
-    return os.path.abspath(sys.executable) == os.path.abspath(VENV_PY)
-
-
 def _bootstrap() -> None:
-    import subprocess
-    import venv
-
     if not os.path.exists(VENV_PY):
         if os.environ.get("FEISHU_NO_BOOTSTRAP"):
             return
-        print(f"创建 venv：{os.path.dirname(VENV_PY)}", file=sys.stderr)
         try:
-            venv.EnvBuilder(with_pip=True).create(os.path.dirname(VENV_PY))
-        except Exception:
-            print("缺 python3-venv，请先执行：\n  sudo apt install python3-venv", file=sys.stderr)
+            _ensure_venv(FEISHU_HOME, _PIP_PACKAGES)
+        except VenvError as exc:
+            print(exc, file=sys.stderr)
             raise SystemExit(1)
-        pip = [os.path.join(os.path.dirname(VENV_PY), "pip"), "install", "-q",
-               "playwright==1.62.0", "protobuf", "httpx", "websockets",
-               "keyring>=25,<27", "secretstorage>=3.3", "cryptography>=43,<47"]
-        # 内网机器拉 pypi 常要走代理；浏览器流量绝不走（见 auth.py）
-        env = dict(os.environ)
-        if subprocess.run(pip, env=env).returncode != 0 and os.path.exists("/etc/apt"):
-            env["https_proxy"] = env.get("https_proxy", "http://127.0.0.1:7890")
-            subprocess.run(pip, env=env, check=True)
-    os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+    _reexec(FEISHU_HOME, os.path.abspath(__file__))
 
 
-if not _in_venv():
+if not in_venv(FEISHU_HOME):
     if os.path.exists(VENV_PY):
-        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+        _reexec(FEISHU_HOME, os.path.abspath(__file__))
     else:
         # --help must never trigger a 500MB download
         if any(a in ("-h", "--help") for a in sys.argv[1:]):
