@@ -216,4 +216,8 @@ def make_client(
         headers=request_headers,
         max_response_bytes=max_response_bytes,
         enforce_policy=True,
+        # 带 session cookie 的流量绝不跟系统代理走（与浏览器侧的
+        # --no-proxy-server 对齐）；也避免没装 socksio 时被
+        # all_proxy=socks:// 直接打崩。
+        trust_env=False,
     )

@@ -323,6 +323,20 @@ class TestTransportPolicy(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_client_ignores_env_proxy(self):
+        # 带 session cookie 的 httpx 流量绝不跟 HTTP(S)_PROXY/ALL_PROXY 走。
+        import asyncio
+        from lark_bridge import _http
+
+        async def check():
+            c = _http.make_client()
+            try:
+                self.assertFalse(c.trust_env)
+            finally:
+                await c.aclose()
+
+        asyncio.run(check())
+
     def test_response_body_is_bounded(self):
         import asyncio
         import gzip
