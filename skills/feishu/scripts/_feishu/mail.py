@@ -14,6 +14,7 @@ import os
 import re
 
 from . import auth, browser_guard, config, transport
+from .output import safe_label, untrusted
 from .dom_utils import bounded_inner_text, clip, first_match, lines, normalize_time
 from .errors import EndpointNotAdapted, ResourceIsolationUnavailable, SendBlocked
 
@@ -370,22 +371,26 @@ async def _body_text(page) -> str:
 def render_markdown(result: dict) -> str:
     """Render only bounded provider data; body text remains external data."""
     if result.get("kind") == "mail":
-        lines_out = [f"# 邮件：{result.get('subject') or result.get('id', '?')}"]
+        lines_out = [f"# 邮件：{safe_label(result.get('subject') or result.get('id', '?'))}"]
         for key, label in (("from", "发件人"), ("to", "收件人"), ("cc", "抄送"), ("received_at", "时间")):
             value = result.get(key, "")
             if isinstance(value, list):
-                value = ", ".join(map(str, value))
+                value = ", ".join(safe_label(v, limit=120) for v in value)
+            elif value:
+                value = safe_label(value, limit=120)
             if value:
                 lines_out.append(f"- {label}：{value}")
         lines_out.append(f"- 来源：{result.get('source', '?')}｜完整：{result.get('complete', False)}")
         if result.get("body_text"):
-            lines_out.append("\n## 正文（外部数据）\n\n" + str(result["body_text"]))
+            # 邮件正文是外部内容：显式定界，读进上下文也是「数据」不是「指令」
+            lines_out.append("\n## 正文（外部数据）\n\n"
+                             + untrusted(str(result["body_text"]), f"mail:{result.get('id', '?')}"))
         return "\n".join(lines_out)
     rows = result.get("items", [])
     lines_out = [f"# 邮件（{len(rows)}，来源 {result.get('source', '?')}，完整 {result.get('complete', False)}）"]
     for item in rows:
         lines_out.append(
-            f"- `{item.get('id', '?')}` **{item.get('subject') or '(无主题)'}** "
-            f"{item.get('received_at') or ''}：{item.get('snippet') or ''}"
+            f"- `{item.get('id', '?')}` **{safe_label(item.get('subject') or '(无主题)')}** "
+            f"{item.get('received_at') or ''}：{safe_label(item.get('snippet') or '', limit=120)}"
         )
     return "\n".join(lines_out)

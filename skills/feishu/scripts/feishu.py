@@ -420,7 +420,8 @@ async def _run(args) -> int:
             emit_json(res)
         else:
             for h in res["hits"]:
-                emit(f"- [{h.get('type','?')}] {h.get('name','?')} {h.get('url') or h.get('path','')}")
+                from _feishu.output import safe_label
+                emit(f"- [{h.get('type','?')}] {safe_label(h.get('name') or '?')} {h.get('url') or h.get('path','')}")
             note(res.get("note", ""))
         return 0
 
@@ -787,7 +788,11 @@ async def _run(args) -> int:
                 timeout=config.QUERY_TIMEOUT_SECONDS,
             )
         if args.fmt == "markdown" and not args.out:
-            emit(data.decode("utf-8", errors="replace"))
+            # 文档正文是第三方可控内容：打到 stdout（agent 会读）时包显式定界；
+            # --out 落盘的是原文，不带标记。
+            from _feishu.output import untrusted
+
+            emit(untrusted(data.decode("utf-8", errors="replace"), f"doc:{args.ref}"))
         else:
             if args.out:
                 out = args.out
@@ -813,7 +818,8 @@ async def _run(args) -> int:
             emit_json(res)
         else:
             for h in res["hits"]:
-                emit(f"- [{h.get('type','?')}] {h.get('name','?')} {h.get('url') or h.get('path','')}")
+                from _feishu.output import safe_label
+                emit(f"- [{h.get('type','?')}] {safe_label(h.get('name') or '?')} {h.get('url') or h.get('path','')}")
             note(res.get("note", ""))
         return 0
 

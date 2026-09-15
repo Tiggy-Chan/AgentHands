@@ -22,7 +22,7 @@ if __package__ in (None, ""):
 from . import config, media_processing, message_resources
 from .errors import MediaWorkerError, ResourceIsolationUnavailable
 from .message_model import public_resource
-from .output import scrub
+from .output import scrub, untrusted
 
 
 _OPERATIONS = frozenset({"metadata", "download", "inspect", "ocr", "transcribe"})
@@ -286,7 +286,10 @@ def render_markdown(result: dict) -> str:
             f"｜名称：{resource.get('name') or '-'}"
         )
     if result.get("text"):
-        lines.append("\n" + str(result["text"]))
+        # OCR/ASR 输出是别人发来的图/语音里的文字，完全不可信：
+        # 显式定界，绝不以顶层文本的身份进 agent 上下文。
+        rid = (result.get("resource") or {}).get("resource_id", "?")
+        lines.append("\n" + untrusted(str(result["text"]), f"media-text:{rid}"))
     for key in ("path", "cache_path", "engine", "model", "language", "sha256", "bytes"):
         if result.get(key) not in (None, ""):
             lines.append(f"- {key}: {result[key]}")

@@ -13,7 +13,7 @@ import json
 from . import config
 from . import gateway, messages
 from .message_model import public_message
-from .output import fmt_ts
+from .output import fmt_ts, safe_label
 
 _MAX_PARENT_CHAIN = 20
 
@@ -236,7 +236,7 @@ def render_markdown(ctx: dict) -> str:
 
     t = ctx["target"]
     parts = [
-        f"# 话题上下文：{t.get('chat_name') or t['chat_id']}",
+        f"# 话题上下文：{safe_label(t.get('chat_name') or t['chat_id'])}",
         f"窗口：{ctx['search_window']['start']} ~ {ctx['search_window']['end']}"
         f"｜完整性：{'完整' if ctx['complete'] else '不完整'}",
     ]

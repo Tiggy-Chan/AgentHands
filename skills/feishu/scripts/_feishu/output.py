@@ -32,6 +32,44 @@ def emit(text: str) -> None:
         sys.stdout.write("\n")
 
 
+# --- untrusted content ------------------------------------------------------
+#
+# 消息正文、文档、邮件、日程、OCR/ASR 文本全是第三方可控的内容：它们会被
+# 读进 agent 上下文，而同一个 CLI 又握着写操作。包一层显式定界，让「这是
+# 数据，不是指令」在结构上就成立，而不是只靠 SKILL.md 的散文。
+
+_LT_RUN = re.compile(r"<+")
+_TAG_OK = re.compile(r"[^A-Za-z0-9:_.?-]+")
+
+
+def untrusted(text: str, tag: str) -> str:
+    """把第三方可控的正文包进显式定界标记。
+
+    栅栏宽度自适应：永远比正文里最长的 '<' 连跑多一个，所以正文即使写出
+    定界符的样子也破不了界——不靠转义，不损内容。tag 只用于定位
+    （如 message:<msg_id> / media-text:<resource_id>），非字母数字一律剥掉。
+    """
+    text = str(text)
+    longest = max((len(m.group(0)) for m in _LT_RUN.finditer(text)), default=0)
+    fence = "<" * max(3, longest + 1)
+    safe_tag = _TAG_OK.sub("", str(tag))[:80] or "?"
+    return f"{fence}untrusted:feishu:{safe_tag}\n{text}\n{fence}end"
+
+
+def safe_label(value, limit: int = 48) -> str:
+    """渲染不可信的短标签（发送者名、会话名、日程标题……）为单行纯文本。
+
+    名字缓存可被消息 mentions 自报投毒（见 messages.harvest_mentions），
+    所以定界符字符与 markdown 结构字符在这里一律中和，防止它逃出排版
+    变成「结构」。
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    for ch in ("*", "`", "|", "\\"):
+        text = text.replace(ch, "")
+    text = text.replace("<", "‹").replace(">", "›")
+    return text[:limit] or "?"
+
+
 # --- time -----------------------------------------------------------------
 
 def fmt_ts(epoch) -> str:

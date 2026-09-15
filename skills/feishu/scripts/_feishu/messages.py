@@ -9,7 +9,7 @@ import re
 
 from . import config, gateway
 from .message_model import public_message
-from .output import fmt_ts, note
+from .output import fmt_ts, note, safe_label, untrusted
 
 _CHAT_TYPE = {0: "unknown", 1: "p2p", 2: "group", 3: "topic"}
 
@@ -319,12 +319,15 @@ def render_markdown(msgs: list[dict], title: str = "") -> str:
                 f"上下文抓取失败：{m.get('error', 'unknown')}"
             )
             continue
-        who = _sender_label(m)
+        # 发送者名字可被 mentions 自报投毒（harvest_mentions），渲染前中和掉
+        # 结构字符——它只能是排版，永远不能变成定界符或 markdown 结构。
+        who = safe_label(_sender_label(m))
         ts = fmt_ts(m.get("create_time"))
         text = m.get("text") or f"[{m.get('type_name', '?')} 消息]"
         if m.get("is_removed"):
             text = "~~已撤回~~"
-        body = "\n".join(f"  > {ln}" for ln in str(text).splitlines())
+        # 正文是第三方可控内容：显式定界，agent 读到时结构上就是「数据」。
+        body = untrusted(str(text), f"message:{m.get('msg_id', '?')}")
         suffix = []
         if m.get("resources"):
             suffix.append(f"资源 {len(m['resources'])} 个")

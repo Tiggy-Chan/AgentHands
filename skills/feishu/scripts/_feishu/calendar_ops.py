@@ -418,7 +418,7 @@ async def _verify_created_event(
 async def create_event(title: str, start: str, end: str, confirm_write: str = "",
                        calendar_id: str = "", description: str = "",
                        my_id: str = "", my_name: str = "") -> dict:
-    from .output import parse_when
+    from .output import parse_when, safe_label, untrusted
 
     if not all(str(value).strip() for value in (title, start, end)):
         raise ValueError("calendar create 需要标题、开始和结束时间")
@@ -972,24 +972,26 @@ def render_markdown(result: dict) -> str:
         for item in result.get("items", []):
             managed = "本人管理" if item.get("managed") else "订阅/共享"
             lines_out.append(
-                f"- `{item.get('calendar_id', '?')}` **{item.get('name') or '(未命名)'}**（{managed}）"
+                f"- `{item.get('calendar_id', '?')}` **{safe_label(item.get('name') or '(未命名)')}**（{managed}）"
             )
         return "\n".join(lines_out)
     if result.get("kind") == "calendar_event":
-        lines_out = [f"# 会议：{result.get('title') or result.get('id', '?')}"]
+        lines_out = [f"# 会议：{safe_label(result.get('title') or result.get('id', '?'))}"]
         for key, label in (("start", "开始"), ("end", "结束"), ("timezone", "时区"),
                            ("organizer", "组织者"), ("location", "地点"), ("status", "状态")):
             if result.get(key):
-                lines_out.append(f"- {label}：{result[key]}")
+                lines_out.append(f"- {label}：{safe_label(result[key], limit=200)}")
         lines_out.append(f"- 来源：{result.get('source', '?')}｜完整：{result.get('complete', False)}")
         if result.get("description"):
-            lines_out.append("\n## 描述（外部数据）\n\n" + str(result["description"]))
+            # 日程描述是外部内容：显式定界
+            lines_out.append("\n## 描述（外部数据）\n\n"
+                             + untrusted(str(result["description"]), f"calendar:{result.get('id', '?')}"))
         return "\n".join(lines_out)
     rows = result.get("items", [])
     lines_out = [f"# 日历（{len(rows)}，来源 {result.get('source', '?')}，完整 {result.get('complete', False)}）"]
     for item in rows:
         lines_out.append(
-            f"- `{item.get('id', '?')}` **{item.get('title') or '(无标题)'}** "
+            f"- `{item.get('id', '?')}` **{safe_label(item.get('title') or '(无标题)')}** "
             f"{item.get('start') or ''} ~ {item.get('end') or ''}"
         )
     return "\n".join(lines_out)
