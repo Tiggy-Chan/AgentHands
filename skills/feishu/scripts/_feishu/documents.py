@@ -529,14 +529,24 @@ async def _clear_editor(page, editor) -> None:
     times and check the real body text between rounds.
     """
     for round_ in range(4):
-        await editor.click()
+        first_body = editor.locator("[data-block-id]:not([data-block-id='1'])").first
+        if await first_body.count():
+            await first_body.click()
+        else:
+            await editor.click()
         await page.wait_for_timeout(300)
         for _ in range(3):
             await page.keyboard.press("Control+a")
             await page.wait_for_timeout(250)
         await page.keyboard.press("Backspace")
         await page.wait_for_timeout(600)
-        if not _editor_body_text(await editor.inner_text()):
+        remaining = await page.evaluate("""() => {
+            const blocks = document.querySelectorAll("[data-block-id]:not([data-block-id='1'])");
+            if (blocks.length === 0) return 0;
+            if (blocks.length === 1 && !blocks[0].innerText.trim()) return 0;
+            return blocks.length;
+        }""")
+        if remaining == 0 or not _editor_body_text(await editor.inner_text()):
             return
     residue = _editor_body_text(await editor.inner_text())
     raise FeishuError(f"清空文档失败（全选删除后仍有残留内容：{residue[:120]!r}）",
@@ -582,10 +592,16 @@ async def _paste_content(page, editor, markdown_text: str, html_body: str, plain
             await page.keyboard.press("Escape")
     except Exception:
         pass
+    # Scroll through document so virtualized renderer instantiates blocks
+    for _ in range(8):
+        await page.evaluate("window.scrollBy(0, 1000)")
+        await page.wait_for_timeout(150)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(300)
+
     inner = await _wait_stable(page, editor)
     body = _editor_body_text(inner)
-    if mode != "plain" and ("```" in body or "| --- |" in body
-                            or len(body) < 0.6 * max(1, len(plain_text))):
+    if mode != "plain" and ("```" in body or "| --- |" in body):
         # The editor ignored the HTML flavor; retry as plain markdown text.
         await _clear_editor(page, editor)
         await page.evaluate("text => navigator.clipboard.writeText(text)", markdown_text)
