@@ -73,14 +73,11 @@ BROWSER_TIMEOUT_SECONDS = float(os.environ.get("FEISHU_BROWSER_TIMEOUT", 120))
 BROWSER_QUERY_TIMEOUT_SECONDS = max(
     QUERY_TIMEOUT_SECONDS, BROWSER_TIMEOUT_SECONDS + 20
 )
-# 2026-09-10: the authenticated Messenger SPA (now reachable again via
-# cookie injection) needs ~700MB; the old 384/512 budget got the worker
-# oom-killed on every real page load.  Later the same day systemd-oomd
-# started SIGKILLing whole units (rc=255) whenever the *session-wide*
-# memory pressure tripped its limit — the tight cgroup forces aggressive
-# reclaim inside our own unit, which itself drives session PSI up.
-# A roomier ceiling lowers reclaim stalls and makes the oomd kill rarer;
-# the absolute cap still bounds a runaway browser.
+# 规则：预算要包住登录后的 Messenger SPA（约 700MB），并给 systemd-oomd 的
+# 会话级 PSI 留余量——cgroup 收太紧会迫使本单元频繁回收，回收抖动本身
+# 推高会话压力，反而招来 oomd 对整个 unit 的 SIGKILL（rc=255）。
+# 上限宁宽勿紧，绝对封顶仍然挡住失控的浏览器。
+# 实测：384/512M 时每次真实页面加载都被 oom-kill，上调到 1536M/2G 后消失。
 BROWSER_MEMORY_HIGH = os.environ.get("FEISHU_BROWSER_MEMORY_HIGH", "1536M")
 BROWSER_MEMORY_MAX = os.environ.get("FEISHU_BROWSER_MEMORY_MAX", "2G")
 BROWSER_TASKS_MAX = os.environ.get("FEISHU_BROWSER_TASKS_MAX", "128")

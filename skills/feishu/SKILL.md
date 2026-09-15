@@ -115,14 +115,14 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
   `--unattended` 下退出码 2 + notify-send。
 - 判活不看 HTTP 200（未登录也可能 200），看 `accounts/web/user` 的业务数据。
 - 浏览器登录、会话列表、远程文档搜索、邮件和日历读取都由单任务 Browser Worker 承载，
-  默认使用 systemd cgroup（1536M high / 2G max / 128 tasks——登录后的 Messenger SPA
-  需要 ~700M，2026-09-10 两次上调：先是 384M/512M→768M/1G 解决 SPA 本体 OOM，
-  再到 1536M/2G 缓解 systemd-oomd 按**会话级 PSI** 整体 SIGKILL 的问题——紧 cgroup
-  的回收抖动本身会推高会话压力；worker 对 oomd 杀（退出码 255 且无输出）自动重试一次）；
-  无 cgroup 时失败关闭。
-- **浏览器操作不再只依赖持久 profile**：所有 Browser Worker 操作在导航前把
-  `cookies.json` 注入浏览器上下文（profile 的登录态比 web 会话 cookie 先过期，
-  2026-09-10 实锤：profile 掉登录导致 chats/docs-search 全部落在登录页）。
+  默认使用 systemd cgroup（1536M high / 2G max / 128 tasks），无 cgroup 时失败关闭。
+  预算规则：要包住登录后的 Messenger SPA（约 700M），并给 systemd-oomd 的会话级
+  PSI 留余量——cgroup 太紧会迫使本单元频繁回收，回收抖动本身推高会话压力，反而
+  招来 oomd 整体 SIGKILL（实测：384/512M 每次页面加载都被 oom-kill，1536M/2G 后
+  消失）。worker 对 oomd 杀（退出码 255 且无输出）自动重试一次。
+- **浏览器操作不依赖持久 profile 的登录态**：导航前一律把 `cookies.json` 注入浏览器
+  上下文——profile 自己的登录态比 web 会话 cookie 先过期（实测：profile 掉登录时
+  chats/docs-search 全部落在登录页）。
   被重定向到登录页时会报明确的「重新 login」错误，而不是伪装成「协议变了」。
 - 图片、文件、音频和视频处理由独立 Media Worker 承载：cgroup 资源上限（768M high /
   1G max / 64 tasks）加 NoNewPrivileges / PrivateTmp / ProtectSystem=full，
