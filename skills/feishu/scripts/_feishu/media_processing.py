@@ -80,7 +80,9 @@ def _probe(path: Path, resource: dict[str, Any]) -> dict[str, Any]:
         return result
     raw = _run(
         [
-            "ffprobe", "-v", "error", "-print_format", "json",
+            # 只读本地文件协议：构造的 m3u8/concat 不能借 ffprobe 去读
+            # file:// 之外的东西，更不许碰 http://（SSRF）。
+            "ffprobe", "-v", "error", "-protocol_whitelist", "file", "-print_format", "json",
             "-show_format", "-show_streams", str(path),
         ],
         timeout=60,
@@ -160,7 +162,7 @@ def _video_frames(path: Path, resource: dict[str, Any]) -> list[Path]:
     try:
         _run(
             [
-                "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+                "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-y", "-i", str(path),
                 "-vf", f"fps={fps:.8f},scale=1920:-2",
                 "-frames:v", str(config.MEDIA_MAX_VIDEO_FRAMES),
                 str(frames_dir / "frame-%03d.jpg"),
@@ -208,7 +210,7 @@ def _extract_audio(path: Path, resource: dict[str, Any]) -> Path:
     try:
         _run(
             [
-                "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+                "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-y", "-i", str(path),
                 "-t", str(config.MEDIA_MAX_DURATION_SECONDS), "-vn",
                 "-ac", "1", "-ar", "16000", str(audio),
             ],

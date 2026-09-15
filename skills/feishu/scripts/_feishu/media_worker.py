@@ -69,6 +69,12 @@ def build_command(operation: str, unit: str, timeout: float) -> list[str]:
         "--property=OOMPolicy=kill",
         "--property=KillMode=control-group",
         f"--property=RuntimeMaxSec={max(1, math.ceil(timeout))}s",
+        # 资源之外的隔离：cgroup 管的是「别吃垮宿主」，这些管的是「打穿了
+        # ffmpeg/tesseract 也别拿到完整用户权限」。不用 ProtectHome——输入与
+        # 产物都在 FEISHU_HOME（$HOME 下），protect 了会把自己饿死。
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=full",
         f"--setenv=FEISHU_HOME={config.HOME}",
         "--setenv=FEISHU_MEDIA_WORKER=1",
         _worker_python(), _worker_script(), "--worker", "--operation", operation,
@@ -231,9 +237,9 @@ async def _execute(operation: str, payload: dict) -> dict:
                 output_bytes = str(processed.get("text") or "").encode("utf-8")
             else:
                 output_bytes = json.dumps(processed, ensure_ascii=False, indent=2).encode("utf-8")
-            # _safe_output was called above to reject accidental overwrite;
-            # the atomic helper rechecks the same contract before install.
-            target.unlink(missing_ok=True)
+            # _safe_output 上面已拒绝覆盖，_write_user_output 里还会原子地
+            # 复核一次——这里不需要也不允许先 unlink（那会删掉别人刚刚
+            # 创建的文件，把不覆盖契约变成 TOCTOU 删除）。
             result["output_path"] = _write_user_output(out, output_bytes)
         return result
     finally:

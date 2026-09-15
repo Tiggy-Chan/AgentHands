@@ -41,7 +41,7 @@ _DEL_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~", re.S)
 _EM_RE = re.compile(r"\*(?=\S)([^*]+?)(?<=\S)\*|_(?=\S)([^_]+?)(?<=\S)_", re.S)
 _LINK_RE = re.compile(r"\[([^\]]+)\]\((\s*<?[^)\s>]+>?(?:\s+\"[^\"]*\")?\s*)\)")
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((\s*<?[^)\s>]+>?)\s*\)")
-_AUTOLINK_RE = re.compile(r"<((?:https?|ftp)://[^>\s]+|[^>\s@]+@[^>\s@]+\.[^>\s@]+)>")
+_AUTOLINK_RE = re.compile(r"<(https?://[^>\s]+|[^>\s@]+@[^>\s@]+\.[^>\s@]+)>")
 _BARE_URL_RE = re.compile(r"(?<![\"'=\]])(https?://[^\s<>\]\)\"']+)")
 
 

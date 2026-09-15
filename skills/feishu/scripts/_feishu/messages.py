@@ -25,11 +25,18 @@ _NAME_DENYLIST = frozenset({
 # poison signature (real people can share a name; one string covering a whole
 # tenant cannot).
 _NAME_UNIFORMITY_LIMIT = 3
+# mentions 自报的名字没有任何服务端背书：限长 + 拒控制字符，别让一条
+# 消息正文把几百字节的东西塞进本地缓存（渲染侧另有 safe_label 中和）。
+_NAME_MAX_LEN = 64
 
 
 def _name_ok(value) -> bool:
     text = str(value or "").strip()
-    return bool(text) and text.lower() not in _NAME_DENYLIST
+    if not text or len(text) > _NAME_MAX_LEN:
+        return False
+    if any(ord(c) < 32 or ord(c) == 0x7F for c in text):
+        return False
+    return text.lower() not in _NAME_DENYLIST
 
 
 def _seconds(value) -> float:
@@ -80,7 +87,7 @@ def _drop_uniform_names(names: dict) -> None:
 
 
 _MENTION_RE = re.compile(
-    r'<at\b[^>]*\b(?:user_id|userid|id)=["\']([A-Za-z0-9_-]+)["\'][^>]*>@?([^<]+)</at>',
+    r'<at\b[^>]*\b(?:user_id|userid|id)=["\']([A-Za-z0-9_-]{1,64})["\'][^>]*>@?([^<]{1,64})</at>',
     re.IGNORECASE,
 )
 

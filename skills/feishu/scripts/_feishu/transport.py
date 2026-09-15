@@ -258,7 +258,9 @@ async def request(
 ):
     """Guarded HTTP request with small retry budget for network errors only.
 
-    Retries never apply to gateway_cmd==5 (sending must not duplicate).
+    Retries never apply to sends or writes (gateway cmd=5 / write cmds, and
+    REST writes like upload/import/create) — a lost response must not
+    duplicate the operation.
     """
     if os.environ.get("FEISHU_NO_NETWORK") == "1":
         from .errors import FeishuError
@@ -266,7 +268,9 @@ async def request(
         raise FeishuError("网络请求已被 FEISHU_NO_NETWORK=1 禁用")
     check_allowed(method, url, gateway_cmd)
     # Sending/creating must not duplicate on a lost response — no retries.
-    if gateway_cmd == SEND_CMD or gateway_cmd in WRITE_GATEWAY_CMDS:
+    # REST 写（云盘上传、import/create）不带 gateway cmd，按 classify 判定。
+    if gateway_cmd == SEND_CMD or gateway_cmd in WRITE_GATEWAY_CMDS \
+            or classify(method, url, gateway_cmd) in ("send", "write"):
         retries = 0
     last_exc = None
     for attempt in range(retries + 1):
@@ -305,6 +309,11 @@ async def stream_request(
     The caller is responsible for enforcing the byte cap while iterating
     ``response.aiter_raw()``.
     """
+    # 离线开关必须管住这条路：媒体下载走的正是 stream。
+    if os.environ.get("FEISHU_NO_NETWORK") == "1":
+        from .errors import FeishuError
+
+        raise FeishuError("网络请求已被 FEISHU_NO_NETWORK=1 禁用")
     check_allowed(method, url, gateway_cmd)
     async with _http.make_client(
         timeout=timeout,

@@ -127,10 +127,12 @@ def encrypt_record(record: dict) -> str:
     )
 
 
-def decrypt_record(line: str) -> dict:
+def decrypt_record(line: str, *, allow_plaintext: bool = False) -> dict:
     envelope = json.loads(line)
     if envelope.get("v") != 2:
-        if isinstance(envelope, dict):
+        # 明文兼容分支只服务于显式的 legacy 读取。加密事件池（.enc）里出现
+        # 明文行 = 有人往 AEAD 保护的文件里注入了一条「事件」，必须拒收。
+        if allow_plaintext and isinstance(envelope, dict):
             return envelope
         raise SecureStoreError("invalid event record")
     key = _load_key()

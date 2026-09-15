@@ -124,9 +124,13 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
   `cookies.json` 注入浏览器上下文（profile 的登录态比 web 会话 cookie 先过期，
   2026-09-10 实锤：profile 掉登录导致 chats/docs-search 全部落在登录页）。
   被重定向到登录页时会报明确的「重新 login」错误，而不是伪装成「协议变了」。
-- 图片、文件、音频和视频处理由独立 Media Worker 承载（768M high / 1G max / 64 tasks），
-  只在明确执行 `media` 时运行；原始附件默认处理后删除。
+- 图片、文件、音频和视频处理由独立 Media Worker 承载：cgroup 资源上限（768M high /
+  1G max / 64 tasks）加 NoNewPrivileges / PrivateTmp / ProtectSystem=full，
+  ffmpeg/ffprobe 只放行 file 协议。它挡资源耗尽和提权，**不是完备安全沙箱**——
+  别用它处理你主动怀疑有毒的文件。只在明确执行 `media` 时运行；原始附件默认处理后删除。
 - OCR 使用本机 tesseract；ASR 使用本机 `faster-whisper base` CPU/int8；不上传消息内容到外部服务。
+  **首次 transcribe 会从 HuggingFace 下载模型**（约 150MB，存 `$FEISHU_HOME/models`），
+  纯内网机器先确认能访问或提前预置。
 - 事件和按需导出的 Markdown 正文优先使用 Secret Service/libsecret 中的 AES-256-GCM 密钥；
   keyring 不可用时退回 0600 文件，并由 `events status` 明确报告未加密。
   单测/CI 设 `FEISHU_EPHEMERAL_KEY=1`：进程级一次性密钥，绝不写系统 keyring

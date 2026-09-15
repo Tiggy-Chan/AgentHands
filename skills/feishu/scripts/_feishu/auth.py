@@ -54,8 +54,11 @@ def save_cookies(cookies: dict, domain: str) -> None:
         "domain": domain,
         "cookies": cookies,
     }
-    tmp.write_text(json.dumps(payload, ensure_ascii=False))
-    os.chmod(tmp, 0o600)
+    # 先建 0600 再写内容：write_text 用默认 umask 建文件，之后 chmod 会留下
+    # 一瞬间的 0644。与 secure_store.atomic_write 同款姿势。
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(payload, ensure_ascii=False))
     os.replace(tmp, config.COOKIES_FILE)
     register_secret(cookie_header(cookies))
     for v in cookies.values():
@@ -178,6 +181,10 @@ def playwright_cookie_jar() -> list[dict]:
             "domain": apex,
             "path": "/",
             "secure": True,
+            # 会话本体不许被页面 JS 经 document.cookie 读到（与浏览器里真实
+            # 会话 cookie 的姿势一致）；CSRF 等工具型 cookie 保持 JS 可读，
+            # SPA 的双提交校验依赖它们。
+            "httpOnly": name == "session" or name.startswith("session_list"),
         })
     return jar
 
