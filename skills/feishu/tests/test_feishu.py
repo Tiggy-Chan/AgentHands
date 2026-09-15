@@ -422,6 +422,7 @@ class TestQueryGuards(unittest.TestCase):
         from _feishu.errors import QueryBusy
 
         with tempfile.TemporaryDirectory() as tmp:
+            old_home = os.environ.get("FEISHU_HOME")
             os.environ["FEISHU_HOME"] = tmp
             importlib.reload(config)
             importlib.reload(query_lock)
@@ -431,7 +432,10 @@ class TestQueryGuards(unittest.TestCase):
                         with query_lock.acquire("mentions"):
                             pass
             finally:
-                os.environ.pop("FEISHU_HOME", None)
+                if old_home is None:
+                    os.environ.pop("FEISHU_HOME", None)
+                else:
+                    os.environ["FEISHU_HOME"] = old_home
 
     def test_repeated_page_token_stops(self):
         import asyncio
@@ -693,6 +697,7 @@ class TestEventStore(unittest.TestCase):
         import tempfile
         from pathlib import Path
         self.tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("FEISHU_HOME")
         os.environ["FEISHU_HOME"] = self.tmp.name
         import importlib
         from _feishu import config, event_store, secure_store
@@ -703,7 +708,10 @@ class TestEventStore(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
-        os.environ.pop("FEISHU_HOME", None)
+        if self._old_home is None:
+            os.environ.pop("FEISHU_HOME", None)
+        else:
+            os.environ["FEISHU_HOME"] = self._old_home
 
     def _ev(self, msg_id, ts, at_me=False, text="hi", chat="c1", from_id="u1"):
         return {"schema": 1, "kind": "message", "msg_id": msg_id, "chat_id": chat,
@@ -1696,6 +1704,8 @@ class TestSendGate(unittest.TestCase):
                 self.calls += 1
                 return httpx.Response(200, content=ack.SerializeToString())
 
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+
         async def check():
             client = Client()
             transport.configure()
@@ -1708,7 +1718,10 @@ class TestSendGate(unittest.TestCase):
                 self.assertTrue(result["sent"])
                 self.assertEqual(client.calls, 1)
             finally:
-                os.environ.pop("FEISHU_ALLOW_SEND", None)
+                if old_allow is None:
+                    os.environ.pop("FEISHU_ALLOW_SEND", None)
+                else:
+                    os.environ["FEISHU_ALLOW_SEND"] = old_allow
         asyncio.run(check())
 
     def test_send_result_verifies_server_message_id(self):
@@ -1908,6 +1921,7 @@ class TestAttribution(unittest.TestCase):
         import tempfile
         import importlib
         self.tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("FEISHU_HOME")
         os.environ["FEISHU_HOME"] = self.tmp.name
         from _feishu import config, messages, gateway
         importlib.reload(config)
@@ -1918,7 +1932,10 @@ class TestAttribution(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
-        os.environ.pop("FEISHU_HOME", None)
+        if self._old_home is None:
+            os.environ.pop("FEISHU_HOME", None)
+        else:
+            os.environ["FEISHU_HOME"] = self._old_home
 
     def _write_names(self, users=None, chats=None):
         self.config.ensure_home()

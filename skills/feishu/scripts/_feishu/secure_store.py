@@ -48,6 +48,18 @@ def _load_key() -> bytes | None:
         _backend = "disabled_by_configuration"
         return None
 
+    # 测试/CI 逃生门：进程级一次性密钥，绝不碰系统 keyring。代价是加密内容
+    # 跨进程不可读——密钥随进程消失，仅限单进程内写完即读的场景（单测）。
+    if os.environ.get("FEISHU_EPHEMERAL_KEY") == "1":
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key = secrets.token_bytes(32)
+        AESGCM(key)  # 同 _load_key 的 keyring 分支：先构造，提早暴露坏安装
+        _key = key
+        _mode = "encrypted"
+        _backend = "ephemeral_no_keyring"
+        return _key
+
     try:
         import keyring
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM

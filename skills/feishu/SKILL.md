@@ -121,6 +121,8 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 - OCR 使用本机 tesseract；ASR 使用本机 `faster-whisper base` CPU/int8；不上传消息内容到外部服务。
 - 事件和按需导出的 Markdown 正文优先使用 Secret Service/libsecret 中的 AES-256-GCM 密钥；
   keyring 不可用时退回 0600 文件，并由 `events status` 明确报告未加密。
+  单测/CI 设 `FEISHU_EPHEMERAL_KEY=1`：进程级一次性密钥，绝不写系统 keyring
+  （代价是加密内容跨进程不可读，仅限单进程内写完即读的场景）。
 
 ## 发送是双重闸门（默认不变）
 
