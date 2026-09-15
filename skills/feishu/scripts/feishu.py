@@ -173,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-nodes", type=int, default=5000)
     p.add_argument("--folder", default="", help="导入目标文件夹 token 或 URL（默认我的空间根目录）")
     p.add_argument("--title", "--name", dest="title", default="", help="导入文档标题（默认取文件名）")
-    p.add_argument("--direct", action="store_true", help="直接写入模式：用户已明确授权，免草稿确认")
+    p.add_argument("--direct", action="store_true", help="直接写入模式：用户已明确授权，免指纹核对；仍需 FEISHU_ALLOW_WRITE=1")
     p.add_argument("--confirm-write", default="", help="写入确认指纹")
 
     p = sub.add_parser("docs-search", help="搜文档（远程网页搜索；--local 搜本地索引/缓存）")
@@ -206,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--at-user-id", action="append", default=[])
     p.add_argument("--confirm-send", default="", metavar="FINGERPRINT")
     p.add_argument("--direct", action="store_true",
-                   help="用户已明确授权时直接发送一条；仍会探活、单次放行且不自动重试")
+                   help="用户已明确授权时直接发送一条；免指纹核对，仍需 FEISHU_ALLOW_SEND=1；仍会探活、单次放行且不自动重试")
 
     p = sub.add_parser("daemon", help="WebSocket 守护进程：start|stop|restart|status|tail|run")
     p.add_argument("action", choices=["start", "stop", "restart", "status", "tail", "run"])

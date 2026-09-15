@@ -1701,6 +1701,9 @@ class TestSendGate(unittest.TestCase):
         import asyncio
         from _feishu import send
 
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+        os.environ["FEISHU_ALLOW_SEND"] = "1"
+
         async def check():
             with patch.object(send.auth, "prepare", new=AsyncMock(return_value={
                 "user_id": "me", "name": "我",
@@ -1718,13 +1721,24 @@ class TestSendGate(unittest.TestCase):
             self.assertEqual(result["status"], "accepted")
             self.assertTrue(result["verified"])
             self.assertEqual(result["verification_source"], "gateway_cmd8")
-        asyncio.run(check())
+        try:
+            asyncio.run(check())
+        finally:
+            if old_allow is None:
+                os.environ.pop("FEISHU_ALLOW_SEND", None)
+            else:
+                os.environ["FEISHU_ALLOW_SEND"] = old_allow
 
     def test_file_send_uses_native_message_without_link_fallback(self):
         import asyncio
         import tempfile
         from pathlib import Path
         from _feishu import send
+
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+        old_write = os.environ.get("FEISHU_ALLOW_WRITE")
+        os.environ["FEISHU_ALLOW_SEND"] = "1"
+        os.environ["FEISHU_ALLOW_WRITE"] = "1"
 
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
@@ -1748,7 +1762,14 @@ class TestSendGate(unittest.TestCase):
                 self.assertTrue(result["upload_completed"])
                 self.assertNotIn("delivered_text", result)
                 self.assertEqual(file_sender.await_args.args[2], "file_v3_00157_01234567-89ab-cdef-0123-456789abcdefg")
-        asyncio.run(check())
+        try:
+            asyncio.run(check())
+        finally:
+            for key, old in (("FEISHU_ALLOW_SEND", old_allow), ("FEISHU_ALLOW_WRITE", old_write)):
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
 
     def test_send_without_confirm_blocked(self):
         import asyncio
@@ -1785,11 +1806,56 @@ class TestSendGate(unittest.TestCase):
         from lark_bridge import _http
 
         transport.configure()
-        os.environ.pop("FEISHU_ALLOW_SEND", None)
-        transport.arm_direct_send_once()
-        _http.require_send_allowed()
-        with self.assertRaises(Exception):
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+        os.environ["FEISHU_ALLOW_SEND"] = "1"
+        try:
+            transport.arm_direct_send_once()
             _http.require_send_allowed()
+            with self.assertRaises(Exception):
+                _http.require_send_allowed()
+        finally:
+            if old_allow is None:
+                os.environ.pop("FEISHU_ALLOW_SEND", None)
+            else:
+                os.environ["FEISHU_ALLOW_SEND"] = old_allow
+
+    def test_direct_gate_still_requires_env(self):
+        # --direct 只免指纹核对；没有 FEISHU_ALLOW_SEND=1 时一次也不能发。
+        import asyncio
+        from _feishu import transport
+        from lark_bridge import _http
+
+        transport.configure()
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+        os.environ.pop("FEISHU_ALLOW_SEND", None)
+        try:
+            transport.arm_direct_send_once()
+            with self.assertRaises(Exception):
+                _http.require_send_allowed()
+        finally:
+            # 闸门在 env 检查处抛异常时不会自动解除武装，测试自己清干净
+            transport._send_armed = False
+            transport._direct_send_armed = False
+            if old_allow is not None:
+                os.environ["FEISHU_ALLOW_SEND"] = old_allow
+
+    def test_direct_write_gate_still_requires_env(self):
+        # 同上：--direct 的写路径也不能绕开 FEISHU_ALLOW_WRITE=1。
+        from _feishu import transport
+        from lark_bridge import _http
+
+        transport.configure()
+        old_write = os.environ.get("FEISHU_ALLOW_WRITE")
+        os.environ.pop("FEISHU_ALLOW_WRITE", None)
+        try:
+            transport.arm_direct_write_once()
+            with self.assertRaises(Exception):
+                _http.require_write_allowed()
+        finally:
+            transport._write_armed = False
+            transport._direct_write_armed = False
+            if old_write is not None:
+                os.environ["FEISHU_ALLOW_WRITE"] = old_write
 
 
 class TestOutput(unittest.TestCase):

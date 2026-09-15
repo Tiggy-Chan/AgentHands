@@ -121,10 +121,11 @@ async def allow_write_operation(direct: bool = False):
 
 def _write_gate_check() -> None:
     global _write_armed, _direct_write_armed, _write_depth
-    if os.environ.get("FEISHU_ALLOW_WRITE") != "1" and not _direct_write_armed:
+    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
             "写入被拦截：需要环境变量 FEISHU_ALLOW_WRITE=1",
-            hint="文档/邮件/日历写入必须同时匹配 fingerprint 并使用 FEISHU_ALLOW_WRITE=1，或使用 --direct",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
         )
     if _write_depth > 0:
         return
@@ -136,10 +137,10 @@ def _write_gate_check() -> None:
 
 def _send_gate_check() -> None:
     global _send_armed, _direct_send_armed
-    if os.environ.get(_ALLOW_SEND_ENV) != "1" and not _direct_send_armed:
+    if os.environ.get(_ALLOW_SEND_ENV) != "1":
         raise SendBlocked(
             "发送被拦截：需要环境变量 FEISHU_ALLOW_SEND=1",
-            hint="这是双重闸门之一；另一道是 send --confirm-send <指纹>",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
         )
     if not _send_armed:
         raise SendBlocked("发送被拦截：send 模块未为本次请求武装闸门")

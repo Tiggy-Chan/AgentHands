@@ -287,10 +287,11 @@ async def import_file(
             "指纹不匹配，拒绝写入",
             hint=f"本次写入指纹是 {draft['fingerprint']}；文件或路径有任何改动都会变",
         )
-    elif os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
-            "指纹正确，但环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
-            hint="双重闸门：FEISHU_ALLOW_WRITE=1 + 本指纹，缺一不可",
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
         )
 
     await auth.prepare()
@@ -350,10 +351,11 @@ async def replace_document(
             "指纹不匹配，拒绝写入",
             hint=f"本次写入指纹是 {draft['fingerprint']}；文件或文档引用有任何改动都会变",
         )
-    elif os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
-            "指纹正确，但环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
-            hint="双重闸门：FEISHU_ALLOW_WRITE=1 + 本指纹，缺一不可",
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
         )
 
     await auth.prepare()

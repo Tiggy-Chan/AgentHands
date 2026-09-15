@@ -239,12 +239,13 @@ async def send(
         )
     import os
 
-    if not direct and os.environ.get("FEISHU_ALLOW_SEND") != "1":
+    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    if os.environ.get("FEISHU_ALLOW_SEND") != "1":
         raise SendBlocked(
-            "指纹正确，但环境变量 FEISHU_ALLOW_SEND=1 未设置，拒绝发送",
-            hint="双重闸门：FEISHU_ALLOW_SEND=1 + 本指纹，缺一不可",
+            "环境变量 FEISHU_ALLOW_SEND=1 未设置，拒绝发送",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
         )
-    if file_bytes is not None and not direct and os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+    if file_bytes is not None and os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
             "原生文件发送需要同时允许云盘上传：FEISHU_ALLOW_WRITE=1",
             hint="文件上传和消息发送属于同一次受控操作，缺少 FEISHU_ALLOW_WRITE=1 时不上传",
