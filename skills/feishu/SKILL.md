@@ -49,20 +49,20 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `thread <msg_id> [--window 15]` | 还原话题串 + 前后文，**必带完整性标记** |
 | `message <msg_id> [--resolve-resources]` | 读取一条消息的统一结构、全部已识别类型和资源元数据 |
 | `media <msg_id> --action metadata\|download\|inspect\|ocr\|transcribe` | 按需下载或在本机处理消息资源；多资源时必须带 `--resource-id` |
-| `media-cache status|purge --confirm-purge` | 查看或把加密媒体缓存移动到可恢复归档 |
+| `media-cache status\|purge --confirm-purge` | 查看或把加密媒体缓存移动到可恢复归档 |
 | `chats [--from-events]` | 列 Messenger 会话（网页 DOM provider；--from-events 是历史事件降级视图） |
 | `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
 | `doc import <本地文件> [--folder …] [--title …]` | 导入本地文件（md/docx/xlsx）为新的在线云文档；默认双重闸门，`--direct` 免确认直写 |
 | `doc replace <文档链接或token> <本地Markdown> [--direct]` | 保持原 token/链接，原地替换已有 docx 正文；md 先本地转 HTML 再走富文本剪贴板粘贴（表格/代码块/任务列表保真），粘贴后自动导出逐行校验（`verified` 字段）。语法对照见 `references/docx-format.md` |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
-| `probe --scope chats|docs-search|mail|calendar|message-media|message-send|media-observe|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证；media-observe 加 `--interact` 会点击文件卡片抓真实下载路由；calendar/mail/message-send 加 `--headed --capture --out 文件` 抓写接口（需本人手动操作一次） |
-| `mail list|search|get` | 读邮件，结果来自稳定接口或受控 DOM，并带 source/complete |
-| `mail send|reply` | 默认只产邮件草稿；受控写接口确认后才可能执行 |
-| `calendar calendars|list|get` | 列可用日历 ID、读日程和详情，默认不缓存正文 |
-| `calendar create|update|delete` | create/delete 已打通真写（gateway 1002003+1010023/1002005，双闸门）；create 默认自动选择本人管理的主日历；update 未适配失败关闭 |
+| `probe --scope chats\|docs-search\|mail\|calendar\|message-media\|message-send\|media-observe\|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证；media-observe 加 `--interact` 会点击文件卡片抓真实下载路由；calendar/mail/message-send 加 `--headed --capture --out 文件` 抓写接口（需本人手动操作一次） |
+| `mail list\|search\|get` | 读邮件，结果来自稳定接口或受控 DOM，并带 source/complete |
+| `mail send\|reply` | 默认只产邮件草稿；受控写接口确认后才可能执行 |
+| `calendar calendars\|list\|get` | 列可用日历 ID、读日程和详情，默认不缓存正文 |
+| `calendar create\|update\|delete` | create/delete 已打通真写（gateway 1002003+1010023/1002005，双闸门）；create 默认自动选择本人管理的主日历；update 未适配失败关闭 |
 | `calendar sync` | gateway 全量/增量同步事件（含 event_uuid 和服务端 id，删除前用它拿 uuid） |
-| `events status|migrate|purge` | 查看存储、迁移旧事件、显式可恢复清理 |
+| `events status\|migrate\|purge` | 查看存储、迁移旧事件、显式可恢复清理 |
 | `send --chat-id … [--text-file …] [--file …] [--sticker-from-message …] [--sticker-set-id … --sticker-id …]` | **默认只产草稿**；支持文本、原生 type=3 文件和原生 type=10 sticker。常规真发见〈发送是双重闸门〉，用户明确要求免确认测试时可加 `--direct`；文件上传和发送必须作为同一次受控操作，协议未适配时失败关闭 |
 
 时间参数统一：`30m`/`2h`/`7d` 表示过去，`+7d` 表示未来，另支持 ISO 日期和 epoch 秒/毫秒。
