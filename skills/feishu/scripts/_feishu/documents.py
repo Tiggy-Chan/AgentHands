@@ -287,7 +287,8 @@ async def import_file(
             "指纹不匹配，拒绝写入",
             hint=f"本次写入指纹是 {draft['fingerprint']}；文件或路径有任何改动都会变",
         )
-    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    # The env var has to be on the very command that writes: whoever approves that command
+    # sees it, and it does not outlive the command. --direct skips only the fingerprint check.
     if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
             "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
@@ -351,7 +352,8 @@ async def replace_document(
             "指纹不匹配，拒绝写入",
             hint=f"本次写入指纹是 {draft['fingerprint']}；文件或文档引用有任何改动都会变",
         )
-    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    # The env var has to be on the very command that writes: whoever approves that command
+    # sees it, and it does not outlive the command. --direct skips only the fingerprint check.
     if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
             "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",

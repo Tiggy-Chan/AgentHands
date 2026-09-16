@@ -121,7 +121,8 @@ async def allow_write_operation(direct: bool = False):
 
 def _write_gate_check() -> None:
     global _write_armed, _direct_write_armed, _write_depth
-    # 环境变量是唯一 agent 无法自己满足的那半闸门：--direct 只免指纹核对，不免它。
+    # The env var has to be on the very command that writes: whoever approves that command
+    # sees it, and it does not outlive the command. --direct skips only the fingerprint check.
     if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
         raise SendBlocked(
             "写入被拦截：需要环境变量 FEISHU_ALLOW_WRITE=1",
