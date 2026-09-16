@@ -632,10 +632,12 @@ async def _run(args) -> int:
         elif fmt == "jsonl":
             emit_jsonl(lst)
         else:
+            from _feishu.output import safe_label
+
             lines = []
             for c in lst:
                 lines.append(
-                    f"- `{c['chat_id']}` {c.get('name') or '（群名未取到）'}"
+                    f"- `{c['chat_id']}` {safe_label(c.get('name') or '（群名未取到）')}"
                     f" [{c.get('chat_type','?')}] 最近: {fmt_ts(c.get('last_time'))} {c.get('last_text','')}"
                 )
             emit("\n".join(lines) or "（空）")
@@ -757,10 +759,12 @@ async def _run(args) -> int:
             if fmt == "json":
                 emit_json(spaces)
             else:
+                from _feishu.output import safe_label
+
                 for label, key in (("我的空间", "my_space"), ("共享空间", "shared_space")):
                     emit(f"\n## {label}")
                     for n in spaces[key]:
-                        emit(f"- [{n['type']}] {n['name']} `{n['token']}` {n.get('url','')}")
+                        emit(f"- [{n['type']}] {safe_label(n['name'])} `{n['token']}` {n.get('url','')}")
                 for error in spaces.get("errors", []):
                     emit(f"- ⚠️ {error.get('space', '?')}：{error.get('error', 'unknown')}")
             return 0 if spaces.get("complete", False) else 1
