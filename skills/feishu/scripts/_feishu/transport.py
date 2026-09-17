@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
@@ -44,6 +45,8 @@ _DRIVE_STREAM_HOST = urlsplit(DRIVE_STREAM).netloc
 _LOGIN_HOST = urlsplit(LOGIN_HOST).netloc
 
 _ALLOW_SEND_ENV = "FEISHU_ALLOW_SEND"
+_LEGACY_POST_IMAGE_HOST_RE = re.compile(r"^p\d+\.pstatp\.com$", re.IGNORECASE)
+_LEGACY_POST_IMAGE_PATH_RE = re.compile(r"^/origin/[A-Za-z0-9._-]{8,512}$")
 
 # One-shot arming: send.py arms, transport disarms after the first cmd=5.
 _send_armed = False
@@ -72,6 +75,23 @@ def bind_session(cookie_header: str, csrf_token: str = "", domain: str = "") -> 
     _csrf_token = csrf_token
     if domain:
         _domain = domain
+
+
+def is_legacy_post_image_url(url: str) -> bool:
+    """Recognize the tenant's legacy rich-text post image URL shape.
+
+    These URLs come from a message's ``post.img`` HTML, not from an
+    ``img_v3_`` key. Enforce HTTPS strictly so images downloaded for OCR or
+    agent processing cannot be tampered with on a cleartext connection.
+    """
+    parsed = urlsplit(str(url or ""))
+    return bool(
+        parsed.scheme == "https"
+        and _LEGACY_POST_IMAGE_HOST_RE.fullmatch(parsed.netloc)
+        and _LEGACY_POST_IMAGE_PATH_RE.fullmatch(parsed.path)
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def arm_send_once() -> None:
@@ -190,6 +210,12 @@ def classify(method: str, url: str, gateway_cmd: int = 0) -> str:
             return "allow"
         return "deny"
 
+    # Rich-text post images in older messages carry a rendered public CDN URL
+    # instead of an img_v3_ key. Only this exact HTTPS GET shape is allowed;
+    # callers use a no-cookie header set for it.
+    if method == "GET" and is_legacy_post_image_url(url):
+        return "allow"
+
     if host == _domain or host == config.DOMAIN:
         if method == "GET" and (
             path.startswith("/space/api/explorer/")
@@ -247,6 +273,20 @@ def session_headers(extra: dict | None = None, *, csrf: bool = False) -> dict:
     return h
 
 
+def public_media_headers(extra: dict | None = None) -> dict:
+    """Headers for public media URLs; deliberately never includes Cookie."""
+    h = {
+        "user-agent": USER_AGENT,
+        "accept": "image/*",
+        "accept-encoding": "identity",
+    }
+    if extra:
+        h.update({key: value for key, value in extra.items() if key.lower() != "cookie"})
+        h.pop("Cookie", None)
+        h.pop("cookie", None)
+    return h
+
+
 async def request(
     method: str,
     url: str,
@@ -300,6 +340,7 @@ async def stream_request(
     headers: dict | None = None,
     timeout: float = 15,
     max_response_bytes: int = _http.DEFAULT_MAX_RESPONSE_BYTES,
+    public: bool = False,
     **kw,
 ):
     """Yield a live bounded response for streaming resource downloads.
@@ -309,6 +350,11 @@ async def stream_request(
     so this context manager owns both the client and response lifecycle.
     The caller is responsible for enforcing the byte cap while iterating
     ``response.aiter_raw()``.
+
+    Public media requests (e.g. legacy CDN images) deliberately carry no
+    session cookies and set trust_env=True to inherit the caller's standard
+    environment proxy (HTTP(S)_PROXY), while authenticated API requests
+    remain strictly trust_env=False to prevent credential leaks.
     """
     # 离线开关必须管住这条路：媒体下载走的正是 stream。
     if os.environ.get("FEISHU_NO_NETWORK") == "1":
@@ -320,6 +366,7 @@ async def stream_request(
         timeout=timeout,
         headers=headers,
         max_response_bytes=max_response_bytes,
+        trust_env=public,
     ) as client:
         request_obj = client.build_request(method, url, headers=headers, **kw)
         response = await client.send(request_obj, stream=True)

@@ -193,6 +193,21 @@ def _url_for(resource: dict) -> str:
     if not _TOKEN_RE.fullmatch(key):
         raise ResourceError("消息资源 key 格式不合法")
 
+    # Legacy type=2 rich-text posts expose a rendered public CDN URL instead
+    # of an img_v3_ key. Validate the exact host/path before the generic image
+    # key route so the URL is not embedded into /static-resource/v1/.
+    if resource.get("source") == "post.img":
+        raw_url = key
+        # 即使消息源 HTML 给出明文 http，也强制升级为 https，绝不走明文链路下载
+        if raw_url.startswith("http://"):
+            raw_url = "https://" + raw_url[len("http://"):]
+        if kind == "image" and transport.is_legacy_post_image_url(raw_url):
+            return raw_url
+        raise EndpointNotAdapted(
+            "富文本图片地址不是受支持的 legacy post.img CDN 路由",
+            hint="只允许 p数字.pstatp.com/origin/<token> 且不带 query 的地址（自动升级至 https）",
+        )
+
     # This is the already-verified Drive stream route used for file/cloud-file
     # tokens.  Image/audio/media routes are intentionally not guessed: once a
     # tenant-specific route is observed by probe it must be added explicitly.
@@ -294,6 +309,7 @@ async def download_resource(
     total = 0
     digest = hashlib.sha256()
     content_type = ""
+    download_url = ""
     try:
         inline = resource.get("_data") or b""
         if inline:
@@ -328,13 +344,20 @@ async def download_resource(
                     pass
         else:
             url = _url_for(resource)
-            headers = transport.session_headers({"accept-encoding": "identity"})
+            download_url = url
+            public_media = transport.is_legacy_post_image_url(url)
+            headers = (
+                transport.public_media_headers()
+                if public_media
+                else transport.session_headers({"accept-encoding": "identity"})
+            )
             async with transport.stream_request(
                 "GET",
                 url,
                 headers=headers,
                 timeout=config.MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
                 max_response_bytes=config.MESSAGE_RESOURCE_MAX_BYTES,
+                public=public_media,
             ) as response:
                 if response.status_code >= 400:
                     raise ResourceError(f"消息资源下载失败（HTTP {response.status_code}）")
@@ -365,6 +388,10 @@ async def download_resource(
         if total > config.MEDIA_JOB_MAX_BYTES:
             raise ResourceError("媒体任务超过总输入大小上限")
         sniffed = _sniff_mime(temp)
+        if transport.is_legacy_post_image_url(download_url) and sniffed not in {
+            "image/jpeg", "image/png", "image/gif", "image/webp",
+        }:
+            raise ResourceError("legacy post.img CDN 返回的内容不是可识别图片")
         result = {
             "resource_id": resource.get("resource_id"),
             "kind": resource.get("kind"),
@@ -382,6 +409,10 @@ async def download_resource(
             _install_output(temp, target)
             result["path"] = str(target)
         return result
+    except FeishuError:
+        raise
+    except Exception as exc:
+        raise ResourceError(f"消息资源下载请求失败（{type(exc).__name__}）") from exc
     finally:
         try:
             temp.unlink()

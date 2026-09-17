@@ -190,6 +190,8 @@ transport 只放行一次，且不自动重试；
   drive-stream 404，真实下载 URL 由网页端经 service worker 一次性签发），`media --action
   download` 已改为受限浏览器打开会话、点文件卡片的下载按钮、捕获真实 download 事件落盘
   （2026-09-10 端到端验证：mime/size 对账一致）。
+- 旧版富文本 `type=2` 的 `post.img` 可能只有 `pN.pstatp.com/origin/<token>` 渲染地址；
+  skill 对该形态使用严格 host/path 白名单（强制 HTTPS）和无 Cookie 公共媒体请求。若服务端对该地址返回 404，只能报告资源失效/不可用，不能把它当成空图片或猜测正文。
 - **sticker 已支持原生发送和解析**：`--sticker-from-message` 只提取源消息的
   sticker file key/set/id，不重放入站 raw content；`type=10` 输出尺寸、区域、ID 和
   内容摘要，资源下载仍需先观察并登记真实路由。
