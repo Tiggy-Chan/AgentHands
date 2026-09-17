@@ -262,6 +262,31 @@ class TestTransportPolicy(unittest.TestCase):
     def test_unknown_host_denied(self):
         self.assertEqual(self.t.classify("GET", "https://evil.example.com/"), "deny")
 
+    def test_legacy_post_image_cdn_is_exact_read_only_and_https_only(self):
+        valid = "https://p1.pstatp.com/origin/0123456789abcdef"
+        self.assertEqual(self.t.classify("GET", valid), "allow")
+        # 明文 http 必须被严格拒绝，防止链路劫持伪造图片进入 OCR
+        self.assertEqual(self.t.classify("GET", valid.replace("https:", "http:")), "deny")
+        for method, url in (
+            ("POST", valid),
+            ("GET", valid + "?token=secret"),
+            ("GET", "https://evil.pstatp.com/origin/0123456789abcdef"),
+            ("GET", "https://p1.pstatp.com/other/0123456789abcdef"),
+            ("GET", "https://p1.pstatp.com/origin/short"),
+        ):
+            self.assertEqual(self.t.classify(method, url), "deny", f"{method} {url}")
+
+    def test_public_media_headers_never_include_session_cookie(self):
+        old_cookie, old_domain = self.t._cookie_header, self.t._domain
+        try:
+            self.t.bind_session("session=must-not-leak", domain="tenant.feishu.cn")
+            headers = self.t.public_media_headers({"Cookie": "also-must-not-leak"})
+            self.assertNotIn("Cookie", headers)
+            self.assertNotIn("cookie", headers)
+            self.assertEqual(headers["accept"], "image/*")
+        finally:
+            self.t._cookie_header, self.t._domain = old_cookie, old_domain
+
     def test_send_gate_requires_env_and_arm(self):
         from lark_bridge import _http
         os.environ.pop("FEISHU_ALLOW_SEND", None)
@@ -1115,6 +1140,69 @@ class TestMessageResourcesAndMedia(unittest.TestCase):
         # Sticker download stays closed until its route is observed.
         with self.assertRaises(EndpointNotAdapted):
             message_resources._url_for(message_resources.select_resource(message, "sticker:three"))
+
+    def test_post_image_uses_legacy_url_and_public_headers(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from _feishu import message_resources
+
+        # 原始链接即使是明文 http，也必须自动升级为 https
+        resource_http = {
+            "resource_id": "image:post",
+            "kind": "image",
+            "source": "post.img",
+            "_key": "http://p1.pstatp.com/origin/0123456789abcdef",
+            "name": "",
+            "mime": "",
+        }
+        self.assertEqual(
+            message_resources._url_for(resource_http),
+            "https://p1.pstatp.com/origin/0123456789abcdef"
+        )
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg", "content-length": "3"}
+
+            async def aiter_raw(self):
+                yield b"\xff\xd8\xff"
+
+        class Context:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        async def check(root):
+            target = root / "post.jpg"
+            with patch.object(
+                message_resources.transport,
+                "public_media_headers",
+                return_value={"user-agent": "test", "accept": "image/*"},
+            ) as headers, patch.object(
+                message_resources.transport,
+                "stream_request",
+                return_value=Context(),
+            ) as stream:
+                result = await message_resources.download_resource(
+                    {}, resource_http, out=str(target)
+                )
+            headers.assert_called_once_with()
+            self.assertNotIn("Cookie", headers.return_value)
+            self.assertNotIn("cookie", headers.return_value)
+            self.assertTrue(stream.call_args.kwargs["public"])
+            self.assertEqual(target.read_bytes(), b"\xff\xd8\xff")
+            self.assertEqual(result["sniffed_mime"], "image/jpeg")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_home = message_resources.config.HOME
+            try:
+                message_resources.config.HOME = Path(tmp)
+                asyncio.run(check(Path(tmp)))
+            finally:
+                message_resources.config.HOME = old_home
 
     def test_media_worker_command_is_cgroup_bounded(self):
         from _feishu import media_worker

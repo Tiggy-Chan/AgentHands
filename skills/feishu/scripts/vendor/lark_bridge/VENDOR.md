@@ -62,10 +62,12 @@
    HTTP 200 但非 protobuf ack 时返回 `unverified`，不能宣称已送达。
 14. **`drive.py`**：`upload_file` 保留 `file_token` 兼容字段，同时返回等价的
    `file_key`，供 skill 构造原生 type=3 文件消息，不把云盘 URL 拼成文本发送。
-15. **`_http.make_client` 固定 `trust_env=False`**：带 session cookie 的请求不读
+15. **`_http.make_client` 默认 `trust_env=False`**：带 session cookie 的请求不读
    `HTTP(S)_PROXY`/`ALL_PROXY` 环境变量、不跟系统代理出境（与浏览器侧
    `--no-proxy-server` 的姿势对齐）；附带避免未装 `socksio` 时
    `all_proxy=socks://…` 把 client 构造直接打崩。
+16. **`_http.make_client` 的 `trust_env` 可选参数**：默认保持 `False`；
+    仅供无 Cookie 的公开媒体资源下载（如 legacy `post.img`）按需继承环境中的代理。
 
 ## 升级步骤
 

@@ -65,6 +65,7 @@ denylist 与同名 ≥3 用户规则自动清除。
 | 种类 | 路由 | 状态 |
 |---|---|---|
 | image/audio/video (img_v3_/audio_v3_/media_v3_ key) | `GET https://internal-api-lark-file.feishu.cn/static-resource/v1/<完整 key 含前缀>~` | **已验证**：200 + image/jpeg，下载后 AES-256-GCM 解密得到与声明尺寸一致的 JPEG |
+| legacy 富文本图片 (type=2 `post.img`) | `GET https://pN.pstatp.com/origin/<token>` | **已登记严格适配**：仅允许 `p`+数字分片、`/origin/` 无 query/fragment，强制 HTTPS；请求不带 Cookie。当前历史消息样本返回 404，资源有效期/存续未取得 200 样本 |
 | sticker/头像 | 同路由，query 带 `format/image_size/sticker_format` | 已观察到，未登记（sticker 下载仍失败关闭） |
 | 消息文件 (file_v3_ key) | 静态路由全灭（static-resource 400/404、drive-stream 404）；真实下载 URL 由网页端一次性签发（疑似 service worker，页面钩子看不到） | **已落地 UI 路径**：`media-file-download` 用受限浏览器点文件卡片下载按钮捕获真实 download 事件（2026-09-10 验证，mime/size 对账一致） |
 | CDN 变体 | `s1-imfile.feishucdn.com/static-resource/v1/...` | 已观察到（免登录 CDN），未使用 |
@@ -203,7 +204,8 @@ md 后缀必须与内容严格一致（否则 1069910）；md 语法保真度无
 6. 邮件发送/回复、日历修改的精确写 endpoint 和 payload。
    ~~日历创建~~ 已登记并实测打通（cmd 1002003 + 1010023，2026-09-11，见「日历写接口」）。
 7. WS ticket/app_key 轮换和长时间断线恢复的更多样本。
-8. ~~图片下载端点~~ 已登记（static-resource 路由 + AES-256-GCM 解密，2026-09-07 验证）。
+8. ~~图片下载端点~~ 已登记（static-resource 路由 + AES-256-GCM 解密，2026-09-07 验证）；legacy `post.img`
+   旧版 CDN 地址已登记严格白名单（强制 HTTPS）和无 Cookie 下载，当前样本仍为 404，需后续新鲜消息验证 200。
    ~~消息文件（file_v3_ key）~~ 已落地 UI 下载路径（2026-09-10，见上表；静态路由确认不存在）。
    剩余：audio/video 的 content 布局与加密材料字段（需真实样本）、sticker 路由的
    query 参数语义（需真实 sticker 消息样本做一次 media-observe）。

@@ -205,6 +205,7 @@ def make_client(
     timeout: float = 15,
     headers: dict | None = None,
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    trust_env: bool = False,
 ) -> httpx.AsyncClient:
     request_headers = dict(headers or {})
     # Prefer an uncompressed response.  _decode_bounded remains necessary for
@@ -217,7 +218,7 @@ def make_client(
         max_response_bytes=max_response_bytes,
         enforce_policy=True,
         # 带 session cookie 的流量绝不跟系统代理走（与浏览器侧的
-        # --no-proxy-server 对齐）；也避免没装 socksio 时被
-        # all_proxy=socks:// 直接打崩。
-        trust_env=False,
+        # --no-proxy-server 对齐）；仅无 Cookie 的公共媒体下载显式开启 trust_env
+        # 以继承调用方环境的 HTTP(S)_PROXY。
+        trust_env=trust_env,
     )
