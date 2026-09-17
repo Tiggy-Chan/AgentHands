@@ -2352,5 +2352,65 @@ class TestExportFallbackMarker(unittest.TestCase):
         self.assertEqual(_normalize_for_compare("# 标题 A-1\n\n正文"), "标题a1正文")
 
 
+class TestLinkifyDraft(unittest.TestCase):
+    def test_draft_fingerprint_stable_and_sensitive(self):
+        from _feishu import documents
+        urls = ["https://sample-tenant.feishu.cn/docx/Abc", "https://sample-tenant.feishu.cn/sheets/Def"]
+        d1 = documents.make_doc_linkify_draft("Abc123", urls, "引用文档")
+        d2 = documents.make_doc_linkify_draft("Abc123", urls, "引用文档")
+        d3 = documents.make_doc_linkify_draft("Abc123", urls[:1], "引用文档")
+        self.assertEqual(d1["fingerprint"], d2["fingerprint"])
+        self.assertNotEqual(d1["fingerprint"], d3["fingerprint"])
+        self.assertEqual(d1["url_count"], 2)
+
+    def test_linkify_rejects_non_feishu_url(self):
+        import asyncio as _asyncio
+
+        from _feishu import documents
+        from _feishu.errors import FeishuError
+        with self.assertRaises(FeishuError):
+            _asyncio.run(documents.linkify_document("Abc123", ["https://example.com/x"], direct=True))
+
+
+class TestLinkifyUrlValidation(unittest.TestCase):
+    def test_host_bypass_urls_rejected(self):
+        from _feishu import documents
+        evil_urls = [
+            # [^/]+ 会吞 #/? 的两条经典绕过
+            "https://evil.example#.feishu.cn/docx/x",
+            "https://evil.example?.feishu.cn/docx/x",
+            # userinfo 与后缀前缀攻击
+            "https://feishu.cn@evil.example/docx/x",
+            "https://feishu.cn.evil.example/docx/x",
+            # scheme 必须是 https
+            "http://sample-tenant.feishu.cn/docx/Abc123",
+            # 路径不在白名单 / 缺 token
+            "https://sample-tenant.feishu.cn/docs/Abc123",
+            "https://sample-tenant.feishu.cn/docx/",
+        ]
+        for u in evil_urls:
+            self.assertEqual(documents._linkify_url_token(u), "", u)
+
+    def test_valid_urls_accepted(self):
+        from _feishu import documents
+        cases = {
+            "https://sample-tenant.feishu.cn/docx/DocxTokenExample0123456789a": "DocxTokenExample0123456789a",
+            "https://feishu.cn/wiki/Abc123?from=search#anchor": "Abc123",
+            "https://sample-tenant.feishu.cn/sheets/SheetTok9": "SheetTok9",
+            "https://sample-tenant.feishu.cn/drive/foldertok": "foldertok",
+        }
+        for u, tok in cases.items():
+            self.assertEqual(documents._linkify_url_token(u), tok, u)
+
+    def test_url_count_cap(self):
+        import asyncio as _asyncio
+
+        from _feishu import documents
+        from _feishu.errors import FeishuError
+        urls = [f"https://sample-tenant.feishu.cn/docx/Tok{i:04d}" for i in range(documents.MAX_LINKIFY_URLS + 1)]
+        with self.assertRaises(FeishuError):
+            _asyncio.run(documents.linkify_document("Abc123", urls, direct=True))
+
+
 if __name__ == "__main__":
     unittest.main()

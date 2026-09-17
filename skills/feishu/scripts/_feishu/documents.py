@@ -13,6 +13,7 @@ import re
 import asyncio
 import tempfile
 from collections import deque
+from urllib.parse import urlsplit
 
 from . import auth, config, secure_store, transport
 from .errors import FeishuError, ResourceIsolationUnavailable, SendBlocked
@@ -754,6 +755,503 @@ async def _inspect_clipboard_impl(ref: str) -> dict:
     if not excerpt:
         excerpt = markup[:2000]
     return {"url": url, "clipboard_html_excerpt": excerpt, "total_html_chars": len(markup)}
+
+
+MAX_LINKIFY_URLS = 50
+_LINKIFY_PATH_RE = re.compile(r"^/(?:docx|sheets|file|wiki|drive)/(?P<token>[A-Za-z0-9_-]+)")
+
+
+def _linkify_url_token(u: str) -> str:
+    """严格校验飞书文档 URL 并取出 token；不合法返回 ""。
+
+    不能用一条正则从头抓到尾：`https://[^/]+\\.feishu\\.cn/...` 里的 `[^/]+`
+    会吞掉 `#` 和 `?`，`https://evil.example#.feishu.cn/docx/x`、
+    `https://evil.example?.feishu.cn/docx/x` 这类真实 host 在别处的伪造链接
+    都能混进来。linkify 会把 URL 写进可能是多人共享的文档，host 必须拆开验。
+    """
+    try:
+        parts = urlsplit(u.strip())
+    except ValueError:
+        return ""
+    if parts.scheme != "https":
+        return ""
+    host = (parts.hostname or "").lower()
+    if host != "feishu.cn" and not host.endswith(".feishu.cn"):
+        return ""
+    m = _LINKIFY_PATH_RE.match(parts.path)
+    return m.group("token") if m else ""
+
+
+def make_doc_linkify_draft(ref: str, urls: list[str], after_heading: str) -> dict:
+    """Draft for linkify: 在文档里插入原生文档引用卡片（mention-doc chip）。"""
+    kind, token = parse_doc_ref(ref)
+    return {
+        "action": "linkify",
+        "document_token": token,
+        "urls": urls,
+        "url_count": len(urls),
+        "after_heading": after_heading,
+        "fingerprint": doc_write_fingerprint("linkify", token, json.dumps(urls, ensure_ascii=False)),
+    }
+
+
+async def linkify_document(
+    ref: str,
+    urls: list[str],
+    after_heading: str = "",
+    confirm: str = "",
+    direct: bool = False,
+) -> dict:
+    """把飞书文档 URL 列表以原生引用卡片形式插入文档（登记「本文引用」）。
+
+    机制：编辑器里以纯文本粘贴飞书文档 URL，会被自动转换为 mention-doc 卡片；
+    只有这种卡片才会进入飞书的引用关系（普通超链接不算）。
+    after_heading 给出时插入到与该文本精确相等的标题块之后，否则追加到文档末尾。
+    """
+    urls = [u.strip() for u in urls if u and u.strip()]
+    if not urls:
+        raise FeishuError("linkify 需要至少一个飞书文档 URL")
+    if len(urls) > MAX_LINKIFY_URLS:
+        raise FeishuError(f"linkify 一次最多 {MAX_LINKIFY_URLS} 个 URL（当前 {len(urls)} 个）")
+    for u in urls:
+        if not _linkify_url_token(u):
+            raise FeishuError(f"不是可识别的飞书文档链接：{u}")
+    draft = make_doc_linkify_draft(ref, urls, after_heading)
+
+    if direct:
+        note("直接写入模式：本次插入引用卡片已明确授权。")
+    elif not confirm:
+        note("未执行插入。确认内容无误后，把指纹填进 --confirm-write 并设 FEISHU_ALLOW_WRITE=1 再执行。")
+        raise SendBlocked("draft only", hint=json.dumps(draft, ensure_ascii=False))
+    elif confirm != draft["fingerprint"]:
+        raise SendBlocked(
+            "指纹不匹配，拒绝写入",
+            hint=f"本次写入指纹是 {draft['fingerprint']}；URL 列表或文档引用有任何改动都会变",
+        )
+    # The env var has to be on the very command that writes: whoever approves that command
+    # sees it, and it does not outlive the command. --direct skips only the fingerprint check.
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+        raise SendBlocked(
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
+        )
+
+    await auth.prepare()
+
+    # 复核基线：插入前导出一次，记录每个 token 的出现次数；
+    # 之后的导出复核看增量，文档里原本就有的 token 不算数。
+    baseline_counts: dict[str, int] = {}
+    try:
+        before_text = (await export_document(ref, "markdown")).decode("utf-8", errors="replace")
+        for u in urls:
+            tok = _linkify_url_token(u)
+            baseline_counts[tok] = before_text.count(tok)
+    except Exception as exc:
+        note(f"linkify 导出基线不可用：{type(exc).__name__}: {exc}")
+        baseline_counts = {}
+    payload = json.dumps(
+        {"ref": ref, "urls": urls, "after_heading": after_heading},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    config.ensure_home()
+    fd, temporary_name = tempfile.mkstemp(prefix=".doc-linkify.", suffix=".json", dir=str(config.HOME))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        from .browser_worker import run
+
+        result = await run(
+            "doc-linkify",
+            {"ref": ref, "payload_file": temporary_name},
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 60 + 30 * len(urls)),
+        )
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+    result.update({"token": draft["document_token"], "url_count": len(urls)})
+
+    # 对齐 doc replace 的标准：写完后重新导出文档，按插入前基线逐条核对增量。
+    # 注意导出文本区分不了卡片和普通链接，「是不是真卡片」由 worker 的
+    # reload_verified（卡片 href 增量）把关；这里只确认导出内容里 token 变多了。
+    inserted_urls = list(result.get("inserted_urls") or [])
+    export_verified: list[str] = []
+    if inserted_urls and baseline_counts:
+        try:
+            after_text = (await export_document(ref, "markdown")).decode("utf-8", errors="replace")
+            for u in inserted_urls:
+                tok = _linkify_url_token(u)
+                if tok and after_text.count(tok) > baseline_counts.get(tok, 0):
+                    export_verified.append(u)
+        except Exception as exc:  # 导出复核不可用不影响插入结果，但如实标注
+            note(f"linkify 导出复核不可用：{type(exc).__name__}: {exc}")
+            result["export_check"] = f"unavailable: {type(exc).__name__}"
+    elif inserted_urls:
+        result["export_check"] = "unavailable: 无插入前基线"
+    result["export_verified"] = export_verified
+    reload_verified = set(result.get("reload_verified") or [])
+    result["verified"] = (
+        bool(inserted_urls)
+        and reload_verified == set(inserted_urls)
+        and set(export_verified) == set(inserted_urls)
+    )
+    return result
+
+
+_SCROLL_BOTTOM_JS = """async () => {
+  const ed = document.querySelector('[data-block-id]');
+  let el = ed;
+  while (el && el.scrollHeight <= el.clientHeight + 50) el = el.parentElement;
+  if (!el) el = document.scrollingElement || document.documentElement;
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    el.scrollTop = el.scrollHeight;
+    await new Promise(r => setTimeout(r, 250));
+    if (Math.abs(el.scrollTop - last) < 2) break;
+    last = el.scrollTop;
+  }
+}"""
+
+_FIND_LAST_EDITABLE_BLOCK_JS = """() => {
+  const blocks = Array.from(document.querySelectorAll('[data-block-id]'));
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    const type = b.getAttribute('data-block-type') || '';
+    if (type === 'page' || type.includes('back_ref')) continue;
+    const r = b.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && b.offsetParent !== null) {
+      return b.getAttribute('data-block-id');
+    }
+  }
+  return null;
+}"""
+
+_COLLECT_HEADING_MATCHES_JS = """async (needle) => {
+  const norm = s => (s || '').replace(/[\\s\\u200b\\u200e\\u200f\\ufeff]+/g, ' ').trim();
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const seen = new Map();
+  const collect = () => {
+    for (const b of document.querySelectorAll('[data-block-id]')) {
+      if (!/heading/i.test(b.className || '')) continue;
+      if (norm(b.innerText) !== needle) continue;
+      seen.set(b.getAttribute('data-block-id'), true);
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return [...seen.keys()];
+}"""
+
+_COLLECT_CHIP_HREFS_JS = """async () => {
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const hrefs = new Set();
+  const collect = () => {
+    for (const el of document.querySelectorAll('[class*=mention-doc]')) {
+      const a = el.querySelector('a[href]');
+      const href = (a && a.href) || el.getAttribute('href') || '';
+      if (href) hrefs.add(href);
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return [...hrefs];
+}"""
+
+
+async def _find_chip_href(page, token: str) -> str:
+    """在已渲染的 mention-doc 卡片里找指向 token 的那张，返回其 href。"""
+    if not token:
+        return ""
+    return await page.evaluate(
+        """(tok) => {
+          for (const el of document.querySelectorAll('[class*=mention-doc]')) {
+            const a = el.querySelector('a[href]');
+            const href = (a && a.href) || el.getAttribute('href') || '';
+            if (href && href.includes(tok)) return href;
+          }
+          return '';
+        }""",
+        token,
+    )
+
+
+_BLOCK_SNAPSHOT_JS = """() => {
+  const norm = s => (s || '').replace(/[\\s\\u200b\\u200e\\u200f\\ufeff]+/g, ' ').trim();
+  const sel = window.getSelection();
+  let node = sel && sel.anchorNode;
+  if (!node) return null;
+  let el = node.nodeType === 1 ? node : node.parentElement;
+  const block = el && el.closest('[data-block-id]');
+  if (!block) return null;
+  let nxt = block.nextElementSibling;
+  while (nxt && !nxt.getAttribute('data-block-id')) nxt = nxt.nextElementSibling;
+  return {
+    id: block.getAttribute('data-block-id'),
+    text: norm(block.innerText),
+    next_id: nxt ? nxt.getAttribute('data-block-id') : '',
+    next_text: nxt ? norm(nxt.innerText) : '',
+  };
+}"""
+
+_BLOCK_STATE_BY_ID_JS = """(bid) => {
+  const norm = s => (s || '').replace(/[\\s\\u200b\\u200e\\u200f\\ufeff]+/g, ' ').trim();
+  const block = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!block) return null;
+  let nxt = block.nextElementSibling;
+  while (nxt && !nxt.getAttribute('data-block-id')) nxt = nxt.nextElementSibling;
+  return {
+    id: bid,
+    text: norm(block.innerText),
+    next_id: nxt ? nxt.getAttribute('data-block-id') : '',
+    next_text: nxt ? norm(nxt.innerText) : '',
+  };
+}"""
+
+
+async def _linkify_document_impl(ref: str, payload_file: str) -> dict:
+    """Browser Worker implementation: paste bare feishu URLs so they become mention-doc chips."""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("插入引用卡片只能由受限 Browser Worker 执行")
+    payload_path = os.path.realpath(payload_file)
+    home_path = os.path.realpath(config.HOME)
+    if os.path.commonpath((home_path, payload_path)) != home_path:
+        raise FeishuError("Browser Worker 拒绝读取 FEISHU_HOME 之外的写入文件")
+    try:
+        payload = json.loads(_read_doc_write_file(payload_path).decode("utf-8"))
+        urls = [str(u) for u in payload["urls"]]
+        after_heading = str(payload.get("after_heading") or "")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise FeishuError("linkify payload 必须是 JSON（含 urls/after_heading）") from exc
+    if not urls:
+        raise FeishuError("linkify 需要至少一个 URL")
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright", hint="先运行 feishu.py login") from exc
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    kind, token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("插入引用卡片目前只支持 docx 文档")
+    url = f"https://{domain}/docx/{token}"
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            permissions=["clipboard-read", "clipboard-write"],
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_000)
+
+            editor = page.locator(".page-block.root-block").first
+            if not await editor.count():
+                raise FeishuError("文档编辑器未渲染", hint="飞书网页结构可能已变化")
+
+            # 复核基线：插入前收集全文档已有的卡片 href，
+            # 结束后的重载复核只看增量，文档里原本就有的卡片不算数。
+            baseline_hrefs = set(await page.evaluate(_COLLECT_CHIP_HREFS_JS))
+
+            # 定位插入点。不能用 Ctrl+End——编辑器虚拟化渲染下它不一定跳到全文末尾。
+            # 先滚动到文档底部强制渲染尾部块（目标块通常都在文档后段）。
+            await page.evaluate(_SCROLL_BOTTOM_JS)
+            await page.wait_for_timeout(800)
+            if after_heading:
+                # 只匹配标题块（class 含 heading），文本归一化后精确相等；
+                # 虚拟化渲染下从头滚到底收集全部渲染过的标题块，要求命中唯一。
+                needle = re.sub(r"\s+", " ", after_heading).strip()
+                matches = await page.evaluate(_COLLECT_HEADING_MATCHES_JS, needle)
+                if not matches:
+                    raise FeishuError(
+                        f"找不到标题块「{after_heading}」",
+                        hint="--after-heading 只匹配标题块，且文本需与标题精确相等",
+                    )
+                if len(matches) > 1:
+                    raise FeishuError(
+                        f"标题块「{after_heading}」命中 {len(matches)} 个，无法确定插入位置",
+                        hint="换一个全文唯一的标题文本",
+                    )
+                target = page.locator(f"[data-block-id='{matches[0]}']")
+                await target.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                await target.click()
+            else:
+                last_id = await page.evaluate(_FIND_LAST_EDITABLE_BLOCK_JS)
+                if not last_id:
+                    raise FeishuError("找不到可编辑的文档末尾块")
+                target = page.locator(f"[data-block-id='{last_id}']")
+                await target.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                await target.click()
+            await page.keyboard.press("End")
+            await page.wait_for_timeout(200)
+
+            inserted_urls: list[str] = []
+            failed: list[str] = []
+            skipped: list[str] = []
+            rollback_unconfirmed: dict = {}
+            for index, target_url in enumerate(urls):
+                token = _linkify_url_token(target_url)
+                before = await page.locator("[class*=mention-doc]").count()
+                # 尝试前快照光标所在块及其下一块：回退后逐项比对，
+                # 不假设"一次撤销恰好只撤掉这次粘贴"。
+                snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                if not snapshot or not snapshot.get("id"):
+                    raise FeishuError(
+                        "无法确定光标所在的文档块，中止插入",
+                        hint="此时文档尚未被本次操作修改；请人工打开文档确认后重试",
+                    )
+                # Enter 与粘贴是这一次尝试的全部改动；转换失败时原样回退，
+                # 不把纯文本/普通链接留在别人的文档里。
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
+                await page.evaluate("t => navigator.clipboard.writeText(t)", target_url)
+                await page.keyboard.press("Control+v")
+                chip_href = ""
+                converted = False
+                for _ in range(20):
+                    await page.wait_for_timeout(250)
+                    # 主信号：出现指向本 token 的卡片（不看总数——虚拟化渲染
+                    # 会让 [class*=mention-doc] 的个数随滚动自己变化）。
+                    chip_href = await _find_chip_href(page, token)
+                    if chip_href:
+                        converted = True
+                        break
+                    # 兜底信号：计数增加。光标附近无滚动，短窗口内计数稳定；
+                    # 是否指向本 URL 由结束后的重载复核把关。
+                    if await page.locator("[class*=mention-doc]").count() > before:
+                        converted = True
+                        break
+                if converted:
+                    inserted_urls.append(target_url)
+                    # 转换成功后等待编辑器内部 DOM 与撤销栈状态稳定，
+                    # 再开始下一个 URL 的 Enter，避免连续粘贴破坏卡片。
+                    await page.wait_for_timeout(600)
+                    continue
+
+                failed.append(target_url)
+                note(f"linkify: 第 {index + 1} 个 URL 未转换为引用卡片，执行回退: {target_url}")
+                # 回退按快照实测分情形处理，不盲按固定键序：
+                await page.keyboard.press("Control+z")
+                await page.wait_for_timeout(400)
+                cur = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                cur_id = cur.get("id") if cur else ""
+                orig_id = snapshot.get("id") or ""
+                next_id = snapshot.get("next_id") or ""
+                # 只有证明光标既不在原块、也不在原本就存在的下一块，即严格落在
+                # 本次 Enter 新建的段落里时，才清文字、并段；其余情形绝不盲按破坏性按键。
+                if cur and cur_id and cur_id != orig_id and cur_id != next_id:
+                    if cur.get("text"):
+                        await page.keyboard.press("Home")
+                        await page.keyboard.press("Shift+End")
+                        await page.keyboard.press("Delete")
+                        await page.wait_for_timeout(200)
+                    await page.keyboard.press("Backspace")
+                    await page.wait_for_timeout(300)
+                # 否则光标已回到原块：撤销把 Enter+粘贴一起撤了，
+                # 绝不能再 Backspace——那会删掉上一块的最后一个字。
+                after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, snapshot["id"])
+                rollback_ok = (
+                    after is not None
+                    and after["text"] == snapshot["text"]
+                    and after["next_id"] == snapshot["next_id"]
+                    and after["next_text"] == snapshot["next_text"]
+                )
+                if not rollback_ok:
+                    rollback_unconfirmed = {
+                        "url": target_url,
+                        "block_id": snapshot["id"],
+                        "expected": snapshot,
+                        "actual": after,
+                        "note": "回退未能确认恢复原样，需人工检查该块及其前后内容",
+                    }
+                    skipped = urls[index + 1:]
+                    note(f"linkify: 回退比对不通过（块 {snapshot['id']}），立即停止，剩余 {len(skipped)} 个 URL 未尝试")
+                    break
+            await page.wait_for_timeout(1_500)
+
+            # 结束后重新加载页面重读文档，滚动全文收集卡片 href，按插入前
+            # 基线取增量、按 token 逐条核对每条 URL 的引用确实存在
+            # （对齐 doc replace 的复核标准）。
+            reload_verified: list[str] = []
+            chips_expose_href = False
+            if inserted_urls:
+                await page.reload(wait_until="networkidle", timeout=60_000)
+                await auth.raise_if_login_redirect(page)
+                await page.wait_for_timeout(2_000)
+                hrefs = set(await page.evaluate(_COLLECT_CHIP_HREFS_JS))
+                chips_expose_href = bool(hrefs)
+                new_hrefs = hrefs - baseline_hrefs
+                for u in inserted_urls:
+                    tok = _linkify_url_token(u)
+                    if tok and any(tok in h for h in new_hrefs):
+                        reload_verified.append(u)
+        finally:
+            await ctx.close()
+
+    if not inserted_urls:
+        status = "failed"
+    elif failed or skipped:
+        status = "partial"
+    else:
+        status = "linkified"
+    result = {
+        "status": status,
+        "url": url,
+        "inserted": len(inserted_urls),
+        "inserted_urls": inserted_urls,
+        "failed": failed,
+        "reload_verified": reload_verified,
+        "reload_check": "chip_href_delta" if chips_expose_href else "unavailable:卡片未暴露href",
+        "after_heading": after_heading,
+    }
+    if skipped:
+        result["skipped"] = skipped
+    if rollback_unconfirmed:
+        result["rollback_unconfirmed"] = rollback_unconfirmed
+    return result
 
 
 async def _read_document_impl(ref: str) -> dict:

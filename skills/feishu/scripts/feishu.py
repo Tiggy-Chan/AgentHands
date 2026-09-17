@@ -170,6 +170,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-nodes", type=int, default=5000)
     p.add_argument("--folder", default="", help="导入目标文件夹 token 或 URL（默认我的空间根目录）")
     p.add_argument("--title", "--name", dest="title", default="", help="导入文档标题（默认取文件名）")
+    p.add_argument("--urls", nargs="*", default=[], help="linkify：要插入为引用卡片的飞书文档 URL")
+    p.add_argument("--urls-file", default="", help="linkify：从文件读 URL 列表（每行一个，- 表示 stdin）")
+    p.add_argument("--after-heading", default="", help="linkify：插入到包含该文本的正文块之后（默认文档末尾）")
     p.add_argument("--direct", action="store_true", help="直接写入模式：用户已明确授权，免指纹核对；仍需 FEISHU_ALLOW_WRITE=1")
     p.add_argument("--confirm-write", default="", help="写入确认指纹")
 
@@ -714,6 +717,51 @@ async def _run(args) -> int:
         return 0
 
     if args.cmd == "doc":
+        if args.ref == "linkify":
+            if not args.file_path:
+                note("用法：feishu.py doc linkify <文档链接或token> [--urls URL ...] [--urls-file 文件] [--after-heading 文本]")
+                return 2
+            urls = list(args.urls)
+            if args.urls_file:
+                if args.urls_file != "-" and os.path.getsize(args.urls_file) > 256 * 1024:
+                    note("linkify --urls-file 文件过大（上限 256 KiB）")
+                    return 2
+                src = sys.stdin if args.urls_file == "-" else open(args.urls_file, encoding="utf-8")
+                with src:
+                    urls.extend(line.strip() for line in src if line.strip() and not line.startswith("#"))
+            if not urls:
+                note("linkify 需要至少一个 URL（--urls 或 --urls-file）")
+                return 2
+            if len(urls) > documents.MAX_LINKIFY_URLS:
+                note(f"linkify 一次最多 {documents.MAX_LINKIFY_URLS} 个 URL（当前 {len(urls)} 个）")
+                return 2
+            with query_lock.acquire("doc-linkify"):
+                res = await documents.linkify_document(
+                    ref=args.file_path,
+                    urls=urls,
+                    after_heading=args.after_heading,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 引用卡片插入完成（{res.get('status')}）：{res.get('inserted')}/{res.get('url_count')} 成功"
+                     + (f"，失败 {len(res.get('failed') or [])} 个" if res.get("failed") else "")
+                     + (f"，跳过 {len(res.get('skipped') or [])} 个" if res.get("skipped") else "")
+                     + f"；重载复核 {len(res.get('reload_verified') or [])} 条、导出复核 {len(res.get('export_verified') or [])} 条"
+                     + f"\n- 链接：{res.get('url')}")
+                for fail in res.get("failed") or []:
+                    emit(f"  ✗ 未转换（已回退并确认恢复原样）：{fail}")
+                rb = res.get("rollback_unconfirmed")
+                if rb:
+                    emit(f"  ⚠️ 回退未能确认：{rb.get('url')}，块 {rb.get('block_id')} 需人工检查")
+                    emit(f"     期望：{json.dumps(rb.get('expected'), ensure_ascii=False)}")
+                    emit(f"     实际：{json.dumps(rb.get('actual'), ensure_ascii=False)}")
+            ok = (res.get("status") == "linkified" and res.get("verified")
+                  and not res.get("rollback_unconfirmed"))
+            return 0 if ok else 1
+
         if args.ref in ("replace", "update"):
             if not args.file_path or not args.replacement_file:
                 note("用法：feishu.py doc replace <文档链接或token> <本地Markdown文件>")

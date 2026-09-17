@@ -34,6 +34,7 @@ _OPERATIONS = frozenset({
     "chats",
     "docs-search",
     "doc-replace",
+    "doc-linkify",
     "doc-read",
     "doc-clipboard-inspect",
     "probe",
@@ -231,6 +232,11 @@ async def _dispatch(operation: str, payload: dict) -> dict:
         from .documents import _replace_document_impl
         return await _replace_document_impl(
             str(payload.get("ref", "")), str(payload.get("content_file", ""))
+        )
+    if operation == "doc-linkify":
+        from .documents import _linkify_document_impl
+        return await _linkify_document_impl(
+            str(payload.get("ref", "")), str(payload.get("payload_file", ""))
         )
     if operation == "doc-read":
         from .documents import _read_document_impl

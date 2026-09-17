@@ -54,6 +54,7 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
 | `doc import <本地文件> [--folder …] [--title …]` | 导入本地文件（md/docx/xlsx）为新的在线云文档；默认双重闸门，`--direct` 免确认直写 |
 | `doc replace <文档链接或token> <本地Markdown> [--direct]` | 保持原 token/链接，原地替换已有 docx 正文；md 先本地转 HTML 再走富文本剪贴板粘贴（表格/代码块/任务列表保真），粘贴后自动导出逐行校验（`verified` 字段）。语法对照见 `references/docx-format.md` |
+| `doc linkify <文档链接或token> [--urls URL …] [--urls-file 文件] [--after-heading 文本] [--direct]` | 把飞书文档 URL 以**原生引用卡片**（mention-doc chip）插入文档，登记「本文引用/反向引用」关系。普通超链接（含 `[标题](url)`）**不登记引用**；编辑器里纯文本粘贴飞书文档 URL 才会自动转卡片。`--after-heading` 指定插入位置（与该文本**精确相等的标题块**之后，须全文唯一，默认文末）；未转成卡片的 URL 立即回退（撤销后按块快照逐项比对，比对不通过即停止并报需人工检查），不留纯文本在文档里，状态分 `linkified`/`partial`/`failed`；结束后重载页面按插入前基线的卡片增量逐条核对指向，并重新导出文档按出现次数增量复核（`verified` 字段）；drive/folder 链接不能转卡片（会按失败报告）；URL 上限 50 条、--urls-file 上限 256 KiB |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
 | `probe --scope chats\|docs-search\|mail\|calendar\|message-media\|message-send\|media-observe\|all` | 受控抓包/资源元数据探测，只输出脱敏元数据，不保存正文/凭证；media-observe 加 `--interact` 会点击文件卡片抓真实下载路由；calendar/mail/message-send 加 `--headed --capture --out 文件` 抓写接口（需本人手动操作一次） |
@@ -98,6 +99,13 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
   `mode=plain`，源 Markdown 的空行可能变成飞书里的空段落，导致段落间距过大。
   替换前压缩正文空行（代码块内部必要空行保留），替换后导出 Markdown/docx 检查
   空段数量以及标题、列表样式；发现间距异常就用紧凑源文件原地替换，不要另建文档。
+- **要在文档里建立「本文引用/反向引用」关系**：markdown 里的 `[标题](url)` 超链接和
+  HTML `<a>` 都不会登记引用，只有原生 mention-doc 卡片会。用
+  `feishu.py doc linkify <文档> --urls-file <URL列表> --after-heading <定位文本> --direct`，
+  它逐条纯文本粘贴 URL 让编辑器自动转卡片；转换失败的 URL 按快照比对回退（比对不通过立即停并报 `rollback_unconfirmed` 需人工检查），不留痕迹；有成功条目即重载页面按 token 增量核对每张卡片的指向，再导出文档按基线增量复核一遍（`verified=true` 才算闭环）。
+  文末「引用文档」类小节的推荐做法：replace 时该节只留标题和引导语，再用 linkify 插卡片。
+  **编辑器键盘操作大忌**：不要依赖 Ctrl+End 跳全文末尾（虚拟化渲染下不可靠，实测曾
+  误删中部表格）；定位一律用「滚动到底部强制渲染 + `[data-block-id]` 定位」；`--after-heading` 只认精确相等的标题块且要求唯一。
 
 ### 「找一篇讲 XX 的文档」
 
