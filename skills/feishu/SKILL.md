@@ -5,6 +5,10 @@ description: 用网页版会话 cookie 接管飞书（Feishu/Lark）个人账号
 
 # 飞书个人账号接管
 
+**本 skill 只在 Linux 上可用**。守护进程与浏览器 / 媒体处理的沙箱靠 `systemd --user` 的 cgroup，
+凭据存在 Linux Secret Service 里，macOS 两者都没有。在 mac 上 `scripts/feishu.py` 会直接退出，
+**不要尝试绕过**，也不要改成装 `secretstorage`——那个包在 macOS 上装得上也连不到任何东西。
+
 公司飞书租户开不出开放平台应用权限（没有 app_id/app_secret），所以**不要提议去申请自建应用**，
 也不要去找官方飞书 skill/MCP。本 skill 走**网页版会话 cookie**，能力等同本人在浏览器里操作。
 

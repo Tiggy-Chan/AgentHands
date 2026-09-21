@@ -43,6 +43,18 @@ def _bootstrap() -> None:
     _reexec(FEISHU_HOME, os.path.abspath(__file__))
 
 
+# Refused here, before the venv is built: bootstrapping would spend a 500MB
+# download to reach a secretstorage that cannot talk to a Secret Service, and
+# the first real command would then fail again inside systemd-run. One sentence
+# up front beats either of those.
+if not sys.platform.startswith("linux"):
+    print(
+        "feishu skill 只支持 Linux：守护进程与浏览器/媒体沙箱靠 systemd --user\n"
+        "cgroup，凭据存 Linux Secret Service，macOS 两者都没有。",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
 if not in_venv(FEISHU_HOME):
     if os.path.exists(VENV_PY):
         _reexec(FEISHU_HOME, os.path.abspath(__file__))
