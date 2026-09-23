@@ -40,13 +40,11 @@ Markdown 语法能安全落到飞书文档，哪些有损——给"要写到飞�
 4. 列表嵌套每层缩进 2 空格，别超过 3 层。
 5. 表格单元格内的竖线写 `\|`。
 6. 图片尽量用可公开访问的 URL；本地图片目前无法随文上传。
-7. 写完用 `doc <token>` 读回检查；`doc replace` 自带 verified 校验
-   （逐行包含核对 + 表格/代码构造核对），`verified=false` 时看 `missing_line_samples`。
+7. 写完用 `doc <token>` 读回检查；`doc replace` 自带 verified 校验（逐行包含核对 + 表格/代码构造核对），`verified=false` 时看 `missing_line_samples`。
 
 ## 编辑器行为备忘（实测）
 
-- 编辑器 innerText 里混有页头控件文字（添加图标/添加封面/展示文档信息）和零宽空格，
-  判空必须剔除（documents.py `_EDITOR_CHROME`）。
+- 编辑器 innerText 里混有页头控件文字（添加图标/添加封面/展示文档信息）和零宽空格，判空必须剔除（documents.py `_EDITOR_CHROME`）。
 - Ctrl+A 需连按多次才扩到全文，且扩展是异步的——清场要循环验证。
 - 粘贴可能弹「保留格式/纯文本」选择框；replace 会自动按 Enter+Escape。
 - 服务端保存有防抖，导出校验要轮询（最多 5×2s）。
