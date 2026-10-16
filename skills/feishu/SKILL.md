@@ -49,6 +49,11 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
 | `doc import <本地文件> [--folder …] [--title …]` | 导入本地文件（md/docx/xlsx）为新的在线云文档；默认双重闸门，`--direct` 免确认直写 |
 | `doc replace <文档链接或token> <本地Markdown> [--direct]` | 保持原 token/链接，原地替换已有 docx 正文；md 先本地转 HTML 再走富文本剪贴板粘贴（表格/代码块/任务列表保真），粘贴后自动导出逐行校验（`verified` 字段）。语法对照见 `references/docx-format.md` |
+| `doc block-map <文档链接或token>` | 只读：滚动全文输出叶块顺序图（index/block-id/类型/文本预览，图片块标 `image`），给 `doc edit` 选锚点用 |
+| `doc edit <文档链接或token> --find 锚点 --insert-after\|--replace\|--delete\|--delete-next [--text 文本\|--text-file 文件\|--images 图片…] [--direct]` | **块级外科编辑**（不全文替换）：锚点按叶块归一化文本精确匹配（须全文唯一，先跑 `block-map` 选），用 Selection API 把文本光标精确放进锚点块（不依赖鼠标坐标，虚拟化下先滚动强制挂载），再执行：insert-after=锚点后插入富文本/图片，replace=替换锚点块正文（限文本块），delete=删锚点文本块，delete-next=删锚点的下一块（图片等无文本块专用）。操作后即时核验+失败撤销回退，结束重载复核（`reload_verified`）。图片走 ClipboardItem 真剪贴板粘贴（飞书自动上传成图片块），单张 ≤10MB |
+| `doc insert-images <文档链接或token> --images 图片… [--after-heading 标题] [--direct]` | 等价于 `doc edit --insert-after --images` 的批量形态（锚点限标题块，缺省文末）；逐张粘贴 / 失败回退 / 重载按图片数增量复核 |
+| `doc insert-file <文档链接或token> --attach 文件 [--after-heading 标题] [--direct]` | 把任意本地文件（zip 等，≤100MB）粘贴为文档附件块（文件随之入云盘）；按文件名出现次数核对 / 失败回退 / 重载滚动全文复核 |
+| `doc <链接或token> --screenshot-dir <目录>` | 只读：滚动抓取文档正文全部图片（浏览器内 fetch 原图，blob/http 源均可，原始分辨率；失败退化元素截图），无导出权限的文档也能拿图 |
 | `doc linkify <文档链接或token> [--urls URL …] [--urls-file 文件] [--after-heading 文本] [--direct]` | 把飞书文档 URL 以**原生引用卡片**（mention-doc chip）插入文档，登记「本文引用/反向引用」关系。普通超链接（含 `[标题](url)`）**不登记引用**；编辑器里纯文本粘贴飞书文档 URL 才会自动转卡片。`--after-heading` 指定插入位置（与该文本**精确相等的标题块**之后，须全文唯一，默认文末）；未转成卡片的 URL 立即回退（撤销后按块快照逐项比对，比对不通过即停止并报需人工检查），不留纯文本在文档里，状态分 `linkified`/`partial`/`failed`；结束后重载页面按插入前基线的卡片增量逐条核对指向，并重新导出文档按出现次数增量复核（`verified` 字段）；drive/folder 链接不能转卡片（会按失败报告）；URL 上限 50 条，--urls-file 上限 256 KiB |
 | `doc --list` / `doc --walk` | 列空间根节点 / 遍历全部可见文档建本地索引 |
 | `docs-search <关键词> [--local]` | 搜文档（远程网页搜索；--local 搜 walk 索引+导出缓存） |
@@ -89,6 +94,7 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
   `feishu.py doc replace <文档链接或token> <本地Markdown文件> --direct`。该命令原地替换 docx 正文并保留原 token/URL，不创建重复文档。
 - **长 Markdown 的排版注意**：`doc replace` 优先尝试 HTML 粘贴，但当前租户若返回
   `mode=plain`，源 Markdown 的空行可能变成飞书里的空段落，导致段落间距过大。替换前压缩正文空行（代码块内部必要空行保留），替换后导出 Markdown/docx 检查空段数量以及标题 / 列表样式；发现间距异常就用紧凑源文件原地替换，不要另建文档。
+- **改文档优先用 `doc edit` 块级编辑，不要默认 `doc replace` 全文替换**：全文替换走文本粘贴通道，会把文档里已有的图片块抹掉，也会冲掉他人的手动润色。`doc edit` 像人一样把光标停到锚点块做增删改，他人改动和图片都不受影响。只有新建文档或整篇重写才用 import/replace。
 - **要在文档里建立「本文引用/反向引用」关系**：markdown 里的 `[标题](url)` 超链接和
   HTML `<a>` 都不会登记引用，只有原生 mention-doc 卡片会。用
   `feishu.py doc linkify <文档> --urls-file <URL列表> --after-heading <定位文本> --direct`，它逐条纯文本粘贴 URL 让编辑器自动转卡片；转换失败的 URL 按快照比对回退（比对不通过立即停并报 `rollback_unconfirmed` 需人工检查），不留痕迹；有成功条目即重载页面按 token 增量核对每张卡片的指向，再导出文档按基线增量复核一遍（`verified=true` 才算闭环）。文末「引用文档」类小节的推荐做法：replace 时该节只留标题和引导语，再用 linkify 插卡片。

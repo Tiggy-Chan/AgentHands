@@ -177,12 +177,23 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["markdown", "docx", "pdf", "xlsx"])
     p.add_argument("--out", default="", help="二进制导出必须写文件；markdown 默认 stdout")
     p.add_argument("--strict", action="store_true", help="导出失败时直接报错，不降级为浏览器 DOM 文本")
+    p.add_argument("--screenshot-dir", default="", help="抓取文档正文全部图片到指定目录（受限浏览器滚动渲染，原图优先）")
     p.add_argument("--list", action="store_true", help="列我的空间+共享空间根节点")
     p.add_argument("--walk", action="store_true", help="遍历全部可见文档建索引（docs-index.jsonl）")
     p.add_argument("--max-nodes", type=int, default=5000)
     p.add_argument("--folder", default="", help="导入目标文件夹 token 或 URL（默认我的空间根目录）")
     p.add_argument("--title", "--name", dest="title", default="", help="导入文档标题（默认取文件名）")
     p.add_argument("--urls", nargs="*", default=[], help="linkify：要插入为引用卡片的飞书文档 URL")
+    p.add_argument("--images", nargs="*", default=[], help="insert-images/edit：要插入文档的本地图片（png/jpg/webp/gif/bmp）")
+    p.add_argument("--attach", default="", help="insert-file：要作为附件块插入文档的本地任意文件（随附件入云盘）")
+    p.add_argument("--find", default="", help="edit：锚点块文本（叶块归一化文本精确匹配，须全文唯一）")
+    p.add_argument("--insert-after", action="store_true", help="edit：在锚点块之后插入内容")
+    p.add_argument("--insert-before", action="store_true", help="edit：在锚点块之前插入内容")
+    p.add_argument("--replace", dest="edit_replace", action="store_true", help="edit：替换锚点块内容")
+    p.add_argument("--delete", dest="edit_delete", action="store_true", help="edit：删除锚点块")
+    p.add_argument("--delete-next", dest="edit_delete_next", action="store_true", help="edit：删除锚点块的下一个块（用于图片等无文本块）")
+    p.add_argument("--text", default="", help="edit：要插入/替换的文本内容（支持 Markdown）")
+    p.add_argument("--text-file", default="", help="edit：从本地 Markdown 文件读入内容")
     p.add_argument("--urls-file", default="", help="linkify：从文件读 URL 列表（每行一个，- 表示 stdin）")
     p.add_argument("--after-heading", default="", help="linkify：插入到包含该文本的正文块之后（默认文档末尾）")
     p.add_argument("--direct", action="store_true", help="直接写入模式：用户已明确授权，免指纹核对；仍需 FEISHU_ALLOW_WRITE=1")
@@ -774,6 +785,111 @@ async def _run(args) -> int:
                   and not res.get("rollback_unconfirmed"))
             return 0 if ok else 1
 
+        if args.ref == "block-map":
+            if not args.file_path:
+                note("用法：feishu.py doc block-map <文档链接或token>")
+                return 2
+            with query_lock.acquire("doc-block-map"):
+                res = await documents.block_map(args.file_path)
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"# {res.get('title')}（{res.get('count')} 个叶块）")
+                for b in res.get("blocks", []):
+                    emit(f"[{b['i']:>3}] {b['type']:<8} #{b['id']}  {b['text']}")
+            return 0
+
+        if args.ref == "edit":
+            if not args.file_path:
+                note("用法：feishu.py doc edit <文档链接或token> --find 锚点 --insert-after|--replace|--delete|--delete-next [--text 文本|--text-file 文件|--images 图片...]")
+                return 2
+            ops = [name for name, flag in (("insert-after", args.insert_after), ("insert-before", args.insert_before),
+                                           ("replace", args.edit_replace),
+                                           ("delete", args.edit_delete), ("delete-next", args.edit_delete_next)) if flag]
+            if len(ops) != 1:
+                note("doc edit 需要且只能指定一种操作：--insert-after / --insert-before / --replace / --delete / --delete-next")
+                return 2
+            if not args.find:
+                note("doc edit 需要 --find 锚点文本")
+                return 2
+            with query_lock.acquire("doc-block-edit"):
+                res = await documents.edit_block(
+                    ref=args.file_path,
+                    find=args.find,
+                    op=ops[0],
+                    text=args.text,
+                    text_file=args.text_file,
+                    images=args.images,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 块级编辑完成（{res.get('status')}）：{res.get('op')} — {res.get('detail')}"
+                     + f"\n- 锚点：{res.get('anchor')}"
+                     + f"\n- 链接：{res.get('url')}"
+                     + ("" if res.get("reload_verified") else "\n  ⚠️ 重载复核未通过，请人工确认"))
+            return 0 if res.get("reload_verified") else 1
+
+        if args.ref == "insert-images":
+            if not args.file_path:
+                note("用法：feishu.py doc insert-images <文档链接或token> --images 图片... [--after-heading 文本]")
+                return 2
+            if not args.images:
+                note("insert-images 需要 --images 指定至少一张本地图片")
+                return 2
+            if len(args.images) > documents.MAX_INSERT_IMAGES:
+                note(f"insert-images 一次最多 {documents.MAX_INSERT_IMAGES} 张（当前 {len(args.images)} 张）")
+                return 2
+            with query_lock.acquire("doc-insert-images"):
+                res = await documents.insert_images(
+                    ref=args.file_path,
+                    images=args.images,
+                    after_heading=args.after_heading,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 图片插入完成（{res.get('status')}）：成功 {len(res.get('inserted') or [])} 张"
+                     + (f"，失败 {len(res.get('failed') or [])} 张" if res.get("failed") else "")
+                     + f"；重载复核 {len(res.get('reload_verified') or [])} 张"
+                     + f"\n- 链接：{res.get('url')}")
+                for fail in res.get("failed") or []:
+                    emit(f"  ✗ 未插入（已回退）：{fail}")
+                rb = res.get("rollback_unconfirmed")
+                if rb:
+                    emit(f"  ⚠️ 回退未能确认：{rb.get('image')}，块 {rb.get('block_id')} 需人工检查")
+            return 0 if res.get("verified") else 1
+
+        if args.ref == "insert-file":
+            if not args.file_path:
+                note("用法：feishu.py doc insert-file <文档链接或token> --attach 本地文件 [--after-heading 文本]")
+                return 2
+            if not args.attach:
+                note("insert-file 需要 --attach 指定本地文件")
+                return 2
+            with query_lock.acquire("doc-insert-file"):
+                res = await documents.insert_file(
+                    ref=args.file_path,
+                    file_path=args.attach,
+                    after_heading=args.after_heading,
+                    confirm=args.confirm_write,
+                    direct=args.direct,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 附件插入完成（{res.get('status')}）：{', '.join(res.get('inserted') or []) or '无'}"
+                     + (f"，失败：{', '.join(res.get('failed') or [])}" if res.get("failed") else "")
+                     + f"\n- 链接：{res.get('url')}")
+                rb = res.get("rollback_unconfirmed")
+                if rb:
+                    emit(f"  ⚠️ 回退未能确认：{rb.get('file')}，块 {rb.get('block_id')} 需人工检查")
+            return 0 if res.get("verified") else 1
+
         if args.ref in ("replace", "update"):
             if not args.file_path or not args.replacement_file:
                 note("用法：feishu.py doc replace <文档链接或token> <本地Markdown文件>")
@@ -843,6 +959,20 @@ async def _run(args) -> int:
                 for n in res["nodes"]:
                     emit(f"- [{n['type']}] {n['path']} `{n['token']}`")
             return 0 if res["complete"] else 1
+        if args.screenshot_dir:
+            if not args.ref:
+                note("doc --screenshot-dir 需要一个文档链接/token")
+                return 2
+            with query_lock.acquire("doc-screenshot"):
+                res = await documents.screenshot_document(args.ref, args.screenshot_dir)
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 抓取完成：{len(res.get('images', []))} 张图片 → {res.get('out_dir')}")
+                for im in res.get("images", []):
+                    emit(f"  - {im}")
+            return 0 if res.get("images") else 1
+
         if not args.ref:
             note("doc 需要一个文档链接/token，或 --list / --walk")
             return 2

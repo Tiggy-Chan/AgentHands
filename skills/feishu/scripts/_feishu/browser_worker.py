@@ -36,6 +36,11 @@ _OPERATIONS = frozenset({
     "doc-replace",
     "doc-linkify",
     "doc-read",
+    "doc-screenshot",
+    "doc-insert-images",
+    "doc-insert-file",
+    "doc-block-edit",
+    "doc-block-map",
     "doc-clipboard-inspect",
     "probe",
     "message-media-probe",
@@ -241,6 +246,25 @@ async def _dispatch(operation: str, payload: dict) -> dict:
     if operation == "doc-read":
         from .documents import _read_document_impl
         return await _read_document_impl(str(payload.get("ref", "")))
+    if operation == "doc-screenshot":
+        from .documents import _screenshot_document_impl
+        return await _screenshot_document_impl(
+            str(payload.get("ref", "")), str(payload.get("out_dir", "")))
+    if operation == "doc-insert-images":
+        from .documents import _insert_images_impl
+        return await _insert_images_impl(
+            str(payload.get("ref", "")), str(payload.get("payload_file", "")))
+    if operation == "doc-insert-file":
+        from .documents import _insert_file_impl
+        return await _insert_file_impl(
+            str(payload.get("ref", "")), str(payload.get("payload_file", "")))
+    if operation == "doc-block-edit":
+        from .documents import _block_edit_impl
+        return await _block_edit_impl(
+            str(payload.get("ref", "")), str(payload.get("payload_file", "")))
+    if operation == "doc-block-map":
+        from .documents import _block_map_impl
+        return await _block_map_impl(str(payload.get("ref", "")))
     if operation == "doc-clipboard-inspect":
         from .documents import _inspect_clipboard_impl
         return await _inspect_clipboard_impl(str(payload.get("ref", "")))

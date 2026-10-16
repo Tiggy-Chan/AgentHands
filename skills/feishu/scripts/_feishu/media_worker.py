@@ -40,7 +40,10 @@ def _systemd_user_available() -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return result.returncode == 0 and result.stdout.strip() in {"running", "degraded"}
+    # is-system-running exits non-zero for "degraded" (any failed user unit,
+    # e.g. feishu-daemon itself).  Degraded still runs transient services
+    # fine, so decide on the reported state, not the exit code.
+    return result.stdout.strip() in {"running", "degraded"}
 
 
 def _worker_python() -> str:

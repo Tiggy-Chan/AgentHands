@@ -663,7 +663,7 @@ async def _replace_document_impl(ref: str, content_file: str) -> dict:
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await ctx.add_cookies(auth.playwright_cookie_jar())
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.goto(url, wait_until="load", timeout=30_000)
             await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(2_000)
 
@@ -719,7 +719,7 @@ async def _inspect_clipboard_impl(ref: str) -> dict:
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await ctx.add_cookies(auth.playwright_cookie_jar())
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.goto(url, wait_until="load", timeout=30_000)
             await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(2_000)
             editor = page.locator(".page-block.root-block").first
@@ -1082,7 +1082,7 @@ async def _linkify_document_impl(ref: str, payload_file: str) -> dict:
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await ctx.add_cookies(auth.playwright_cookie_jar())
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.goto(url, wait_until="load", timeout=30_000)
             await auth.raise_if_login_redirect(page)
             await page.wait_for_timeout(2_000)
 
@@ -1218,7 +1218,7 @@ async def _linkify_document_impl(ref: str, payload_file: str) -> dict:
             reload_verified: list[str] = []
             chips_expose_href = False
             if inserted_urls:
-                await page.reload(wait_until="networkidle", timeout=60_000)
+                await page.reload(wait_until="load", timeout=30_000)
                 await auth.raise_if_login_redirect(page)
                 await page.wait_for_timeout(2_000)
                 hrefs = set(await page.evaluate(_COLLECT_CHIP_HREFS_JS))
@@ -1301,3 +1301,1759 @@ async def _read_document_impl(ref: str) -> dict:
             return {"title": title, "content": text, "url": url}
         finally:
             await ctx.close()
+
+
+async def screenshot_document(ref: str, out_dir: str) -> dict:
+    """抓取文档正文中的全部图片（受限 Browser Worker 渲染 + 滚动强制加载）。"""
+    from .browser_worker import run
+
+    return await run(
+        "doc-screenshot",
+        {"ref": ref, "out_dir": out_dir},
+        timeout=max(config.BROWSER_TIMEOUT_SECONDS, 300),
+    )
+
+
+_SCREENSHOT_COLLECT_JS = """() => {
+    const root = document.querySelector('.page-block.root-block') ||
+                 document.querySelector('.wiki-content') ||
+                 document.querySelector('.docx-page') ||
+                 document.querySelector('#doc-main') ||
+                 document.querySelector('.render-unit-wrapper') ||
+                 document.body;
+    const vh = window.innerHeight;
+    const imgs = [...root.querySelectorAll('img')].map((img) => {
+        const r = img.getBoundingClientRect();
+        return {
+            img,
+            src: img.currentSrc || img.src || '',
+            w: img.naturalWidth || 0,
+            h: img.naturalHeight || 0,
+            top: r.top,
+            bottom: r.bottom,
+            visible: r.bottom > -50 && r.top < vh + 50 && r.width > 0,
+        };
+    }).filter(x => x.visible && x.w >= 150 && x.h >= 80
+                  && !/avatar|icon|emoji|logo/i.test(x.src));
+    imgs.forEach((x, i) => x.img.setAttribute('data-feishu-shot', String(i)));
+    return imgs.map((x, i) => ({shot: String(i), src: x.src, w: x.w, h: x.h}));
+}"""
+
+_SCREENSHOT_FETCH_JS = """async (src) => {
+    const resp = await fetch(src);
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    const blob = await resp.blob();
+    if (blob.size > 24 * 1024 * 1024) throw new Error('too large: ' + blob.size);
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return {type: blob.type || '', b64: btoa(bin)};
+}"""
+
+_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+}
+
+
+async def _screenshot_document_impl(ref: str, out_dir: str) -> dict:
+    """Browser Worker implementation: 滚动文档抓取正文图片。
+
+    优先在浏览器内 fetch 原图（http(s) 与 blob: 源均可，保持原始分辨率）；
+    fetch 失败退化为元素截图。虚拟化渲染的文档必须边滚动边抓。
+    """
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("文档图片抓取只能由受限 Browser Worker 执行")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright") from exc
+    import base64
+    from pathlib import Path
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    if ref.startswith("http://") or ref.startswith("https://"):
+        url = ref
+    else:
+        kind, token = parse_doc_ref(ref)
+        url = f"https://{domain}/{kind}/{token}"
+
+    out = Path(out_dir)
+    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    saved: list[str] = []
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(4000)
+            title = await page.title()
+
+            # 选定真正的滚动容器（scrollHeight 最大的可滚动元素），后续统一滚动它
+            await page.evaluate("""() => {
+                let best = document.scrollingElement || document.documentElement;
+                for (const c of document.querySelectorAll('*')) {
+                    if (c.clientHeight > 200 && c.scrollHeight > c.clientHeight + 100
+                        && c.scrollHeight > (best.scrollHeight || 0)) best = c;
+                }
+                window.__feishuScroller = best;
+            }""")
+
+            seen: set[str] = set()
+            last_top = -1
+            stall = 0
+            for _step in range(200):
+                if len(saved) >= 80:
+                    break
+                metas = await page.evaluate(_SCREENSHOT_COLLECT_JS)
+                for meta in metas:
+                    key = meta["src"] or f"shot:{meta['shot']}:{meta['w']}x{meta['h']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    n = len(saved) + 1
+                    name = ""
+                    src = meta["src"]
+                    if src:
+                        try:
+                            res = await page.evaluate(_SCREENSHOT_FETCH_JS, src)
+                            ext = _MIME_EXT.get((res.get("type") or "").split(";")[0].strip().lower(), ".png")
+                            name = f"img_{n:02d}{ext}"
+                            (out / name).write_bytes(base64.b64decode(res["b64"]))
+                        except Exception:
+                            name = ""
+                    if not name:
+                        try:
+                            handle = await page.query_selector(f'[data-feishu-shot="{meta["shot"]}"]')
+                            if handle:
+                                await handle.scroll_into_view_if_needed(timeout=3000)
+                                name = f"img_{n:02d}.png"
+                                await handle.screenshot(path=str(out / name), timeout=5000)
+                            else:
+                                continue
+                        except Exception:
+                            if name and (out / name).exists():
+                                (out / name).unlink()
+                            continue
+                    saved.append(name)
+                top = await page.evaluate("""() => {
+                    const s = window.__feishuScroller;
+                    s.scrollTop = (s.scrollTop || 0) + Math.round(window.innerHeight * 0.75);
+                    return s.scrollTop;
+                }""")
+                await page.wait_for_timeout(700)
+                if top == last_top:
+                    stall += 1
+                    if stall >= 2:
+                        break
+                else:
+                    stall = 0
+                last_top = top
+
+            return {"url": url, "title": title, "out_dir": str(out), "images": saved}
+        finally:
+            await ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# 文档插图（image insert）
+# ---------------------------------------------------------------------------
+
+MAX_INSERT_IMAGES = 20
+_INSERT_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+_INSERT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+_SCROLL_TO_BLOCK_JS = """async (bid) => {
+  const sel = () => document.querySelector('[data-block-id="' + bid + '"]');
+  if (sel()) return true;
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  // 虚拟化渲染下目标块可能已卸载：先回顶部，再逐步下滚直到重新挂载
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 250));
+  if (sel()) return true;
+  const step = Math.max(Math.floor(scroller.clientHeight * 0.8), 300);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 220));
+    if (sel()) return true;
+  }
+  return !!sel();
+}"""
+
+_IMG_CLIPBOARD_WRITE_JS = """async ([b64, mime]) => {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], {type: mime});
+  const item = {};
+  item[mime] = blob;
+  await navigator.clipboard.write([new ClipboardItem(item)]);
+}"""
+
+_IMG_DATATRANSFER_PASTE_JS = """([b64, mime, name]) => {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const file = new File([bytes], name, {type: mime});
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  // 派发到选区所在的 contenteditable 上：从不可编辑的根 div 冒泡的
+  // paste 事件会被编辑器忽略（实测踩过）
+  const sel = window.getSelection();
+  let el = sel && sel.anchorNode;
+  el = el && (el.nodeType === 1 ? el : el.parentElement);
+  const editable = el && el.closest ? el.closest('[contenteditable="true"]') : null;
+  const target = editable || document.activeElement;
+  const ev = new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true});
+  target.dispatchEvent(ev);
+}"""
+
+# 探测指定块的“下一块”是否含图片（位置感知检测，免疫虚拟化计数抖动）
+_NEXT_BLOCK_IS_IMAGE_JS = """(bid) => {
+  const b = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!b) return {found: false};
+  let n = b.nextElementSibling;
+  while (n && !n.getAttribute('data-block-id')) n = n.nextElementSibling;
+  if (!n) return {found: false};
+  const t = (n.getAttribute('data-block-type') || '') + ' ' + (n.className || '');
+  return {found: true, isImage: !!n.querySelector('img') || /image/i.test(t)};
+}"""
+
+# 拖放路径：在光标坐标处派发 DragEvent(drop)，走编辑器的文件拖入上传通道
+_IMG_DROP_JS = """([b64, mime, name]) => {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const file = new File([bytes], name, {type: mime});
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  const sel = window.getSelection();
+  let x = 400, y = 300, target = null;
+  if (sel && sel.rangeCount) {
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    if (rect && (rect.width || rect.height)) { x = rect.left + 2; y = rect.top + 2; }
+    let el = sel.anchorNode;
+    el = el && (el.nodeType === 1 ? el : el.parentElement);
+    target = el && el.closest ? el.closest('[contenteditable="true"]') : null;
+  }
+  if (!target) {
+    target = document.elementFromPoint(x, y) || document.activeElement;
+  }
+  for (const type of ['dragenter', 'dragover', 'drop']) {
+    const ev = new DragEvent(type, {dataTransfer: dt, bubbles: true, cancelable: true,
+                                    clientX: x, clientY: y});
+    target.dispatchEvent(ev);
+  }
+}"""
+
+_IMG_COUNT_NEAR_JS = """() => {
+  const root = document.querySelector('.page-block.root-block');
+  if (!root) return 0;
+  let n = root.querySelectorAll('img').length;
+  for (const b of root.querySelectorAll('[data-block-id]')) {
+    const t = (b.getAttribute('data-block-type') || '') + (b.className || '');
+    if (/image/i.test(t) && !b.querySelector('img')) n += 1;  // 图片块占位（上传中）
+  }
+  return n;
+}"""
+
+_IMG_UPLOAD_BUSY_JS = """() => {
+  const root = document.querySelector('.page-block.root-block');
+  if (!root) return false;
+  return !!root.querySelector('[class*=upload], [class*=progress], [class*=loading]');
+}"""
+
+_COUNT_ALL_IMAGES_JS = """async () => {
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const seen = new Set();
+  const collect = () => {
+    const root = document.querySelector('.page-block.root-block');
+    if (!root) return;
+    for (const img of root.querySelectorAll('img')) {
+      const key = img.currentSrc || img.src || '';
+      if (key) seen.add(key);
+    }
+    for (const b of root.querySelectorAll('[data-block-id]')) {
+      const t = (b.getAttribute('data-block-type') || '') + (b.className || '');
+      if (/image/i.test(t)) seen.add('block:' + b.getAttribute('data-block-id'));
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return seen.size;
+}"""
+
+
+def make_doc_images_draft(ref: str, images: list[str], after_heading: str) -> dict:
+    """Draft for insert-images: 在文档指定位置插入本地图片。"""
+    kind, token = parse_doc_ref(ref)
+    h = hashlib.sha256()
+    entries = []
+    for path in images:
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        entries.append({"file": os.path.basename(path), "size": os.path.getsize(path), "sha256": digest})
+        h.update(digest.encode())
+    return {
+        "action": "insert_images",
+        "document_token": token,
+        "images": entries,
+        "image_count": len(entries),
+        "after_heading": after_heading,
+        "fingerprint": doc_write_fingerprint("insert-images", token, h.hexdigest()),
+    }
+
+
+async def insert_images(
+    ref: str,
+    images: list[str],
+    after_heading: str = "",
+    confirm: str = "",
+    direct: bool = False,
+) -> dict:
+    """把本地图片插入已有 docx 文档（after_heading 标题块之后，默认文末）。
+
+    机制：受限浏览器打开文档 → 定位插入点 → 把图片写入剪贴板
+    （ClipboardItem，失败退化为 DataTransfer 合成粘贴事件）→ 模拟 Ctrl+V，
+    飞书编辑器自动完成上传并生成图片块。逐张核对、失败回退、结束重载复核。
+    """
+    images = [str(p) for p in images if p and str(p).strip()]
+    if not images:
+        raise FeishuError("insert-images 需要至少一张本地图片")
+    if len(images) > MAX_INSERT_IMAGES:
+        raise FeishuError(f"insert-images 一次最多 {MAX_INSERT_IMAGES} 张（当前 {len(images)} 张）")
+    kind, _token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("插入图片目前只支持 docx 文档")
+
+    import base64 as _b64
+
+    payload_images = []
+    total_b64 = 0
+    for path in images:
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            raise FeishuError(f"图片不存在：{path}")
+        ext = os.path.splitext(real)[1].lower()
+        mime = _INSERT_IMAGE_MIME.get(ext)
+        if not mime:
+            raise FeishuError(f"不支持的图片格式：{path}（支持 {', '.join(sorted(_INSERT_IMAGE_MIME))}）")
+        size = os.path.getsize(real)
+        if size > _INSERT_IMAGE_MAX_BYTES:
+            raise FeishuError(f"单张图片超过 10MB 上限：{path}")
+        with open(real, "rb") as f:
+            b64 = _b64.b64encode(f.read()).decode("ascii")
+        total_b64 += len(b64)
+        payload_images.append({"name": os.path.basename(real), "mime": mime, "b64": b64})
+    if total_b64 > config.MAX_DOC_WRITE_BYTES:
+        raise FeishuError(
+            f"图片总体积超过上限（base64 后 {total_b64} bytes）",
+            hint=f"当前上限为 {config.MAX_DOC_WRITE_BYTES} bytes；分批插入或压缩图片",
+        )
+
+    draft = make_doc_images_draft(ref, images, after_heading)
+    if direct:
+        note("直接写入模式：本次插入图片已明确授权。")
+    elif not confirm:
+        note("未执行插入。确认内容无误后，把指纹填进 --confirm-write 并设 FEISHU_ALLOW_WRITE=1 再执行。")
+        raise SendBlocked("draft only", hint=json.dumps(draft, ensure_ascii=False))
+    elif confirm != draft["fingerprint"]:
+        raise SendBlocked(
+            "指纹不匹配，拒绝写入",
+            hint=f"本次写入指纹是 {draft['fingerprint']}；图片列表或文档引用有任何改动都会变",
+        )
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+        raise SendBlocked(
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
+        )
+
+    await auth.prepare()
+    payload = json.dumps(
+        {"ref": ref, "after_heading": after_heading, "images": payload_images},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    config.ensure_home()
+    fd, temporary_name = tempfile.mkstemp(prefix=".doc-images.", suffix=".json", dir=str(config.HOME))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        from .browser_worker import run
+
+        result = await run(
+            "doc-insert-images",
+            {"ref": ref, "payload_file": temporary_name},
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 90 + 45 * len(images)),
+        )
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+    inserted = result.get("inserted") or []
+    result["verified"] = bool(inserted) and len(result.get("reload_verified") or []) == len(inserted)
+    return result
+
+
+async def _insert_images_impl(ref: str, payload_file: str) -> dict:
+    """Browser Worker implementation: 逐张把图片粘贴进文档编辑器。"""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("插入图片只能由受限 Browser Worker 执行")
+    payload_path = os.path.realpath(payload_file)
+    home_path = os.path.realpath(config.HOME)
+    if os.path.commonpath((home_path, payload_path)) != home_path:
+        raise FeishuError("Browser Worker 拒绝读取 FEISHU_HOME 之外的写入文件")
+    try:
+        payload = json.loads(_read_doc_write_file(payload_path).decode("utf-8"))
+        images = payload["images"]
+        after_heading = str(payload.get("after_heading") or "")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise FeishuError("insert-images payload 必须是 JSON（含 images/after_heading）") from exc
+    if not images:
+        raise FeishuError("insert-images 需要至少一张图片")
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright") from exc
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    kind, token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("插入图片目前只支持 docx 文档")
+    url = f"https://{domain}/docx/{token}"
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            permissions=["clipboard-read", "clipboard-write"],
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="load", timeout=30_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_000)
+
+            editor = page.locator(".page-block.root-block").first
+            if not await editor.count():
+                raise FeishuError("文档编辑器未渲染", hint="飞书网页结构可能已变化")
+
+            # 基线：插入前滚动全文统计已有图片数（虚拟化渲染下逐个收集去重）
+            baseline_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+
+            # 定位插入点（与 linkify 同一套：禁 Ctrl+End，先滚底强制渲染）
+            await page.evaluate(_SCROLL_BOTTOM_JS)
+            await page.wait_for_timeout(800)
+            if after_heading:
+                needle = re.sub(r"\s+", " ", after_heading).strip()
+                matches = await page.evaluate(_COLLECT_HEADING_MATCHES_JS, needle)
+                if not matches:
+                    raise FeishuError(
+                        f"找不到标题块「{after_heading}」",
+                        hint="--after-heading 只匹配标题块，且文本需与标题精确相等",
+                    )
+                if len(matches) > 1:
+                    raise FeishuError(
+                        f"标题块「{after_heading}」命中 {len(matches)} 个，无法确定插入位置",
+                        hint="换一个全文唯一的标题文本",
+                    )
+                target_id = matches[0]
+            else:
+                target_id = await page.evaluate(_FIND_LAST_EDITABLE_BLOCK_JS)
+                if not target_id:
+                    raise FeishuError("找不到可编辑的文档末尾块")
+            # 标题收集结束时滚动条在文末，靠前的目标块可能已被虚拟化卸载：
+            # 先滚动到它重新挂载，再 scroll_into_view
+            if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
+                raise FeishuError(f"目标块 {target_id} 滚动后仍未渲染，无法定位插入点")
+            target = page.locator(f"[data-block-id='{target_id}']")
+            await target.scroll_into_view_if_needed()
+            await page.wait_for_timeout(500)
+            # 用 Selection API 精确建立文本光标（鼠标点击可能落在块容器上，
+            # 导致焦点在根 div、键盘/粘贴事件不进入编辑区）
+            if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
+                raise FeishuError("无法在目标块内建立文本光标（块类型不支持？）")
+            await page.wait_for_timeout(200)
+
+            inserted: list[str] = []
+            failed: list[str] = []
+            diagnostics: list[dict] = []
+            for index, image in enumerate(images):
+                name = image["name"]
+                snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                if not snapshot or not snapshot.get("id"):
+                    raise FeishuError(
+                        "无法确定光标所在的文档块，中止插图",
+                        hint="此时文档尚未被本次操作修改；请人工打开文档确认后重试",
+                    )
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
+                before_imgs = await page.evaluate(_IMG_COUNT_NEAR_JS)
+                # 大图上传慢：检测窗口随体积放宽（基础 30s，每 MB +10s）
+                size_mb = max(1, len(image["b64"]) * 3 // 4 // (1024 * 1024))
+                deadline_polls = 60 + 20 * size_mb
+
+                async def _try_paste(mode: str) -> str:
+                    """按指定方式粘贴一次；返回实际生效的方式（"" 表示没能发出）。"""
+                    if mode == "clipboard":
+                        try:
+                            # clipboard.write 需要文档聚焦；Enter 后光标已在编辑区，
+                            # 再补一次聚焦防止 evaluate 调用把焦点偷走
+                            await page.evaluate("() => { const e = document.activeElement; if (e && e.focus) e.focus(); }")
+                            await page.evaluate(_IMG_CLIPBOARD_WRITE_JS, [image["b64"], image["mime"]])
+                            await page.keyboard.press("Control+v")
+                            return "clipboard"
+                        except Exception as exc:
+                            note(f"insert-images: clipboard 方式发出失败（{type(exc).__name__}: {exc}）")
+                            return ""
+                    try:
+                        await page.evaluate(_IMG_DATATRANSFER_PASTE_JS,
+                                            [image["b64"], image["mime"], name])
+                        return "datatransfer"
+                    except Exception as exc:
+                        note(f"insert-images: datatransfer 方式发出失败（{type(exc).__name__}: {exc}）")
+                        return ""
+
+                ok = False
+                used_mode = ""
+                for mode in ("clipboard", "datatransfer"):
+                    used_mode = await _try_paste(mode)
+                    if not used_mode:
+                        continue
+                    for _ in range(deadline_polls):
+                        await page.wait_for_timeout(500)
+                        if await page.evaluate(_IMG_COUNT_NEAR_JS) > before_imgs:
+                            ok = True
+                            break
+                    if ok:
+                        break
+                    note(f"insert-images: {used_mode} 方式 {deadline_polls // 2}s 内未被接收，换下一种方式")
+                    # 换一种方式前撤销可能的残留（空段落由后续回退统一处理）
+                    await page.keyboard.press("Control+z")
+                    await page.wait_for_timeout(300)
+                if ok:
+                    inserted.append(name)
+                    note(f"insert-images: 第 {index + 1} 张已插入（{used_mode}）：{name}")
+                    # 等上传与撤销栈稳定再插下一张
+                    await page.wait_for_timeout(2_000)
+                    continue
+                diag = await page.evaluate("""() => {
+                    const e = document.activeElement;
+                    const popups = [...document.querySelectorAll('[class*=paste], [class*=modal], [class*=dialog], [class*=upload]')]
+                        .filter(x => x.offsetWidth > 0)
+                        .map(x => (x.className || '').slice(0, 60) + ':' + (x.innerText || '').slice(0, 40));
+                    return {
+                        activeElement: e ? e.tagName + '.' + (e.className || '') : 'none',
+                        imgs: document.querySelectorAll('.page-block.root-block')
+                            ? document.querySelector('.page-block.root-block').querySelectorAll('img').length : -1,
+                        popups,
+                    };
+                }""")
+                shot = config.HOME / f"debug-insert-{int(__import__('time').time())}.png"
+                try:
+                    await page.screenshot(path=str(shot), full_page=False)
+                    diag["screenshot"] = str(shot)
+                except Exception:
+                    pass
+                diagnostics.append(diag)
+
+                failed.append(name)
+                note(f"insert-images: 第 {index + 1} 张未被编辑器接收，执行回退：{name}")
+                await page.keyboard.press("Control+z")
+                await page.wait_for_timeout(400)
+                cur = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                cur_id = cur.get("id") if cur else ""
+                orig_id = snapshot.get("id") or ""
+                next_id = snapshot.get("next_id") or ""
+                if cur and cur_id and cur_id != orig_id and cur_id != next_id:
+                    if cur.get("text"):
+                        await page.keyboard.press("Home")
+                        await page.keyboard.press("Shift+End")
+                        await page.keyboard.press("Delete")
+                        await page.wait_for_timeout(200)
+                    await page.keyboard.press("Backspace")
+                    await page.wait_for_timeout(300)
+                after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, snapshot["id"])
+                rollback_ok = (
+                    after is not None
+                    and after["text"] == snapshot["text"]
+                    and after["next_id"] == snapshot["next_id"]
+                    and after["next_text"] == snapshot["next_text"]
+                )
+                if not rollback_ok:
+                    result = {
+                        "status": "failed",
+                        "url": url,
+                        "inserted": inserted,
+                        "failed": failed + [img["name"] for img in images[index + 1:]],
+                        "rollback_unconfirmed": {
+                            "image": name,
+                            "block_id": snapshot["id"],
+                            "expected": snapshot,
+                            "actual": after,
+                            "note": "回退未能确认恢复原样，需人工检查该块及其前后内容",
+                        },
+                    }
+                    return result
+            await page.wait_for_timeout(1_500)
+
+            # 复核：重载页面滚动全文统计图片数，应不少于 基线 + 插入数
+            reload_verified: list[str] = []
+            if inserted:
+                await page.reload(wait_until="load", timeout=30_000)
+                await auth.raise_if_login_redirect(page)
+                await page.wait_for_timeout(2_000)
+                after_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+                if after_count >= baseline_count + len(inserted):
+                    reload_verified = list(inserted)
+                else:
+                    note(f"insert-images: 重载复核图片数不足（基线 {baseline_count}，"
+                         f"现 {after_count}，预期 +{len(inserted)}）")
+
+            status = "inserted" if inserted and not failed else ("partial" if inserted else "failed")
+            return {
+                "status": status,
+                "url": url,
+                "inserted": inserted,
+                "failed": failed,
+                "reload_verified": reload_verified,
+                "after_heading": after_heading,
+                "diagnostics": diagnostics,
+            }
+        finally:
+            await ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# 文档附件（file attachment insert）：任意文件粘贴为附件块，同时入云盘
+# ---------------------------------------------------------------------------
+
+MAX_INSERT_FILE_BYTES = 100 * 1024 * 1024
+
+# 光标附近（文末挂载区）按文件名出现次数探测附件块是否生成
+_FILE_NAME_NEAR_COUNT_JS = """(name) => {
+  const root = document.querySelector('.page-block.root-block');
+  if (!root) return 0;
+  const text = root.innerText || '';
+  let n = 0, i = 0;
+  for (;;) { i = text.indexOf(name, i); if (i < 0) break; n++; i += name.length; }
+  return n;
+}"""
+
+# 滚动全文收集含目标文件名的块（虚拟化免疫），用于基线与重载复核
+_FILE_NAME_BLOCKS_COUNT_JS = """async (name) => {
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const seen = new Set();
+  const collect = () => {
+    const root = document.querySelector('.page-block.root-block');
+    if (!root) return;
+    for (const b of root.querySelectorAll('[data-block-id]')) {
+      if ((b.innerText || '').indexOf(name) >= 0) seen.add(b.getAttribute('data-block-id'));
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return seen.size;
+}"""
+
+
+def make_doc_file_draft(ref: str, file_path: str, after_heading: str) -> dict:
+    """Draft for insert-file: 把本地文件作为附件块插入文档（文件随附件入云盘）。"""
+    kind, token = parse_doc_ref(ref)
+    digest = hashlib.sha256(open(file_path, "rb").read()).hexdigest()
+    return {
+        "action": "insert_file",
+        "document_token": token,
+        "file": {"file": os.path.basename(file_path), "size": os.path.getsize(file_path), "sha256": digest},
+        "after_heading": after_heading,
+        "fingerprint": doc_write_fingerprint("insert-file", token, digest),
+    }
+
+
+async def insert_file(
+    ref: str,
+    file_path: str,
+    after_heading: str = "",
+    confirm: str = "",
+    direct: bool = False,
+) -> dict:
+    """把本地任意文件插入已有 docx 文档为附件块（after_heading 标题块之后，默认文末）。
+
+    机制同 insert-images：受限浏览器打开文档 → 定位插入点 → DataTransfer
+    合成粘贴（ClipboardItem 先行尝试）→ 飞书编辑器自动上传并生成附件块，
+    文件随之进入云盘。按文件名出现次数核对、失败回退、结束重载复核。
+    """
+    file_path = str(file_path or "").strip()
+    if not file_path:
+        raise FeishuError("insert-file 需要 --attach 指定本地文件")
+    kind, _token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("插入附件目前只支持 docx 文档")
+
+    import base64 as _b64
+    import mimetypes as _mimetypes
+
+    real = os.path.realpath(file_path)
+    if not os.path.isfile(real):
+        raise FeishuError(f"文件不存在：{file_path}")
+    size = os.path.getsize(real)
+    if size > MAX_INSERT_FILE_BYTES:
+        raise FeishuError(f"文件超过 100MB 上限：{file_path}")
+    mime = _mimetypes.guess_type(real)[0] or "application/octet-stream"
+    with open(real, "rb") as f:
+        b64 = _b64.b64encode(f.read()).decode("ascii")
+    if len(b64) > config.MAX_DOC_WRITE_BYTES:
+        raise FeishuError(
+            f"文件体积超过上限（base64 后 {len(b64)} bytes）",
+            hint=f"当前上限为 {config.MAX_DOC_WRITE_BYTES} bytes",
+        )
+    name = os.path.basename(real)
+
+    draft = make_doc_file_draft(ref, real, after_heading)
+    if direct:
+        note("直接写入模式：本次插入附件已明确授权。")
+    elif not confirm:
+        note("未执行插入。确认内容无误后，把指纹填进 --confirm-write 并设 FEISHU_ALLOW_WRITE=1 再执行。")
+        raise SendBlocked("draft only", hint=json.dumps(draft, ensure_ascii=False))
+    elif confirm != draft["fingerprint"]:
+        raise SendBlocked(
+            "指纹不匹配，拒绝写入",
+            hint=f"本次写入指纹是 {draft['fingerprint']}；文件或文档引用有任何改动都会变",
+        )
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+        raise SendBlocked(
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
+        )
+
+    await auth.prepare()
+    payload = json.dumps(
+        {"ref": ref, "after_heading": after_heading,
+         "file": {"name": name, "mime": mime, "b64": b64}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    config.ensure_home()
+    fd, temporary_name = tempfile.mkstemp(prefix=".doc-file.", suffix=".json", dir=str(config.HOME))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        from .browser_worker import run
+
+        size_mb = max(1, size // (1024 * 1024))
+        result = await run(
+            "doc-insert-file",
+            {"ref": ref, "payload_file": temporary_name},
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 120 + 30 * size_mb),
+        )
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+    inserted = result.get("inserted") or []
+    result["verified"] = bool(inserted) and bool(result.get("reload_verified"))
+    return result
+
+
+async def _insert_file_impl(ref: str, payload_file: str) -> dict:
+    """Browser Worker implementation: 把单个文件粘贴为文档附件块。"""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("插入附件只能由受限 Browser Worker 执行")
+    payload_path = os.path.realpath(payload_file)
+    home_path = os.path.realpath(config.HOME)
+    if os.path.commonpath((home_path, payload_path)) != home_path:
+        raise FeishuError("Browser Worker 拒绝读取 FEISHU_HOME 之外的写入文件")
+    try:
+        payload = json.loads(_read_doc_write_file(payload_path).decode("utf-8"))
+        file_info = payload["file"]
+        after_heading = str(payload.get("after_heading") or "")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise FeishuError("insert-file payload 必须是 JSON（含 file/after_heading）") from exc
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright") from exc
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    kind, token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("插入附件目前只支持 docx 文档")
+    url = f"https://{domain}/docx/{token}"
+
+    name = file_info["name"]
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            permissions=["clipboard-read", "clipboard-write"],
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="load", timeout=30_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_000)
+
+            editor = page.locator(".page-block.root-block").first
+            if not await editor.count():
+                raise FeishuError("文档编辑器未渲染", hint="飞书网页结构可能已变化")
+
+            # 基线：全文（滚动收集）已含该文件名的块数，正常应为 0
+            baseline_count = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, name)
+
+            # 定位插入点（与 insert-images 同一套：禁 Ctrl+End，先滚底强制渲染）
+            await page.evaluate(_SCROLL_BOTTOM_JS)
+            await page.wait_for_timeout(800)
+            if after_heading:
+                needle = re.sub(r"\s+", " ", after_heading).strip()
+                matches = await page.evaluate(_COLLECT_HEADING_MATCHES_JS, needle)
+                if not matches:
+                    raise FeishuError(
+                        f"找不到标题块「{after_heading}」",
+                        hint="--after-heading 只匹配标题块，且文本需与标题精确相等",
+                    )
+                if len(matches) > 1:
+                    raise FeishuError(
+                        f"标题块「{after_heading}」命中 {len(matches)} 个，无法确定插入位置",
+                        hint="换一个全文唯一的标题文本",
+                    )
+                target_id = matches[0]
+            else:
+                target_id = await page.evaluate(_FIND_LAST_EDITABLE_BLOCK_JS)
+                if not target_id:
+                    raise FeishuError("找不到可编辑的文档末尾块")
+            if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
+                raise FeishuError(f"目标块 {target_id} 滚动后仍未渲染，无法定位插入点")
+            target = page.locator(f"[data-block-id='{target_id}']")
+            await target.scroll_into_view_if_needed()
+            await page.wait_for_timeout(500)
+            if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
+                raise FeishuError("无法在目标块内建立文本光标（块类型不支持？）")
+            await page.wait_for_timeout(200)
+
+            inserted: list[str] = []
+            failed: list[str] = []
+            diagnostics: list[dict] = []
+
+            snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+            if not snapshot or not snapshot.get("id"):
+                raise FeishuError(
+                    "无法确定光标所在的文档块，中止插入附件",
+                    hint="此时文档尚未被本次操作修改；请人工打开文档确认后重试",
+                )
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(300)
+            before_names = await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name)
+            size_mb = max(1, len(file_info["b64"]) * 3 // 4 // (1024 * 1024))
+            deadline_polls = 60 + 20 * size_mb
+
+            async def _try_paste(mode: str) -> str:
+                if mode == "clipboard":
+                    try:
+                        await page.evaluate("() => { const e = document.activeElement; if (e && e.focus) e.focus(); }")
+                        await page.evaluate(_IMG_CLIPBOARD_WRITE_JS, [file_info["b64"], file_info["mime"]])
+                        await page.keyboard.press("Control+v")
+                        return "clipboard"
+                    except Exception as exc:
+                        note(f"insert-file: clipboard 方式发出失败（{type(exc).__name__}: {exc}）")
+                        return ""
+                try:
+                    await page.evaluate(_IMG_DATATRANSFER_PASTE_JS,
+                                        [file_info["b64"], file_info["mime"], name])
+                    return "datatransfer"
+                except Exception as exc:
+                    note(f"insert-file: datatransfer 方式发出失败（{type(exc).__name__}: {exc}）")
+                    return ""
+
+            ok = False
+            used_mode = ""
+            for mode in ("clipboard", "datatransfer"):
+                used_mode = await _try_paste(mode)
+                if not used_mode:
+                    continue
+                for _ in range(deadline_polls):
+                    await page.wait_for_timeout(500)
+                    if await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name) > before_names:
+                        ok = True
+                        break
+                if ok:
+                    break
+                note(f"insert-file: {used_mode} 方式 {deadline_polls // 2}s 内未被接收，换下一种方式")
+                await page.keyboard.press("Control+z")
+                await page.wait_for_timeout(300)
+
+            if ok:
+                inserted.append(name)
+                note(f"insert-file: 附件已插入（{used_mode}）：{name}")
+                # 等上传完成（busy 指示消失）再收尾
+                for _ in range(40):
+                    await page.wait_for_timeout(500)
+                    if not await page.evaluate(_IMG_UPLOAD_BUSY_JS):
+                        break
+                await page.wait_for_timeout(2_000)
+            else:
+                diag = await page.evaluate("""() => {
+                    const e = document.activeElement;
+                    const popups = [...document.querySelectorAll('[class*=paste], [class*=modal], [class*=dialog], [class*=upload]')]
+                        .filter(x => x.offsetWidth > 0)
+                        .map(x => (x.className || '').slice(0, 60) + ':' + (x.innerText || '').slice(0, 40));
+                    return {
+                        activeElement: e ? e.tagName + '.' + (e.className || '') : 'none',
+                        popups,
+                    };
+                }""")
+                shot = config.HOME / f"debug-insert-file-{int(__import__('time').time())}.png"
+                try:
+                    await page.screenshot(path=str(shot), full_page=False)
+                    diag["screenshot"] = str(shot)
+                except Exception:
+                    pass
+                diagnostics.append(diag)
+                failed.append(name)
+                note(f"insert-file: 附件未被编辑器接收，执行回退：{name}")
+                await page.keyboard.press("Control+z")
+                await page.wait_for_timeout(400)
+                cur = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                cur_id = cur.get("id") if cur else ""
+                orig_id = snapshot.get("id") or ""
+                next_id = snapshot.get("next_id") or ""
+                if cur and cur_id and cur_id != orig_id and cur_id != next_id:
+                    if cur.get("text"):
+                        await page.keyboard.press("Home")
+                        await page.keyboard.press("Shift+End")
+                        await page.keyboard.press("Delete")
+                        await page.wait_for_timeout(200)
+                    await page.keyboard.press("Backspace")
+                    await page.wait_for_timeout(300)
+                after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, snapshot["id"])
+                rollback_ok = (
+                    after is not None
+                    and after["text"] == snapshot["text"]
+                    and after["next_id"] == snapshot["next_id"]
+                    and after["next_text"] == snapshot["next_text"]
+                )
+                if not rollback_ok:
+                    return {
+                        "status": "failed",
+                        "url": url,
+                        "inserted": inserted,
+                        "failed": failed,
+                        "rollback_unconfirmed": {
+                            "file": name,
+                            "block_id": snapshot["id"],
+                            "expected": snapshot,
+                            "actual": after,
+                            "note": "回退未能确认恢复原样，需人工检查该块及其前后内容",
+                        },
+                    }
+            await page.wait_for_timeout(1_500)
+
+            # 复核：重载页面滚动全文按文件名计数，应不少于 基线 + 1
+            reload_verified: list[str] = []
+            if inserted:
+                await page.reload(wait_until="load", timeout=30_000)
+                await auth.raise_if_login_redirect(page)
+                await page.wait_for_timeout(2_000)
+                after_count = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, name)
+                if after_count >= baseline_count + len(inserted):
+                    reload_verified = list(inserted)
+                else:
+                    note(f"insert-file: 重载复核文件名块数不足（基线 {baseline_count}，"
+                         f"现 {after_count}，预期 +{len(inserted)}）")
+
+            status = "inserted" if inserted and not failed else ("partial" if inserted else "failed")
+            return {
+                "status": status,
+                "url": url,
+                "inserted": inserted,
+                "failed": failed,
+                "reload_verified": reload_verified,
+                "after_heading": after_heading,
+                "diagnostics": diagnostics,
+            }
+        finally:
+            await ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# 块级外科编辑（surgical block edit）：像人一样把光标停到目标块再增删改
+# ---------------------------------------------------------------------------
+
+# 通用块匹配：叶块（内部不再嵌套 data-block-id）归一化文本精确相等
+_COLLECT_BLOCK_MATCHES_JS = """async (needle) => {
+  const norm = s => (s || '').replace(/[\\s\\u200b\\u200e\\u200f\\ufeff]+/g, ' ').trim();
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const seen = new Map();
+  const collect = () => {
+    for (const b of document.querySelectorAll('[data-block-id]')) {
+      if (b.querySelector('[data-block-id]')) continue;
+      if (norm(b.innerText) !== needle) continue;
+      seen.set(b.getAttribute('data-block-id'), true);
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return [...seen.keys()];
+}"""
+
+# 用 Selection API 把文本光标精确放到目标块的可编辑区末尾（不依赖鼠标坐标）
+_FOCUS_BLOCK_END_JS = """(bid) => {
+  const block = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!block) return 'missing';
+  const editable = block.querySelector('[contenteditable="true"]') || block;
+  editable.focus();
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(editable);
+  range.collapse(false);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const ok = !!(el && el.closest && el.closest('[contenteditable="true"]'));
+  return ok ? 'ok' : 'no-editable';
+}"""
+
+# 把文本光标放到目标块可编辑区的开头（insert-before 用）
+_FOCUS_BLOCK_START_JS = """(bid) => {
+  const block = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!block) return 'missing';
+  const editable = block.querySelector('[contenteditable="true"]') || block;
+  editable.focus();
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(editable);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const ok = !!(el && el.closest && el.closest('[contenteditable="true"]'));
+  return ok ? 'ok' : 'no-editable';
+}"""
+
+# 选中目标块可编辑区的全部内容（replace-block 用）
+_SELECT_BLOCK_CONTENT_JS = """(bid) => {
+  const block = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!block) return 'missing';
+  const editable = block.querySelector('[contenteditable="true"]') || block;
+  editable.focus();
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(editable);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const ok = !!(el && el.closest && el.closest('[contenteditable="true"]'));
+  return ok ? 'ok' : 'no-editable';
+}"""
+
+# 全文滚动收集所有叶块归一化文本（删除/替换后的核验用）
+_COLLECT_ALL_BLOCK_TEXTS_JS = """async () => {
+  const norm = s => (s || '').replace(/[\\s\\u200b\\u200e\\u200f\\ufeff]+/g, ' ').trim();
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const texts = new Set();
+  const collect = () => {
+    for (const b of document.querySelectorAll('[data-block-id]')) {
+      if (b.querySelector('[data-block-id]')) continue;
+      const t = norm(b.innerText);
+      if (t) texts.add(t);
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return [...texts];
+}"""
+
+
+async def _locate_unique_block(page, anchor: str, *, kind_hint: str = "正文块") -> str:
+    """全文滚动收集，定位归一化文本与 anchor 精确相等的唯一叶块，返回 block_id。"""
+    needle = re.sub(r"\s+", " ", anchor).strip()
+    matches = await page.evaluate(_COLLECT_BLOCK_MATCHES_JS, needle)
+    if not matches:
+        raise FeishuError(
+            f"找不到块「{anchor[:60]}」",
+            hint="锚点按叶块归一化文本精确匹配；代码块/表格等多行内容请用整段文本或换更短的唯一片段",
+        )
+    if len(matches) > 1:
+        raise FeishuError(
+            f"锚点「{anchor[:60]}」命中 {len(matches)} 个{kind_hint}，无法确定位置",
+            hint="换一个全文唯一的锚点文本",
+        )
+    block_id = matches[0]
+    if not await page.evaluate(_SCROLL_TO_BLOCK_JS, block_id):
+        raise FeishuError(f"目标块 {block_id} 滚动后仍未渲染，无法定位")
+    return block_id
+
+
+async def _paste_rich_at_cursor(page, markdown_text: str, html_body: str, plain_text: str) -> str:
+    """在当前光标处粘贴富文本（对齐 _paste_content 的三级降级），返回实际方式。"""
+    try:
+        await page.evaluate(_RICH_CLIPBOARD_JS, [html_body, plain_text])
+        await page.keyboard.press("Control+v")
+        return "html"
+    except Exception:
+        pass
+    try:
+        await page.evaluate(_DATATRANSFER_PASTE_JS, [html_body, plain_text])
+        return "html-datatransfer"
+    except Exception:
+        pass
+    await page.evaluate("text => navigator.clipboard.writeText(text)", markdown_text)
+    await page.keyboard.press("Control+v")
+    return "plain"
+
+
+async def _paste_image_at_cursor(page, image: dict, diag: dict | None = None,
+                                 watch_block_id: str = "") -> bool:
+    """在当前光标处粘贴一张图片（clipboard → datatransfer → drop），返回是否被编辑器接收。
+
+    watch_block_id 给出时用位置感知检测（该块的“下一块”出现图片内容即成功），
+    免疫虚拟化渲染造成的全局图片计数抖动；否则退化为全局计数对比。
+    diag 传入时会回写诊断信息（方式/异常/计数/失败截图），worker stderr 不外传，
+    诊断必须走返回值。
+    """
+    size_mb = max(1, len(image["b64"]) * 3 // 4 // (1024 * 1024))
+    deadline_polls = 60 + 20 * size_mb
+    before = await page.evaluate(_IMG_COUNT_NEAR_JS)
+    if diag is not None:
+        diag.update({"image": image["name"], "before_imgs": before, "attempts": []})
+
+    async def _detected() -> bool:
+        if watch_block_id:
+            probe = await page.evaluate(_NEXT_BLOCK_IS_IMAGE_JS, watch_block_id)
+            if probe and probe.get("isImage"):
+                return True
+        return await page.evaluate(_IMG_COUNT_NEAR_JS) > before
+    for mode in ("clipboard", "datatransfer", "drop"):
+        sent = False
+        exc_info = ""
+        if mode == "clipboard":
+            try:
+                await page.evaluate("() => { const e = document.activeElement; if (e && e.focus) e.focus(); }")
+                await page.evaluate(_IMG_CLIPBOARD_WRITE_JS, [image["b64"], image["mime"]])
+                await page.keyboard.press("Control+v")
+                sent = True
+            except Exception as exc:
+                exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+        elif mode == "datatransfer":
+            try:
+                await page.evaluate(_IMG_DATATRANSFER_PASTE_JS,
+                                    [image["b64"], image["mime"], image["name"]])
+                sent = True
+            except Exception as exc:
+                exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+        else:
+            try:
+                await page.evaluate(_IMG_DROP_JS,
+                                    [image["b64"], image["mime"], image["name"]])
+                sent = True
+            except Exception as exc:
+                exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if diag is not None:
+            diag["attempts"].append({"mode": mode, "sent": sent, "error": exc_info})
+        if not sent:
+            continue
+        for _poll_i in range(deadline_polls):
+            await page.wait_for_timeout(500)
+            if await _detected():
+                await page.wait_for_timeout(2_000)  # 等上传与撤销栈稳定
+                if diag is not None:
+                    diag["result"] = f"inserted via {mode}"
+                return True
+        await page.keyboard.press("Control+z")
+        await page.wait_for_timeout(300)
+    if diag is not None:
+        diag["after_imgs"] = await page.evaluate(_IMG_COUNT_NEAR_JS)
+        diag["activeElement"] = await page.evaluate(
+            "() => { const e = document.activeElement; return e ? e.tagName + '.' + (e.className || '') : 'none'; }")
+        diag["selection"] = await page.evaluate(
+            """() => { const s = window.getSelection();
+                       const n = s && s.anchorNode;
+                       const el = n && (n.nodeType === 1 ? n : n.parentElement);
+                       return el && el.closest ? (el.closest('[contenteditable="true"]') ? 'in-editable' : 'not-editable') : 'none'; }""")
+        try:
+            shot = config.HOME / f"debug-edit-img-{int(__import__('time').time())}.png"
+            await page.screenshot(path=str(shot), full_page=False)
+            diag["screenshot"] = str(shot)
+        except Exception:
+            pass
+    return False
+
+
+def make_doc_edit_draft(ref: str, op: str, anchor: str, content_desc: str, content_sha: str) -> dict:
+    kind, token = parse_doc_ref(ref)
+    return {
+        "action": "block_edit",
+        "op": op,
+        "document_token": token,
+        "anchor": anchor,
+        "content": content_desc,
+        "fingerprint": doc_write_fingerprint(f"edit-{op}", token, content_sha + anchor),
+    }
+
+
+async def edit_block(
+    ref: str,
+    find: str,
+    op: str,
+    text: str = "",
+    text_file: str = "",
+    images: list[str] | None = None,
+    confirm: str = "",
+    direct: bool = False,
+) -> dict:
+    """在已有 docx 文档上做块级外科编辑（不全文替换）。
+
+    op:
+      insert-after  在锚点块之后插入内容（--text/--text-file 富文本，或 --images 图片）
+      insert-before 在锚点块之前插入内容（同上；实现在锚点块首造空段后粘贴）
+      replace       替换锚点块的正文内容（纯文本/富文本，限单个文本块）
+      delete        删除锚点块（限文本块）
+      delete-next   删除锚点块的下一个块（用于图片等无文本块）
+    """
+    if op not in ("insert-after", "insert-before", "replace", "delete", "delete-next"):
+        raise FeishuError(f"不支持的编辑操作：{op}")
+    if not find.strip():
+        raise FeishuError("doc edit 需要 --find 锚点文本")
+    kind, _token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("块级编辑目前只支持 docx 文档")
+
+    import base64 as _b64
+    from . import md_html
+
+    markdown_text, html_body, plain_text = "", "", ""
+    payload_images: list[dict] = []
+    content_desc = "(无)"
+    if op in ("insert-after", "insert-before", "replace"):
+        if images:
+            if len(images) > MAX_INSERT_IMAGES:
+                raise FeishuError(f"一次最多 {MAX_INSERT_IMAGES} 张图片")
+            total_b64 = 0
+            for path in images:
+                real = os.path.realpath(path)
+                if not os.path.isfile(real):
+                    raise FeishuError(f"图片不存在：{path}")
+                ext = os.path.splitext(real)[1].lower()
+                mime = _INSERT_IMAGE_MIME.get(ext)
+                if not mime:
+                    raise FeishuError(f"不支持的图片格式：{path}")
+                if os.path.getsize(real) > _INSERT_IMAGE_MAX_BYTES:
+                    raise FeishuError(f"单张图片超过 10MB 上限：{path}")
+                with open(real, "rb") as f:
+                    b64 = _b64.b64encode(f.read()).decode("ascii")
+                total_b64 += len(b64)
+                payload_images.append({"name": os.path.basename(real), "mime": mime, "b64": b64})
+            if total_b64 > config.MAX_DOC_WRITE_BYTES:
+                raise FeishuError(f"图片总体积超过上限（base64 后 {total_b64} bytes）")
+            content_desc = f"{len(payload_images)} 张图片"
+        else:
+            if text_file:
+                markdown_text = _read_doc_write_file(text_file).decode("utf-8", errors="replace")
+            else:
+                markdown_text = text
+            if not markdown_text.strip():
+                raise FeishuError(f"{op} 需要 --text/--text-file 或 --images 提供内容")
+            html_body, plain_text = md_html.markdown_to_html(markdown_text)
+            html_body = md_html.wrap_clipboard_html(html_body)
+            content_desc = f"文本 {len(markdown_text)} 字符"
+    elif text or text_file or images:
+        raise FeishuError(f"{op} 不接受内容参数")
+
+    content_sha = hashlib.sha256(
+        (markdown_text + "|" + ",".join(i["name"] for i in payload_images)).encode()
+    ).hexdigest()
+    draft = make_doc_edit_draft(ref, op, find, content_desc, content_sha)
+    if direct:
+        note("直接写入模式：本次块级编辑已明确授权。")
+    elif not confirm:
+        note("未执行编辑。确认内容无误后，把指纹填进 --confirm-write 并设 FEISHU_ALLOW_WRITE=1 再执行。")
+        raise SendBlocked("draft only", hint=json.dumps(draft, ensure_ascii=False))
+    elif confirm != draft["fingerprint"]:
+        raise SendBlocked(
+            "指纹不匹配，拒绝写入",
+            hint=f"本次写入指纹是 {draft['fingerprint']}；锚点或内容有任何改动都会变",
+        )
+    if os.environ.get("FEISHU_ALLOW_WRITE") != "1":
+        raise SendBlocked(
+            "环境变量 FEISHU_ALLOW_WRITE=1 未设置，拒绝写入",
+            hint="--direct 只免指纹核对；这道闸门没有任何命令行旗标能绕过",
+        )
+
+    await auth.prepare()
+    payload = json.dumps(
+        {
+            "ref": ref,
+            "op": op,
+            "anchor": find,
+            "markdown": markdown_text,
+            "html": html_body,
+            "plain": plain_text,
+            "images": payload_images,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    config.ensure_home()
+    fd, temporary_name = tempfile.mkstemp(prefix=".doc-edit.", suffix=".json", dir=str(config.HOME))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        from .browser_worker import run
+
+        result = await run(
+            "doc-block-edit",
+            {"ref": ref, "payload_file": temporary_name},
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 120 + 45 * max(1, len(payload_images))),
+        )
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+    result["verified"] = bool(result.get("reload_verified"))
+    return result
+
+
+async def _block_edit_impl(ref: str, payload_file: str) -> dict:
+    """Browser Worker implementation: 定位锚点块，执行一次块级增/删/改并核验。"""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("块级编辑只能由受限 Browser Worker 执行")
+    payload_path = os.path.realpath(payload_file)
+    home_path = os.path.realpath(config.HOME)
+    if os.path.commonpath((home_path, payload_path)) != home_path:
+        raise FeishuError("Browser Worker 拒绝读取 FEISHU_HOME 之外的写入文件")
+    try:
+        payload = json.loads(_read_doc_write_file(payload_path).decode("utf-8"))
+        op = str(payload["op"])
+        anchor = str(payload["anchor"])
+        markdown_text = str(payload.get("markdown") or "")
+        html_body = str(payload.get("html") or "")
+        plain_text = str(payload.get("plain") or "")
+        images = payload.get("images") or []
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise FeishuError("block-edit payload 必须是 JSON（含 op/anchor/...）") from exc
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright") from exc
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    kind, token = parse_doc_ref(ref)
+    if kind != "docx":
+        raise FeishuError("块级编辑目前只支持 docx 文档")
+    url = f"https://{domain}/docx/{token}"
+    needle = re.sub(r"\s+", " ", anchor).strip()
+    # 核验针用渲染后首个非空块的纯文本，防止首行（如标题）不足 40 字时跨段导致单块匹配必败
+    _first_lines = [l.strip() for l in (plain_text or markdown_text).splitlines() if l.strip()]
+    _first_probe = _first_lines[0] if _first_lines else ""
+    new_needle = _first_probe[:min(40, len(_first_probe))] if len(_first_probe) >= 4 else re.sub(r"\s+", " ", plain_text or markdown_text).strip()[:40]
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            permissions=["clipboard-read", "clipboard-write"],
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="load", timeout=30_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_000)
+
+            editor = page.locator(".page-block.root-block").first
+            if not await editor.count():
+                raise FeishuError("文档编辑器未渲染", hint="飞书网页结构可能已变化")
+
+            diagnostics: list[dict] = []
+            baseline_img_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+            block_id = await _locate_unique_block(page, anchor)
+            snapshot = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
+            if not snapshot:
+                raise FeishuError(f"锚点块 {block_id} 状态读取失败，中止编辑")
+
+            detail = ""
+            if op == "insert-after":
+                if await page.evaluate(_FOCUS_BLOCK_END_JS, block_id) != "ok":
+                    raise FeishuError("无法在锚点块内建立文本光标（块类型不支持？）")
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
+                if images:
+                    inserted_imgs = []
+                    watch_id = block_id
+                    for image in images:
+                        diag: dict = {}
+                        if await _paste_image_at_cursor(page, image, diag, watch_block_id=watch_id):
+                            inserted_imgs.append(image["name"])
+                            # 下一张的观察点 = 刚插入的图片块（锚点的当前下一块）
+                            probe = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
+                            if probe and probe.get("next_id"):
+                                watch_id = probe["next_id"]
+                        else:
+                            diagnostics.append(diag)
+                            break
+                    if len(inserted_imgs) != len(images):
+                        for _ in range(4):
+                            await page.keyboard.press("Control+z")
+                            await page.wait_for_timeout(300)
+                        return {
+                            "status": "failed",
+                            "url": url,
+                            "op": op,
+                            "anchor": anchor,
+                            "detail": f"图片粘贴未全部被接收（{len(inserted_imgs)}/{len(images)}），已撤销本次编辑",
+                            "reload_verified": False,
+                            "diagnostics": diagnostics,
+                        }
+                    detail = f"插入 {len(inserted_imgs)} 张图片"
+                else:
+                    await _paste_rich_at_cursor(page, markdown_text, html_body, plain_text)
+                    await page.wait_for_timeout(800)
+                    detail = f"插入文本 {len(markdown_text)} 字符"
+
+            elif op == "insert-before":
+                if images:
+                    # 图片不存在“并段”问题：直接把光标放到上一块末尾粘贴，
+                    # 图片块即落在上一块与锚点之间 = 锚点之前。
+                    # （走 Enter+ArrowUp 的话，0 高度空段会被光标导航跳过，
+                    #   焦点丢失后剪贴板粘贴会打空——实测踩过）
+                    prev_id = await page.evaluate(
+                        """(bid) => {
+                             const b = document.querySelector('[data-block-id="' + bid + '"]');
+                             let p = b && b.previousElementSibling;
+                             while (p && !p.getAttribute('data-block-id')) p = p.previousElementSibling;
+                             return p ? p.getAttribute('data-block-id') : '';
+                           }""",
+                        block_id,
+                    )
+                    placed = False
+                    if prev_id and await page.evaluate(_FOCUS_BLOCK_END_JS, prev_id) == "ok":
+                        placed = True
+                    else:
+                        if await page.evaluate(_FOCUS_BLOCK_START_JS, block_id) != "ok":
+                            raise FeishuError("无法在锚点区域建立文本光标（块类型不支持？）")
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(300)
+                        await page.keyboard.press("ArrowUp")
+                        await page.wait_for_timeout(200)
+                        placed = True
+                    inserted_imgs = []
+                    watch_id = prev_id if prev_id else block_id
+                    for image in images:
+                        diag: dict = {}
+                        if await _paste_image_at_cursor(page, image, diag, watch_block_id=watch_id):
+                            inserted_imgs.append(image["name"])
+                            probe = await page.evaluate(_BLOCK_STATE_BY_ID_JS, watch_id)
+                            if probe and probe.get("next_id"):
+                                watch_id = probe["next_id"]
+                        else:
+                            diagnostics.append(diag)
+                            break
+                    if len(inserted_imgs) != len(images):
+                        for _ in range(4):
+                            await page.keyboard.press("Control+z")
+                            await page.wait_for_timeout(300)
+                        raise FeishuError(
+                            f"图片粘贴未全部被接收（{len(inserted_imgs)}/{len(images)}），已撤销本次编辑",
+                            hint="可换更小的图片重试；文档已恢复原样",
+                        )
+                    detail = f"在锚点前插入 {len(inserted_imgs)} 张图片"
+                else:
+                    if await page.evaluate(_FOCUS_BLOCK_START_JS, block_id) != "ok":
+                        raise FeishuError("无法在锚点块内建立文本光标（块类型不支持？）")
+                    # 块首 Enter 在上方造空段，ArrowUp 进入空段再粘贴
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("ArrowUp")
+                    await page.wait_for_timeout(200)
+                    await _paste_rich_at_cursor(page, markdown_text, html_body, plain_text)
+                    await page.wait_for_timeout(800)
+                    detail = f"在锚点前插入文本 {len(markdown_text)} 字符"
+
+            elif op == "replace":
+                if images:
+                    raise FeishuError("replace 暂不支持图片内容（先 delete-next 再 insert-after）")
+                if await page.evaluate(_SELECT_BLOCK_CONTENT_JS, block_id) != "ok":
+                    raise FeishuError("无法在锚点块内建立选区（块类型不支持？）")
+                await _paste_rich_at_cursor(page, markdown_text, html_body, plain_text)
+                await page.wait_for_timeout(800)
+                detail = f"替换为 {len(markdown_text)} 字符"
+
+            elif op == "delete":
+                if await page.evaluate(_SELECT_BLOCK_CONTENT_JS, block_id) != "ok":
+                    raise FeishuError("无法在锚点块内建立选区（非文本块请用 delete-next）")
+                await page.keyboard.press("Delete")
+                await page.wait_for_timeout(300)
+                await page.keyboard.press("Backspace")
+                await page.wait_for_timeout(400)
+                detail = "删除锚点块"
+
+            elif op == "delete-next":
+                if await page.evaluate(_FOCUS_BLOCK_END_JS, block_id) != "ok":
+                    raise FeishuError("无法在锚点块内建立文本光标")
+                # 段落末尾前向 Delete：第一下选中下一块（图片等），第二下删除
+                for _ in range(2):
+                    await page.keyboard.press("Delete")
+                    await page.wait_for_timeout(400)
+                    cur = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
+                    if cur and cur.get("next_id") != snapshot.get("next_id"):
+                        break
+                detail = "删除锚点的下一块"
+
+            # ---- 操作后核验 + 失败回退 ----
+            ok = False
+            if op == "delete":
+                texts = await page.evaluate(_COLLECT_ALL_BLOCK_TEXTS_JS)
+                ok = needle not in texts
+            elif op == "delete-next":
+                cur = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
+                ok = bool(cur) and cur.get("next_id") != snapshot.get("next_id")
+            elif op in ("insert-after", "insert-before") and images:
+                count_now = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+                ok = count_now >= baseline_img_count + len(images)
+            else:  # insert-after / insert-before 文本 / replace
+                texts = await page.evaluate(_COLLECT_ALL_BLOCK_TEXTS_JS)
+                ok = any(new_needle in t for t in texts) if new_needle else False
+            if not ok:
+                for _ in range(4):
+                    await page.keyboard.press("Control+z")
+                    await page.wait_for_timeout(300)
+                after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
+                restored = (
+                    op in ("delete", "delete-next")
+                    or (after is not None
+                        and after["text"] == snapshot["text"]
+                        and after["next_id"] == snapshot["next_id"])
+                )
+                raise FeishuError(
+                    f"编辑后核验未通过（{op}），已撤销本次操作",
+                    hint="文档已尽力恢复原样" + ("" if restored else "；但回退比对不完全一致，请人工检查"),
+                )
+
+            # ---- 重载复核 ----
+            await page.wait_for_timeout(1_500)
+            await page.reload(wait_until="load", timeout=30_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_000)
+            reload_verified = False
+            if op in ("insert-after", "insert-before") and images:
+                after_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+                reload_verified = after_count >= baseline_img_count + len(images)
+            else:
+                texts = await page.evaluate(_COLLECT_ALL_BLOCK_TEXTS_JS)
+                if op == "delete":
+                    reload_verified = needle not in texts
+                elif op == "delete-next":
+                    reload_verified = True  # 下一块无文本可比对，以操作后核验为准
+                else:
+                    reload_verified = any(new_needle in t for t in texts) if new_needle else False
+            return {
+                "status": "edited" if reload_verified else "unverified",
+                "url": url,
+                "op": op,
+                "anchor": anchor,
+                "detail": detail,
+                "reload_verified": reload_verified,
+            }
+        finally:
+            await ctx.close()
+
+
+_BLOCK_MAP_JS = """async () => {
+  const norm = s => (s || '').replace(/[\s\u200b\u200e\u200f\ufeff]+/g, ' ').trim();
+  const ed = document.querySelector('[data-block-id]');
+  let scroller = ed;
+  while (scroller && scroller.scrollHeight <= scroller.clientHeight + 50)
+    scroller = scroller.parentElement;
+  if (!scroller) scroller = document.scrollingElement || document.documentElement;
+  const seen = new Map();
+  const collect = () => {
+    for (const b of document.querySelectorAll('[data-block-id]')) {
+      if (b.querySelector('[data-block-id]')) continue;
+      const id = b.getAttribute('data-block-id');
+      if (seen.has(id)) continue;
+      const r = b.getBoundingClientRect();
+      const absTop = r.top + (scroller.scrollTop || window.scrollY || 0);
+      const cls = (b.className || '') + ' ' + (b.getAttribute('data-block-type') || '');
+      const type = b.querySelector('img') ? 'image'
+                 : /heading/i.test(cls) ? 'heading'
+                 : /code/i.test(cls) ? 'code'
+                 : /table/i.test(cls) ? 'table' : 'text';
+      seen.set(id, {id, y: Math.round(absTop), type, text: norm(b.innerText).slice(0, 70)});
+    }
+  };
+  scroller.scrollTop = 0;
+  await new Promise(r => setTimeout(r, 300));
+  const step = Math.max(scroller.clientHeight, 400);
+  for (let y = 0; y <= scroller.scrollHeight + step; y += step) {
+    scroller.scrollTop = y;
+    await new Promise(r => setTimeout(r, 200));
+    collect();
+  }
+  scroller.scrollTop = scroller.scrollHeight;
+  await new Promise(r => setTimeout(r, 300));
+  collect();
+  return [...seen.values()].sort((a, b) => a.y - b.y)
+    .map((v, i) => ({i, id: v.id, type: v.type, text: v.text}));
+}"""
+
+
+async def block_map(ref: str) -> dict:
+    """只读：滚动全文输出叶块顺序图（index/id/type/text），供选取编辑锚点。"""
+    from .browser_worker import run
+
+    return await run(
+        "doc-block-map",
+        {"ref": ref},
+        timeout=max(config.BROWSER_TIMEOUT_SECONDS, 120),
+    )
+
+
+async def _block_map_impl(ref: str) -> dict:
+    """Browser Worker implementation: 输出文档叶块顺序图。"""
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        raise ResourceIsolationUnavailable("文档块扫描只能由受限 Browser Worker 执行")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise FeishuError("当前 venv 没有 playwright") from exc
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    if ref.startswith("http://") or ref.startswith("https://"):
+        url = ref
+    else:
+        kind, token = parse_doc_ref(ref)
+        url = f"https://{domain}/{kind}/{token}"
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            ignore_https_errors=False,
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="load", timeout=30_000)
+            await auth.raise_if_login_redirect(page)
+            await page.wait_for_timeout(2_500)
+            title = await page.title()
+            blocks = await page.evaluate(_BLOCK_MAP_JS)
+            return {"url": url, "title": title, "blocks": blocks, "count": len(blocks)}
+        finally:
+            await ctx.close()
+
