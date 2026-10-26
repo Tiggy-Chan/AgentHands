@@ -400,7 +400,7 @@ def _unit_path():
 
 def _write_unit() -> None:
     unit = f"""[Unit]
-Description=feishu skill WS daemon (agenthands)
+Description=feishu skill WS daemon (AgentHands)
 
 [Service]
 ExecStart={_venv_python()} {_feishu_py()} daemon run

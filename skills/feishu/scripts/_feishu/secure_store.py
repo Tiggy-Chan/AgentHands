@@ -20,7 +20,9 @@ from pathlib import Path
 from . import config
 
 _SERVICE = "agenthands.feishu"
+_LEGACY_SERVICE = "agenthands.feishu"
 _AAD = b"agenthands/feishu/v2"
+_LEGACY_AAD = b"agenthands/feishu/v2"
 _key: bytes | None = None
 _mode: str | None = None
 _backend: str = "unavailable"
@@ -67,6 +69,13 @@ def _load_key() -> bytes | None:
         _backend = type(keyring.get_keyring()).__name__
         account = _account()
         encoded = keyring.get_password(_SERVICE, account)
+        if not encoded:
+            encoded = keyring.get_password(_LEGACY_SERVICE, account)
+            if encoded:
+                try:
+                    keyring.set_password(_SERVICE, account, encoded)
+                except Exception:
+                    pass
         if encoded:
             key = base64.urlsafe_b64decode(encoded.encode())
         else:
@@ -142,7 +151,10 @@ def decrypt_record(line: str, *, allow_plaintext: bool = False) -> dict:
 
     nonce = base64.urlsafe_b64decode(envelope["nonce"])
     cipher = base64.urlsafe_b64decode(envelope["ciphertext"])
-    plain = AESGCM(key).decrypt(nonce, cipher, _AAD)
+    try:
+        plain = AESGCM(key).decrypt(nonce, cipher, _AAD)
+    except Exception:
+        plain = AESGCM(key).decrypt(nonce, cipher, _LEGACY_AAD)
     value = json.loads(plain.decode())
     if not isinstance(value, dict):
         raise SecureStoreError("decrypted record is not an object")
@@ -177,7 +189,11 @@ def decrypt_blob(data: bytes, *, aad: bytes = _AAD) -> bytes:
 
     nonce = base64.urlsafe_b64decode(envelope["nonce"])
     cipher = base64.urlsafe_b64decode(envelope["ciphertext"])
-    return AESGCM(key).decrypt(nonce, cipher, aad)
+    try:
+        return AESGCM(key).decrypt(nonce, cipher, aad)
+    except Exception:
+        legacy_aad = _LEGACY_AAD if aad == _AAD else (b"agenthands/feishu/docs/v2" if aad == b"agenthands/feishu/docs/v2" else aad)
+        return AESGCM(key).decrypt(nonce, cipher, legacy_aad)
 
 
 _MEDIA_MAGIC = b"AH-MEDIA-CHUNKED-1\n"

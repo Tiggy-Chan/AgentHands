@@ -14,11 +14,8 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 FEISHU_HOME = os.environ.get("FEISHU_HOME", os.path.expanduser("~/.local/share/feishu"))
 
-# venv 自举与 other_tools 共用 lib/venv_bootstrap.py；resolve() 让 ~/.claude/skills
-# 下的软链指回本仓库再定位 lib/。
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(_REPO_ROOT / "lib"))
-
+# venv 自举：自包含在 _feishu.venv_bootstrap 中，零外部依赖
+sys.path.insert(0, os.path.join(HERE, "_feishu"))
 from venv_bootstrap import VenvError, in_venv, ensure as _ensure_venv, reexec as _reexec, venv_python  # noqa: E402
 
 VENV_PY = str(venv_python(FEISHU_HOME))
