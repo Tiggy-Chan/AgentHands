@@ -535,7 +535,7 @@ async def _download_file_browser_impl(msg_id: str, chat_id: str, file_name: str,
                 if await search_btn.count():
                     await search_btn.click()
                     await page.wait_for_timeout(1000)
-                for selector in ("[contenteditable=true]", "input[placeholder*=搜索]", "input"):
+                for selector in ("input[placeholder*=搜索]", "input[type=search]", "input"):
                     box = page.locator(selector).first
                     if not await box.count():
                         continue
