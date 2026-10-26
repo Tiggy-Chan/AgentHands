@@ -214,19 +214,36 @@ def _local_search(keyword: str, limit: int) -> dict:
 
 async def _run_search(page, keyword: str) -> None:
     """(Re)open the search panel and run the cloud-doc search."""
+    search_sels = ('[contenteditable=true]', 'input[placeholder*="搜索"]', 'input[aria-label*="搜索"]', 'input')
     await _click_visible(page, page.get_by_text("搜索", exact=True).first)
     await page.wait_for_timeout(1200)
-    editor = page.locator("[contenteditable=true]").first
-    if not await editor.count():
+
+    editor = None
+    for sel in search_sels:
+        cand = page.locator(sel).first
+        if await cand.count() and await cand.is_visible():
+            editor = cand
+            break
+
+    if not editor:
         await _click_visible(page, page.get_by_text("搜索", exact=True).first)
         await page.wait_for_timeout(1200)
-        editor = page.locator("[contenteditable=true]").first
-    if not await editor.count():
+        for sel in search_sels:
+            cand = page.locator(sel).first
+            if await cand.count():
+                editor = cand
+                break
+
+    if not editor:
         raise FeishuError("搜索框未渲染", hint="运行 feishu.py probe --scope docs-search 检查网页变化")
-    await editor.click()
-    await page.keyboard.press("Control+a")  # panel may remember the last query
-    await page.keyboard.press("Backspace")
-    await page.keyboard.type(keyword)
+
+    try:
+        await editor.fill(keyword)
+    except Exception:
+        await editor.click()
+        await page.keyboard.press("Control+a")
+        await page.keyboard.press("Backspace")
+        await page.keyboard.type(keyword)
     await page.wait_for_timeout(1200)
     cloud = page.get_by_text("云文档", exact=True).last
     if await cloud.count():

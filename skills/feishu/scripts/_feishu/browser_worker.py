@@ -52,6 +52,7 @@ _OPERATIONS = frozenset({
     "calendar-list",
     "calendar-get",
     "calendar-calendars",
+    "chat-send-file",
 })
 
 
@@ -295,6 +296,13 @@ async def _dispatch(operation: str, payload: dict) -> dict:
     if operation.startswith("calendar-"):
         from . import calendar_ops as calendar
         return await calendar.browser_operation(operation[9:], payload)
+    if operation == "chat-send-file":
+        from .send import _browser_send_file_impl
+        return await _browser_send_file_impl(
+            str(payload.get("chat_id", "")),
+            str(payload.get("file_path", "")),
+            str(payload.get("text", "")),
+        )
     raise BrowserWorkerError(f"未实现的 Browser Worker 操作：{operation}")
 
 

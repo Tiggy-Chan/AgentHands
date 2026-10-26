@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import mimetypes
 import re
 import time
 from typing import Any
@@ -90,13 +91,19 @@ def _build_file_request(
     chat_id: str,
     reply_id: str = "",
 ) -> tuple[bytes, str]:
-    """Build the inner ``PutMessageRequest`` for a native type-3 file."""
+    """Build the inner ``PutMessageRequest`` for a native file.
+
+    Feishu IM uses type 3 (FILE) for native IM keys (starting with file_ or file_v3_),
+    and type 13 (CLOUD_FILE) for cloud drive tokens (e.g. boxcn... or explorer uploads).
+    """
     if not file_key or not file_name:
         raise ValueError("原生文件消息需要 file_key 和 file_name")
-    msg, message_cid = _new_request(3, chat_id, reply_id)
+    msg_type = 3 if file_key.startswith("file_") else 13
+    msg, message_cid = _new_request(msg_type, chat_id, reply_id)
     msg.content.fileKey = file_key
     msg.content.fileName = file_name
-    msg.content.fileMime = file_mime or "application/octet-stream"
+    guessed_mime = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+    msg.content.fileMime = file_mime or guessed_mime
     msg.content.fileSize = max(0, int(file_size))
     return msg.SerializeToString(), message_cid
 
@@ -224,9 +231,17 @@ async def send_payload_result(cookie: str, request_payload: bytes, domain: str =
         async with _http.make_client(timeout=10) as client:
             response = await client.post(gateway_url, headers=headers, content=data)
         if response.status_code != 200:
+            err_text = ""
+            try:
+                err_text = response.text[:200].strip()
+            except Exception:
+                pass
+            detail = f"http_status_{response.status_code}"
+            if err_text:
+                detail += f": {err_text}"
             return {
                 "status": "rejected",
-                "detail": f"http_status_{response.status_code}",
+                "detail": detail,
                 "http_status": response.status_code,
                 "request_id": request_id,
                 "sent": False,

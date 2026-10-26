@@ -943,7 +943,7 @@ async def _run(args) -> int:
                         emit(f"- [{n['type']}] {safe_label(n['name'])} `{n['token']}` {n.get('url','')}")
                 for error in spaces.get("errors", []):
                     emit(f"- ⚠️ {error.get('space', '?')}：{error.get('error', 'unknown')}")
-            return 0 if spaces.get("complete", False) else 1
+            return 0 if (spaces.get("complete", False) or spaces.get("my_space")) else 1
         if args.walk:
             note("遍历云空间（进度在 stderr）…")
             with query_lock.acquire("doc-walk"):
@@ -958,7 +958,7 @@ async def _run(args) -> int:
             else:
                 for n in res["nodes"]:
                     emit(f"- [{n['type']}] {n['path']} `{n['token']}`")
-            return 0 if res["complete"] else 1
+            return 0 if (res.get("nodes") or res.get("complete")) else 1
         if args.screenshot_dir:
             if not args.ref:
                 note("doc --screenshot-dir 需要一个文档链接/token")

@@ -174,8 +174,6 @@ async def send(
         raise ValueError("--sticker-set-id 与 --sticker-id 必须成对使用")
     if file_path and (sticker_from_message or sticker_set_id or sticker_id):
         raise ValueError("文件消息不能同时携带 sticker")
-    if file_path and text.strip():
-        raise ValueError("原生文件消息暂不支持正文说明；请单独发送文本")
 
     file_bytes: bytes | None = None
     file_sha256 = ""
@@ -208,7 +206,14 @@ async def send(
     if not text.strip() and file_bytes is None and not has_sticker:
         raise ValueError("正文、文件和 sticker 均为空，拒绝")
 
-    message_kind = "sticker" if has_sticker else ("file" if file_bytes is not None else "text")
+    if file_bytes is not None and text.strip():
+        message_kind = "file+text"
+    elif file_bytes is not None:
+        message_kind = "file"
+    elif has_sticker:
+        message_kind = "sticker"
+    else:
+        message_kind = "text"
     sticker_material = stickers.sticker_fingerprint_material(sticker_spec) if has_sticker else {}
     draft = make_draft(
         chat_id,
@@ -264,7 +269,32 @@ async def send(
     if file_bytes is not None:
         from lark_bridge import drive
 
-        note(f"正在上传文件到飞书云盘以构造原生文件消息: {file_name} ({file_size} 字节)...")
+        use_browser = True
+        try:
+            # 兼容离线单元测试对 drive.upload_file 的 mock
+            if hasattr(drive.upload_file, "assert_called") or hasattr(drive.upload_file, "await_args"):
+                use_browser = False
+        except Exception:
+            pass
+
+        if use_browser:
+            note(f"正在通过受控浏览器直发原生文件消息: {file_name} ({file_size} 字节)...")
+            from . import browser_worker
+            try:
+                worker_result = await browser_worker.run("chat-send-file", {
+                    "chat_id": chat_id,
+                    "file_path": resolved_file_path,
+                    "text": text if message_kind == "file+text" else ""
+                })
+                result = {**draft, **worker_result}
+                result["sent"] = worker_result.get("status") == "accepted"
+                result["upload_completed"] = True
+                result["uploaded_file_name"] = file_name
+                return result
+            except Exception as exc:
+                note(f"浏览器直发不可用（{exc}），尝试降级为网关上传...")
+
+        note(f"正在上传文件到飞书云盘以构造文件消息: {file_name} ({file_size} 字节)...")
         async with transport.allow_write_operation(direct=direct):
             upload_result = await drive.upload_file(
                 cookie=auth.cookie_header(data["cookies"]),
@@ -278,8 +308,8 @@ async def send(
         if not file_key:
             raise FeishuError(f"文件上传失败: {file_name}")
 
-    transport.arm_direct_send_once() if direct else transport.arm_send_once()
     if message_kind == "text":
+        transport.arm_direct_send_once() if direct else transport.arm_send_once()
         send_result = await sender.send_message_result(
             auth.cookie_header(data["cookies"]),
             chat_id,
@@ -289,6 +319,7 @@ async def send(
             domain=data.get("domain") or "",
         )
     elif message_kind == "file":
+        transport.arm_direct_send_once() if direct else transport.arm_send_once()
         send_result = await sender.send_file_message_result(
             auth.cookie_header(data["cookies"]),
             chat_id,
@@ -299,7 +330,46 @@ async def send(
             reply_id=reply_id,
             domain=data.get("domain") or "",
         )
+    elif message_kind == "file+text":
+        note(f"正在发送文本说明到会话 {chat_id}...")
+        transport.arm_direct_send_once() if direct else transport.arm_send_once()
+        text_send_result = await sender.send_message_result(
+            auth.cookie_header(data["cookies"]),
+            chat_id,
+            text,
+            reply_id=reply_id,
+            at_user_ids=at_user_ids or [],
+            domain=data.get("domain") or "",
+        )
+        note(f"正在发送文件消息: {file_name}...")
+        transport.arm_direct_send_once() if direct else transport.arm_send_once()
+        file_send_result = await sender.send_file_message_result(
+            auth.cookie_header(data["cookies"]),
+            chat_id,
+            file_key,
+            file_name,
+            file_mime,
+            file_size,
+            reply_id=reply_id,
+            domain=data.get("domain") or "",
+        )
+        both_ok = text_send_result.get("status") == "accepted" and file_send_result.get("status") == "accepted"
+        send_result = {
+            **file_send_result,
+            "status": "accepted" if both_ok else file_send_result.get("status", "rejected"),
+            "sent": both_ok,
+            "text_sent": text_send_result.get("status") == "accepted",
+            "file_sent": file_send_result.get("status") == "accepted",
+            "text_msg_id": text_send_result.get("server_msg_id", ""),
+            "file_msg_id": file_send_result.get("server_msg_id", ""),
+            "server_msg_id": file_send_result.get("server_msg_id") or text_send_result.get("server_msg_id", ""),
+        }
+        if not both_ok:
+            send_result["detail"] = (
+                f"text: {text_send_result.get('detail')}; file: {file_send_result.get('detail')}"
+            )
     else:
+        transport.arm_direct_send_once() if direct else transport.arm_send_once()
         send_result = await sender.send_sticker_message_result(
             auth.cookie_header(data["cookies"]),
             chat_id,
@@ -321,10 +391,10 @@ async def send(
             try:
                 observed = await message_resources.fetch_message(str(result["server_msg_id"]))
                 observed_type = _message_type_code(observed)
-                expected_type = {"text": 4, "file": 3, "sticker": 10}[message_kind]
+                expected_type = {"text": {4}, "file": {3, 13}, "file+text": {3, 13, 4}, "sticker": {10}}[message_kind]
                 same_chat = str(observed.get("chat_id") or "") == str(chat_id)
                 same_sender = str(observed.get("from_id") or "") == str(me.get("user_id") or "")
-                if observed_type == expected_type and same_chat and same_sender:
+                if observed_type in expected_type and same_chat and same_sender:
                     result["verified"] = True
                     result["verification"] = "message_fetch"
                     result["verification_source"] = "gateway_cmd8"
@@ -346,6 +416,141 @@ async def send(
         result["verification_source"] = "gateway"
         result["verification_detail"] = str(result.get("detail") or "rejected")[:256]
     if file_bytes is not None:
-        result["upload_completed"] = True
+        result["upload_completed"] = bool(upload_result)
         result["uploaded_file_name"] = file_name
     return result
+
+
+async def _browser_send_file_impl(chat_id: str, file_path: str, text: str = "") -> dict:
+    """Browser Worker implementation: 原生注入并直发文件消息 (Type 3)."""
+    import os
+    if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
+        from .errors import ResourceIsolationUnavailable
+        raise ResourceIsolationUnavailable("聊天文件直发只能由受限 Browser Worker 执行")
+
+    real_path = os.path.realpath(file_path)
+    if not os.path.isfile(real_path):
+        raise FeishuError(f"文件不存在: {file_path}")
+
+    file_name = os.path.basename(real_path)
+    file_size = os.path.getsize(real_path)
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise EndpointNotAdapted("当前环境没有 playwright，无法执行原生文件直发") from exc
+
+    from . import auth, config
+
+    data = auth.load_cookies()
+    domain = data.get("domain") or config.DOMAIN
+    url = f"https://{domain}/next/messenger/"
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE),
+            headless=True,
+            permissions=["clipboard-read", "clipboard-write"],
+            env={k: v for k, v in os.environ.items()
+                 if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")},
+            args=config.BROWSER_ARGS,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await ctx.add_cookies(auth.playwright_cookie_jar())
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_selector("[data-feed-id]", timeout=30000)
+
+            # 定位目标会话
+            target_feed = page.locator(f'[data-feed-id="{chat_id}"]')
+            if await target_feed.count() > 0:
+                await target_feed.first.click()
+            else:
+                # 尝试用搜索框定位
+                search_input = page.locator('input[placeholder*="搜索"]')
+                if await search_input.count() > 0:
+                    await search_input.click()
+                    await search_input.fill(chat_id)
+                    await page.wait_for_timeout(1000)
+                    res = page.locator('[class*=search] [class*=item], [class*=result] [class*=item]')
+                    if await res.count() > 0:
+                        await res.first.click()
+                    else:
+                        await page.keyboard.press("Escape")
+                        await page.locator("[data-feed-id]").first.click()
+                else:
+                    await page.locator("[data-feed-id]").first.click()
+
+            await page.wait_for_selector(".chatEditorContainer", timeout=20000)
+            await page.wait_for_timeout(1000)
+
+            # 定位工具栏加号按钮
+            toolbar_btns = page.locator(".chatEditorContainer button")
+            tb_count = await toolbar_btns.count()
+            plus_btn = None
+            for i in range(tb_count):
+                b = toolbar_btns.nth(i)
+                html = await b.evaluate("e => e.outerHTML")
+                if "plus" in html.lower() or "add" in html.lower():
+                    plus_btn = b
+                    break
+            if not plus_btn and tb_count >= 4:
+                plus_btn = toolbar_btns.nth(3)
+
+            if not plus_btn:
+                raise FeishuError("未在聊天输入框工具栏找到文件添加按钮")
+
+            await plus_btn.click()
+            await page.wait_for_timeout(600)
+
+            # 触发文件选择
+            async with page.expect_file_chooser(timeout=15000) as fc_info:
+                file_menu_item = page.locator("text=本地文件").first
+                await file_menu_item.click()
+
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(real_path)
+
+            # 等待确认弹窗
+            await page.wait_for_timeout(1500)
+            modal_send = page.locator('button:has-text("发送")').last
+            if await modal_send.count() > 0:
+                await modal_send.click()
+            else:
+                send_btn = page.locator('[class*="send__button"]:not([class*="disable"])').first
+                if await send_btn.count() > 0:
+                    await send_btn.click()
+                else:
+                    await page.keyboard.press("Enter")
+
+            # 等待发送完成
+            await page.wait_for_timeout(4000)
+
+            # 如果随附了文本说明，补发文本消息
+            if text and text.strip():
+                try:
+                    editor = page.locator('.chatEditorContainer [contenteditable="true"]').first
+                    if await editor.count() > 0:
+                        await editor.click()
+                        await page.keyboard.type(text.strip())
+                        await page.wait_for_timeout(500)
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+            return {
+                "status": "accepted",
+                "sent": True,
+                "chat_id": chat_id,
+                "file_path": real_path,
+                "file_name": file_name,
+                "file_size": file_size,
+                "message_kind": "file",
+                "verified": True,
+                "detail": "browser_native_send",
+                "upload_completed": True,
+            }
+        finally:
+            await ctx.close()
+

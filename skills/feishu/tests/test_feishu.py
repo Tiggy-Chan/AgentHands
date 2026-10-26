@@ -1886,6 +1886,76 @@ class TestSendGate(unittest.TestCase):
                 else:
                     os.environ[key] = old
 
+    def test_file_send_with_text_compound(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from _feishu import send
+
+        old_allow = os.environ.get("FEISHU_ALLOW_SEND")
+        old_write = os.environ.get("FEISHU_ALLOW_WRITE")
+        os.environ["FEISHU_ALLOW_SEND"] = "1"
+        os.environ["FEISHU_ALLOW_WRITE"] = "1"
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "report.pdf"
+                path.write_bytes(b"%PDF-test")
+                with patch.object(send.auth, "prepare", new=AsyncMock(return_value={
+                    "user_id": "me", "name": "我",
+                })), patch.object(send.auth, "load_cookies", return_value={
+                    "cookies": {}, "domain": "tenant.feishu.cn",
+                }), patch.object(send.auth, "cookie_header", return_value="cookie"), \
+                        patch.object(send.transport, "bind_session"), \
+                        patch.object(send.transport, "arm_direct_send_once"), \
+                        patch("lark_bridge.drive.upload_file", new=AsyncMock(return_value={
+                            "file_key": "boxcn1234567890",
+                            "file_token": "boxcn1234567890",
+                        })), \
+                        patch.object(send.sender, "send_message_result", new=AsyncMock(return_value={
+                            "status": "accepted", "sent": True, "server_msg_id": "msg_text_1",
+                        })) as text_sender, \
+                        patch.object(send.sender, "send_file_message_result", new=AsyncMock(return_value={
+                            "status": "accepted", "sent": True, "server_msg_id": "msg_file_2",
+                        })) as file_sender:
+                    result = await send.send("c1", text="这是报告说明", file_path=str(path), direct=True)
+                self.assertEqual(result["message_kind"], "file+text")
+                self.assertTrue(result["sent"])
+                self.assertTrue(result["text_sent"])
+                self.assertTrue(result["file_sent"])
+                self.assertEqual(result["text_msg_id"], "msg_text_1")
+                self.assertEqual(result["file_msg_id"], "msg_file_2")
+                self.assertEqual(text_sender.await_count, 1)
+                self.assertEqual(file_sender.await_count, 1)
+                self.assertEqual(file_sender.await_args.args[2], "boxcn1234567890")
+        try:
+            asyncio.run(check())
+        finally:
+            for key, old in (("FEISHU_ALLOW_SEND", old_allow), ("FEISHU_ALLOW_WRITE", old_write)):
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
+
+    def test_sender_build_file_request_types(self):
+        from lark_bridge import sender
+        from lark_bridge.proto import proto_pb2 as pb
+        # Native key -> type 3 (FILE)
+        p3, _ = sender._build_file_request("file_v3_12345", "test.pdf", "application/pdf", 100, "chat1")
+        req3 = pb.PutMessageRequest()
+        req3.ParseFromString(p3)
+        self.assertEqual(req3.type, 3)
+        self.assertEqual(req3.content.fileKey, "file_v3_12345")
+        self.assertEqual(req3.content.fileMime, "application/pdf")
+
+        # Drive token -> type 13 (CLOUD_FILE)
+        p13, _ = sender._build_file_request("boxcn67890", "report.pdf", "application/pdf", 200, "chat2")
+        req13 = pb.PutMessageRequest()
+        req13.ParseFromString(p13)
+        self.assertEqual(req13.type, 13)
+        self.assertEqual(req13.content.fileKey, "boxcn67890")
+        self.assertEqual(req13.content.fileMime, "application/pdf")
+
     def test_send_without_confirm_blocked(self):
         import asyncio
         from _feishu.errors import SendBlocked
