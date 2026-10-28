@@ -104,6 +104,11 @@ DAEMON_PID = HOME / "daemon.pid"
 DAEMON_LOCK = HOME / "daemon.lock"
 DAEMON_LOG = HOME / "daemon.log"
 DAEMON_STATE = HOME / "daemon.state.json"
+AGENT_DIR = HOME / "agent"
+AGENT_RULES_FILE = HOME / "agent_rules.json"
+AGENT_SESSIONS_DIR = HOME / "agent_sessions"
+AGENT_STATE_FILE = HOME / "agent_state.json"
+AGENT_LOCK = HOME / "agent.lock"
 DOCS_DIR = HOME / "docs"               # exported document cache
 DOCS_INDEX = HOME / "docs-index.jsonl"
 CACHE_DIR = HOME / "cache"
@@ -128,3 +133,4 @@ def ensure_home() -> None:
     os.chmod(HOME, 0o700)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    AGENT_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)

@@ -65,6 +65,7 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `calendar sync` | gateway 全量/增量同步事件（含 event_uuid 和服务端 id，删除前用它拿 uuid） |
 | `events status\|migrate\|purge` | 查看存储，迁移旧事件，显式可恢复清理 |
 | `send --chat-id … [--text-file …] [--file …] [--sticker-from-message …] [--sticker-set-id … --sticker-id …]` | **默认只产草稿**；支持文本，原生 type=3 文件和原生 type=10 sticker。常规真发见〈发送是双重闸门〉，用户明确要求免确认测试时可加 `--direct`；文件上传和发送必须作为同一次受控操作，协议未适配时失败关闭 |
+| `agent status\|rules\|process\|watch` | **Command Agent 网关**：规则过滤（放行/静默群、敏感话题防火墙）、两阶段指令（裸@出零Token菜单引导，指令`/qa`/`/diag`/`/doc`/`/reset`/`/help`/`/sponsor`）、Session 会话隔离与防滥用频控 |
 
 时间参数统一：`30m`/`2h`/`7d` 表示过去，`+7d` 表示未来，另支持 ISO 日期和 epoch 秒/毫秒。
 
@@ -104,6 +105,26 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 
 远程搜索当前通过受控 Browser Worker 读取“云文档”结果卡片；可用的离线路径是：
 `feishu.py doc --walk` 建本地索引（标题/路径级）→ `feishu.py docs-search XX --local`。导出过的文档正文也在缓存里能被搜到。别把消息搜索当文档搜索用。
+
+### 「Command Agent 飞书指令网关与端到端助手」
+
+当同事在群聊或私聊 @本人 时，由网关承接两阶段交互与防滥用管控：
+1. **阶段一（零 Token 引导菜单）**：如果对方仅艾特未带任何具体指令，系统直接从本地秒回指令卡片与规则说明，**不消耗任何大模型 Token**，挡掉无意义闲聊与催促；
+2. **阶段二（指令执行与 Session 隔离）**：
+   - `/qa <技术问题>`：分配并挂接独立的 Claude Session，基于本地源码与知识库回答硬核技术疑问；
+   - `/diag <IP或SN> [check|system]`：自动通过本地或网络调起对应体检脚本，输出结构化诊断报告；
+   - `/doc <关键词>`：检索在线技术排查手册与通信协议；
+   - `/reset`：清空当前会话上下文并分配全新 Claude Session；
+   - `/help` / `/sponsor`：查看使用说明、剩余额度与 Token 投喂指引。
+3. **安全与边界防护（Rules Engine）**：
+   - 群聊过滤（`allowed_chats` / `blocked_chats`）：大群/通知群绝对静默；
+   - 敏感管理话题防火墙（`blocked_topics`）：考勤、排期、请假、评价等管理事项自动边界拦截拒答；
+   - 额度与频控（`rate_limit`）：单人 30s 冷却，每日免费限额，超限提示赞助/投喂。
+4. **常用命令**：
+   - `feishu.py agent status`：查看网关状态、活跃会话与规则概要；
+   - `feishu.py agent rules [--json-output/--set-enabled/...]`：查看与热更新规则；
+   - `feishu.py agent process <msg_id> [--send]`：单次测试或重放一条消息事件；
+   - `feishu.py agent watch [--once] [--send]`：常驻或单次监听事件池实时分发处理。
 
 ## 登录与凭证
 

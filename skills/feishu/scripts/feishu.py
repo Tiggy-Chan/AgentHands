@@ -296,6 +296,22 @@ def build_parser() -> argparse.ArgumentParser:
     q = cal_sub.add_parser("sync", help="gateway 增量同步日历事件（含 event_uuid）")
     q.add_argument("--calendar-id", default="", help="目标日历 id（或设 FEISHU_CALENDAR_ID）")
     q.add_argument("--since-micros", type=int, default=0, help="增量起点（微秒）；0=全量")
+
+    p = sub.add_parser("agent", help="Command Agent 网关（规则过滤、两阶段指令、Session 隔离）")
+    agent_sub = p.add_subparsers(dest="agent_action", required=True)
+    q = agent_sub.add_parser("status", help="查看 Agent 配置、会话统计与状态")
+    q = agent_sub.add_parser("rules", help="查看或更新 Agent 规则与群组白名单")
+    q.add_argument("--json-output", action="store_true", help="以 JSON 格式输出")
+    q.add_argument("--set-enabled", choices=["true", "false"], help="设置 Agent 总开关")
+    q.add_argument("--add-allowed-chat", help="添加放行群聊（ID 或通配符）")
+    q.add_argument("--add-blocked-chat", help="添加屏蔽群聊（ID 或通配符）")
+    q = agent_sub.add_parser("process", help="单次处理一条消息事件（用于联调与测试）")
+    q.add_argument("msg_id", help="要处理的消息 ID")
+    q.add_argument("--send", action="store_true", help="允许真正将生成的回复发送出去（需 FEISHU_ALLOW_SEND=1）")
+    q = agent_sub.add_parser("watch", help="监听事件池实时处理 @me 与 P2P 指令")
+    q.add_argument("--once", action="store_true", help="仅单次轮询后退出")
+    q.add_argument("--poll-interval", type=float, default=2.0, help="轮询间隔（秒）")
+    q.add_argument("--send", action="store_true", help="允许真正将生成的回复发送出去（需 FEISHU_ALLOW_SEND=1）")
     return ap
 
 
@@ -548,6 +564,63 @@ async def _run(args) -> int:
             my_id=me.get("user_id", ""), my_name=me.get("name", ""))
         emit_json(result)
         return 0
+
+    if args.cmd == "agent":
+        from _feishu import agent_dispatcher, agent_rules, agent_worker
+        if args.agent_action == "status":
+            st = agent_worker.get_agent_status()
+            if fmt == "json":
+                emit_json(st)
+            else:
+                emit("Command Agent 网关状态：")
+                emit(f"- 运行开关: {'开启' if st['enabled'] else '关闭'}")
+                emit(f"- 活跃会话数: {st['total_active_sessions']}")
+                emit(f"- 放行群聊: {', '.join(st['allowed_chats']) if st['allowed_chats'] else '所有群聊（排除屏蔽项）'}")
+                emit(f"- 屏蔽群聊: {', '.join(st['blocked_chats']) if st['blocked_chats'] else '无'}")
+                emit(f"- 敏感话题词数: {st['blocked_topics_count']}")
+                emit(f"- 单人每日上限: {st['max_daily_per_user']} 次 (冷却间隔 {st['cooldown_seconds']}s)")
+                emit(f"- 规则文件: {st['rules_file']}")
+            return 0
+        if args.agent_action == "rules":
+            rules = agent_rules.load_rules()
+            changed = False
+            if getattr(args, "set_enabled", None) is not None:
+                rules["enabled"] = (args.set_enabled == "true")
+                changed = True
+            if getattr(args, "add_allowed_chat", None):
+                rules.setdefault("allowed_chats", []).append(args.add_allowed_chat)
+                changed = True
+            if getattr(args, "add_blocked_chat", None):
+                rules.setdefault("blocked_chats", []).append(args.add_blocked_chat)
+                changed = True
+            if changed:
+                agent_rules.save_rules(rules)
+                note("✓ 已更新 Agent 规则配置")
+            if fmt == "json" or getattr(args, "json_output", False):
+                emit_json(rules)
+            else:
+                emit(json.dumps(rules, ensure_ascii=False, indent=2))
+            return 0
+        if args.agent_action == "process":
+            if getattr(args, "send", False):
+                await auth.prepare()
+            res = await agent_worker.process_msg_id(args.msg_id, send_reply=getattr(args, "send", False))
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"处理结果: status={res.get('status')} action={res.get('action')}")
+                if res.get("reply"):
+                    emit(f"\n回复内容:\n{res['reply']}")
+            return 0
+        if args.agent_action == "watch":
+            if getattr(args, "send", False):
+                await auth.prepare()
+            await agent_worker.watch_events_loop(
+                poll_interval=getattr(args, "poll_interval", 2.0),
+                once=getattr(args, "once", False),
+                send_reply=getattr(args, "send", False),
+            )
+            return 0
 
     # everything below needs a live session
     try:
