@@ -437,6 +437,35 @@ class TestDocumentWrites(unittest.TestCase):
                 "https://example.feishu.cn/wiki/WikiToken123", "/tmp/body.md", b"# body\n"
             )
 
+    def test_insert_file_draft_single_and_batch(self):
+        import tempfile
+        from pathlib import Path
+        from _feishu import documents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "f1.pdf"
+            p1.write_bytes(b"%PDF-1.4\n")
+            p2 = Path(tmp) / "f2.bin"
+            p2.write_bytes(b"\x00\x01\x02")
+
+            # Single file draft
+            draft_single = documents.make_doc_file_draft("DocTok1", str(p1), after_heading="标题")
+            self.assertEqual(draft_single["action"], "insert_file")
+            self.assertEqual(draft_single["file"]["file"], "f1.pdf")
+            self.assertEqual(len(draft_single["files"]), 1)
+            self.assertEqual(draft_single["after_heading"], "标题")
+            self.assertEqual(len(draft_single["fingerprint"]), 16)
+
+            # Batch file draft
+            draft_batch = documents.make_doc_file_draft("DocTok1", [str(p1), str(p2)], find="锚点", insert_before=True)
+            self.assertEqual(draft_batch["action"], "insert_file")
+            self.assertEqual(len(draft_batch["files"]), 2)
+            self.assertEqual(draft_batch["files"][0]["file"], "f1.pdf")
+            self.assertEqual(draft_batch["files"][1]["file"], "f2.bin")
+            self.assertEqual(draft_batch["find"], "锚点")
+            self.assertTrue(draft_batch["insert_before"])
+            self.assertEqual(len(draft_batch["fingerprint"]), 16)
+
 
 class TestQueryGuards(unittest.TestCase):
     def test_query_lock_rejects_second_process(self):

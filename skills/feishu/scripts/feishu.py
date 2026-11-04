@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", "--name", dest="title", default="", help="导入文档标题（默认取文件名）")
     p.add_argument("--urls", nargs="*", default=[], help="linkify：要插入为引用卡片的飞书文档 URL")
     p.add_argument("--images", nargs="*", default=[], help="insert-images/edit：要插入文档的本地图片（png/jpg/webp/gif/bmp）")
-    p.add_argument("--attach", default="", help="insert-file：要作为附件块插入文档的本地任意文件（随附件入云盘）")
+    p.add_argument("--attach", nargs="*", default=[], help="insert-file/edit：要作为附件块插入文档的本地文件列表（随附件入云盘）")
     p.add_argument("--find", default="", help="edit：锚点块文本（叶块归一化文本精确匹配，须全文唯一）")
     p.add_argument("--insert-after", action="store_true", help="edit：在锚点块之后插入内容")
     p.add_argument("--insert-before", action="store_true", help="edit：在锚点块之前插入内容")

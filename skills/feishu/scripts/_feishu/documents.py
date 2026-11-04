@@ -923,7 +923,9 @@ _FIND_LAST_EDITABLE_BLOCK_JS = """() => {
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
     const type = b.getAttribute('data-block-type') || '';
-    if (type === 'page' || type.includes('back_ref')) continue;
+    if (type === 'page' || type.includes('back_ref') || b.closest('[class*="back-ref"], [class*="back_ref"]')) continue;
+    const editable = b.querySelector('[contenteditable="true"]') || (b.getAttribute('contenteditable') === 'true' ? b : null);
+    if (!editable) continue;
     const r = b.getBoundingClientRect();
     if (r.width > 0 && r.height > 0 && b.offsetParent !== null) {
       return b.getAttribute('data-block-id');
@@ -1827,6 +1829,10 @@ async def _insert_images_impl(ref: str, payload_file: str) -> dict:
             diagnostics: list[dict] = []
             for index, image in enumerate(images):
                 name = image["name"]
+                # 连续插图脱困：若当前焦点仍在图片等不可编辑块上，先按 ArrowDown 离开
+                if not await page.evaluate(_IS_EDITABLE_FOCUSED_JS):
+                    await page.keyboard.press("ArrowDown")
+                    await page.wait_for_timeout(300)
                 snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
                 if not snapshot or not snapshot.get("id"):
                     raise FeishuError(
@@ -1883,6 +1889,13 @@ async def _insert_images_impl(ref: str, payload_file: str) -> dict:
                     note(f"insert-images: 第 {index + 1} 张已插入（{used_mode}）：{name}")
                     # 等上传与撤销栈稳定再插下一张
                     await page.wait_for_timeout(2_000)
+                    cur_snap = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                    cur_bid = cur_snap.get("id") if cur_snap else ""
+                    if cur_bid:
+                        res = await page.evaluate(_ENSURE_EDITABLE_AFTER_BLOCK_JS, cur_bid)
+                        if res != "next-focused":
+                            await page.keyboard.press("ArrowDown")
+                            await page.wait_for_timeout(300)
                     continue
                 diag = await page.evaluate("""() => {
                     const e = document.activeElement;
@@ -1976,6 +1989,7 @@ async def _insert_images_impl(ref: str, payload_file: str) -> dict:
 # ---------------------------------------------------------------------------
 
 MAX_INSERT_FILE_BYTES = 100 * 1024 * 1024
+MAX_INSERT_FILES = 20
 
 # 光标附近（文末挂载区）按文件名出现次数探测附件块是否生成
 _FILE_NAME_NEAR_COUNT_JS = """(name) => {
@@ -2017,35 +2031,69 @@ _FILE_NAME_BLOCKS_COUNT_JS = """async (name) => {
 }"""
 
 
-def make_doc_file_draft(ref: str, file_path: str, after_heading: str) -> dict:
-    """Draft for insert-file: 把本地文件作为附件块插入文档（文件随附件入云盘）。"""
+def make_doc_file_draft(
+    ref: str,
+    file_paths: list[str] | str,
+    after_heading: str = "",
+    find: str = "",
+    insert_before: bool = False,
+) -> dict:
+    """Draft for insert-file: 把本地文件（单个或批量）作为附件块插入文档（文件随附件入云盘）。"""
     kind, token = parse_doc_ref(ref)
-    digest = hashlib.sha256(open(file_path, "rb").read()).hexdigest()
-    return {
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    h = hashlib.sha256()
+    entries = []
+    for path in file_paths:
+        real = os.path.realpath(path)
+        with open(real, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        entries.append({"file": os.path.basename(real), "size": os.path.getsize(real), "sha256": digest})
+        h.update(digest.encode())
+    content_token = entries[0]["sha256"] if len(entries) == 1 else h.hexdigest()
+    res = {
         "action": "insert_file",
         "document_token": token,
-        "file": {"file": os.path.basename(file_path), "size": os.path.getsize(file_path), "sha256": digest},
+        "files": entries,
+        "file_count": len(entries),
         "after_heading": after_heading,
-        "fingerprint": doc_write_fingerprint("insert-file", token, digest),
+        "find": find,
+        "insert_before": insert_before,
+        "fingerprint": doc_write_fingerprint("insert-file", token, content_token),
     }
+    if len(entries) == 1:
+        res["file"] = entries[0]
+    return res
 
 
 async def insert_file(
     ref: str,
-    file_path: str,
+    file_path: str | list[str],
     after_heading: str = "",
+    find: str = "",
+    insert_before: bool = False,
     confirm: str = "",
     direct: bool = False,
 ) -> dict:
-    """把本地任意文件插入已有 docx 文档为附件块（after_heading 标题块之后，默认文末）。
+    """把本地任意文件（单文件或批量）插入已有 docx 文档为附件块。
+
+    支持插入位置：
+      - 默认：文档末尾
+      - after_heading: 位于指定文本的标题块之后
+      - find + insert_before / insert_after: 位于指定锚点块之前或之后
 
     机制同 insert-images：受限浏览器打开文档 → 定位插入点 → DataTransfer
-    合成粘贴（ClipboardItem 先行尝试）→ 飞书编辑器自动上传并生成附件块，
-    文件随之进入云盘。按文件名出现次数核对、失败回退、结束重载复核。
+    合成粘贴（ClipboardItem 先行尝试）逐个上传附件 → 文件随之进入云盘。
+    按文件名出现次数核对、失败回退、结束重载复核。
     """
-    file_path = str(file_path or "").strip()
-    if not file_path:
+    if isinstance(file_path, str):
+        raw_paths = [file_path.strip()] if file_path.strip() else []
+    else:
+        raw_paths = [str(p).strip() for p in file_path if p and str(p).strip()]
+    if not raw_paths:
         raise FeishuError("insert-file 需要 --attach 指定本地文件")
+    if len(raw_paths) > MAX_INSERT_FILES:
+        raise FeishuError(f"insert-file 一次最多 {MAX_INSERT_FILES} 个文件（当前 {len(raw_paths)} 个）")
     kind, _token = parse_doc_ref(ref)
     if kind != "docx":
         raise FeishuError("插入附件目前只支持 docx 文档")
@@ -2053,23 +2101,35 @@ async def insert_file(
     import base64 as _b64
     import mimetypes as _mimetypes
 
-    real = os.path.realpath(file_path)
-    if not os.path.isfile(real):
-        raise FeishuError(f"文件不存在：{file_path}")
-    size = os.path.getsize(real)
-    if size > MAX_INSERT_FILE_BYTES:
-        raise FeishuError(f"文件超过 100MB 上限：{file_path}")
-    mime = _mimetypes.guess_type(real)[0] or "application/octet-stream"
-    with open(real, "rb") as f:
-        b64 = _b64.b64encode(f.read()).decode("ascii")
-    if len(b64) > config.MAX_DOC_WRITE_BYTES:
-        raise FeishuError(
-            f"文件体积超过上限（base64 后 {len(b64)} bytes）",
-            hint=f"当前上限为 {config.MAX_DOC_WRITE_BYTES} bytes",
-        )
-    name = os.path.basename(real)
+    payload_files = []
+    total_b64 = 0
+    total_bytes = 0
+    for path in raw_paths:
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            raise FeishuError(f"文件不存在：{path}")
+        size = os.path.getsize(real)
+        if size > MAX_INSERT_FILE_BYTES:
+            raise FeishuError(f"文件超过 100MB 上限：{path} ({size} bytes)")
+        mime = _mimetypes.guess_type(real)[0] or "application/octet-stream"
+        with open(real, "rb") as f:
+            b64 = _b64.b64encode(f.read()).decode("ascii")
+        total_b64 += len(b64)
+        total_bytes += size
+        payload_files.append({
+            "name": os.path.basename(real),
+            "mime": mime,
+            "b64": b64,
+            "size": size,
+        })
 
-    draft = make_doc_file_draft(ref, real, after_heading)
+    if total_b64 > config.MAX_DOC_WRITE_BYTES:
+        raise FeishuError(
+            f"文件总体积超过写入上限（base64 后 {total_b64} bytes）",
+            hint=f"当前上限为 {config.MAX_DOC_WRITE_BYTES} bytes，请分批插入",
+        )
+
+    draft = make_doc_file_draft(ref, raw_paths, after_heading=after_heading, find=find, insert_before=insert_before)
     if direct:
         note("直接写入模式：本次插入附件已明确授权。")
     elif not confirm:
@@ -2088,8 +2148,14 @@ async def insert_file(
 
     await auth.prepare()
     payload = json.dumps(
-        {"ref": ref, "after_heading": after_heading,
-         "file": {"name": name, "mime": mime, "b64": b64}},
+        {
+            "ref": ref,
+            "after_heading": after_heading,
+            "find": find,
+            "insert_before": insert_before,
+            "files": payload_files,
+            "file": payload_files[0] if payload_files else {},
+        },
         ensure_ascii=False,
     ).encode("utf-8")
 
@@ -2103,11 +2169,11 @@ async def insert_file(
             os.fsync(temporary.fileno())
         from .browser_worker import run
 
-        size_mb = max(1, size // (1024 * 1024))
+        size_mb = max(1, total_bytes // (1024 * 1024))
         result = await run(
             "doc-insert-file",
             {"ref": ref, "payload_file": temporary_name},
-            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 120 + 30 * size_mb),
+            timeout=max(config.BROWSER_TIMEOUT_SECONDS, 120 + 30 * size_mb + 15 * len(payload_files)),
         )
     finally:
         try:
@@ -2116,12 +2182,66 @@ async def insert_file(
             pass
 
     inserted = result.get("inserted") or []
-    result["verified"] = bool(inserted) and bool(result.get("reload_verified"))
+    result["verified"] = bool(inserted) and (len(result.get("reload_verified") or []) == len(inserted))
     return result
 
 
+async def _paste_file_at_cursor(page, file_info: dict, diag: dict | None = None) -> bool:
+    """在当前光标处粘贴一个附件（clipboard → datatransfer），返回是否被编辑器接收并完成上传。"""
+    name = file_info["name"]
+    before = await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name)
+    size_mb = max(1, len(file_info["b64"]) * 3 // 4 // (1024 * 1024))
+    deadline_polls = 60 + 20 * size_mb
+    if diag is not None:
+        diag.update({"file": name, "before_count": before, "attempts": []})
+
+    for mode in ("clipboard", "datatransfer"):
+        sent = False
+        exc_info = ""
+        if mode == "clipboard":
+            try:
+                await page.evaluate("() => { const e = document.activeElement; if (e && e.focus) e.focus(); }")
+                await page.evaluate(_IMG_CLIPBOARD_WRITE_JS, [file_info["b64"], file_info["mime"]])
+                await page.keyboard.press("Control+v")
+                sent = True
+            except Exception as exc:
+                exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+        elif mode == "datatransfer":
+            try:
+                await page.evaluate(_IMG_DATATRANSFER_PASTE_JS, [file_info["b64"], file_info["mime"], name])
+                sent = True
+            except Exception as exc:
+                exc_info = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        if sent:
+            ok = False
+            for _ in range(deadline_polls):
+                await page.wait_for_timeout(500)
+                if await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name) > before:
+                    ok = True
+                    break
+            if ok:
+                for _ in range(40):
+                    await page.wait_for_timeout(500)
+                    if not await page.evaluate(_IMG_UPLOAD_BUSY_JS):
+                        break
+                await page.wait_for_timeout(1_000)
+                if diag is not None:
+                    diag["attempts"].append({"mode": mode, "status": "accepted"})
+                return True
+            note(f"paste_file: {mode} 方式未被接收，换下一种方式")
+            await page.keyboard.press("Control+z")
+            await page.wait_for_timeout(300)
+            if diag is not None:
+                diag["attempts"].append({"mode": mode, "status": "timeout"})
+        else:
+            if diag is not None:
+                diag["attempts"].append({"mode": mode, "status": "failed_to_send", "error": exc_info})
+    return False
+
+
 async def _insert_file_impl(ref: str, payload_file: str) -> dict:
-    """Browser Worker implementation: 把单个文件粘贴为文档附件块。"""
+    """Browser Worker implementation: 把文件（单个或批量）粘贴为文档附件块。"""
     if os.environ.get("FEISHU_BROWSER_WORKER") != "1":
         raise ResourceIsolationUnavailable("插入附件只能由受限 Browser Worker 执行")
     payload_path = os.path.realpath(payload_file)
@@ -2130,10 +2250,16 @@ async def _insert_file_impl(ref: str, payload_file: str) -> dict:
         raise FeishuError("Browser Worker 拒绝读取 FEISHU_HOME 之外的写入文件")
     try:
         payload = json.loads(_read_doc_write_file(payload_path).decode("utf-8"))
-        file_info = payload["file"]
+        files = payload.get("files")
+        if not files and "file" in payload and payload["file"]:
+            files = [payload["file"]]
         after_heading = str(payload.get("after_heading") or "")
+        find_anchor = str(payload.get("find") or "")
+        insert_before = bool(payload.get("insert_before"))
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise FeishuError("insert-file payload 必须是 JSON（含 file/after_heading）") from exc
+        raise FeishuError("insert-file payload 必须是 JSON（含 files/after_heading）") from exc
+    if not files:
+        raise FeishuError("insert-file 需要至少一个文件")
 
     try:
         from playwright.async_api import async_playwright
@@ -2147,7 +2273,6 @@ async def _insert_file_impl(ref: str, payload_file: str) -> dict:
         raise FeishuError("插入附件目前只支持 docx 文档")
     url = f"https://{domain}/docx/{token}"
 
-    name = file_info["name"]
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE),
@@ -2169,13 +2294,38 @@ async def _insert_file_impl(ref: str, payload_file: str) -> dict:
             if not await editor.count():
                 raise FeishuError("文档编辑器未渲染", hint="飞书网页结构可能已变化")
 
-            # 基线：全文（滚动收集）已含该文件名的块数，正常应为 0
-            baseline_count = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, name)
+            # 基线：全文（滚动收集）已含各文件名的块数
+            baseline_counts = {}
+            for f in files:
+                fname = f["name"]
+                if fname not in baseline_counts:
+                    baseline_counts[fname] = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, fname)
 
-            # 定位插入点（与 insert-images 同一套：禁 Ctrl+End，先滚底强制渲染）
+            # 定位插入点
             await page.evaluate(_SCROLL_BOTTOM_JS)
             await page.wait_for_timeout(800)
-            if after_heading:
+            if find_anchor:
+                target_id = await _locate_unique_block(page, find_anchor, kind_hint="锚点块")
+                if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
+                    raise FeishuError(f"锚点块 {target_id} 滚动后仍未渲染，无法定位插入点")
+                target = page.locator(f"[data-block-id='{target_id}']")
+                await target.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                if insert_before:
+                    if await page.evaluate(_FOCUS_BLOCK_START_JS, target_id) != "ok":
+                        raise FeishuError("无法在目标块开头建立文本光标")
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("ArrowUp")
+                    await page.wait_for_timeout(300)
+                else:
+                    if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
+                        raise FeishuError("无法在目标块末尾建立文本光标")
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(300)
+            elif after_heading:
                 needle = re.sub(r"\s+", " ", after_heading).strip()
                 matches = await page.evaluate(_COLLECT_HEADING_MATCHES_JS, needle)
                 if not matches:
@@ -2189,159 +2339,146 @@ async def _insert_file_impl(ref: str, payload_file: str) -> dict:
                         hint="换一个全文唯一的标题文本",
                     )
                 target_id = matches[0]
+                if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
+                    raise FeishuError(f"目标块 {target_id} 滚动后仍未渲染，无法定位插入点")
+                target = page.locator(f"[data-block-id='{target_id}']")
+                await target.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
+                    raise FeishuError("无法在目标块内建立文本光标（块类型不支持？）")
+                await page.wait_for_timeout(200)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
             else:
                 target_id = await page.evaluate(_FIND_LAST_EDITABLE_BLOCK_JS)
                 if not target_id:
                     raise FeishuError("找不到可编辑的文档末尾块")
-            if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
-                raise FeishuError(f"目标块 {target_id} 滚动后仍未渲染，无法定位插入点")
-            target = page.locator(f"[data-block-id='{target_id}']")
-            await target.scroll_into_view_if_needed()
-            await page.wait_for_timeout(500)
-            if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
-                raise FeishuError("无法在目标块内建立文本光标（块类型不支持？）")
-            await page.wait_for_timeout(200)
+                if not await page.evaluate(_SCROLL_TO_BLOCK_JS, target_id):
+                    raise FeishuError(f"目标块 {target_id} 滚动后仍未渲染，无法定位插入点")
+                target = page.locator(f"[data-block-id='{target_id}']")
+                await target.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                if await page.evaluate(_FOCUS_BLOCK_END_JS, target_id) != "ok":
+                    raise FeishuError("无法在目标块内建立文本光标（块类型不支持？）")
+                await page.wait_for_timeout(200)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(300)
 
             inserted: list[str] = []
             failed: list[str] = []
             diagnostics: list[dict] = []
+            rollback_unconfirmed = None
 
-            snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
-            if not snapshot or not snapshot.get("id"):
-                raise FeishuError(
-                    "无法确定光标所在的文档块，中止插入附件",
-                    hint="此时文档尚未被本次操作修改；请人工打开文档确认后重试",
-                )
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(300)
-            before_names = await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name)
-            size_mb = max(1, len(file_info["b64"]) * 3 // 4 // (1024 * 1024))
-            deadline_polls = 60 + 20 * size_mb
-
-            async def _try_paste(mode: str) -> str:
-                if mode == "clipboard":
-                    try:
-                        await page.evaluate("() => { const e = document.activeElement; if (e && e.focus) e.focus(); }")
-                        await page.evaluate(_IMG_CLIPBOARD_WRITE_JS, [file_info["b64"], file_info["mime"]])
-                        await page.keyboard.press("Control+v")
-                        return "clipboard"
-                    except Exception as exc:
-                        note(f"insert-file: clipboard 方式发出失败（{type(exc).__name__}: {exc}）")
-                        return ""
-                try:
-                    await page.evaluate(_IMG_DATATRANSFER_PASTE_JS,
-                                        [file_info["b64"], file_info["mime"], name])
-                    return "datatransfer"
-                except Exception as exc:
-                    note(f"insert-file: datatransfer 方式发出失败（{type(exc).__name__}: {exc}）")
-                    return ""
-
-            ok = False
-            used_mode = ""
-            for mode in ("clipboard", "datatransfer"):
-                used_mode = await _try_paste(mode)
-                if not used_mode:
-                    continue
-                for _ in range(deadline_polls):
-                    await page.wait_for_timeout(500)
-                    if await page.evaluate(_FILE_NAME_NEAR_COUNT_JS, name) > before_names:
-                        ok = True
-                        break
-                if ok:
-                    break
-                note(f"insert-file: {used_mode} 方式 {deadline_polls // 2}s 内未被接收，换下一种方式")
-                await page.keyboard.press("Control+z")
-                await page.wait_for_timeout(300)
-
-            if ok:
-                inserted.append(name)
-                note(f"insert-file: 附件已插入（{used_mode}）：{name}")
-                # 等上传完成（busy 指示消失）再收尾
-                for _ in range(40):
-                    await page.wait_for_timeout(500)
-                    if not await page.evaluate(_IMG_UPLOAD_BUSY_JS):
-                        break
-                await page.wait_for_timeout(2_000)
-            else:
-                diag = await page.evaluate("""() => {
-                    const e = document.activeElement;
-                    const popups = [...document.querySelectorAll('[class*=paste], [class*=modal], [class*=dialog], [class*=upload]')]
-                        .filter(x => x.offsetWidth > 0)
-                        .map(x => (x.className || '').slice(0, 60) + ':' + (x.innerText || '').slice(0, 40));
-                    return {
-                        activeElement: e ? e.tagName + '.' + (e.className || '') : 'none',
-                        popups,
-                    };
-                }""")
-                shot = config.HOME / f"debug-insert-file-{int(__import__('time').time())}.png"
-                try:
-                    await page.screenshot(path=str(shot), full_page=False)
-                    diag["screenshot"] = str(shot)
-                except Exception:
-                    pass
-                diagnostics.append(diag)
-                failed.append(name)
-                note(f"insert-file: 附件未被编辑器接收，执行回退：{name}")
-                await page.keyboard.press("Control+z")
-                await page.wait_for_timeout(400)
-                cur = await page.evaluate(_BLOCK_SNAPSHOT_JS)
-                cur_id = cur.get("id") if cur else ""
-                orig_id = snapshot.get("id") or ""
-                next_id = snapshot.get("next_id") or ""
-                if cur and cur_id and cur_id != orig_id and cur_id != next_id:
-                    if cur.get("text"):
-                        await page.keyboard.press("Home")
-                        await page.keyboard.press("Shift+End")
-                        await page.keyboard.press("Delete")
-                        await page.wait_for_timeout(200)
-                    await page.keyboard.press("Backspace")
+            for index, file_info in enumerate(files):
+                name = file_info["name"]
+                if not await page.evaluate(_IS_EDITABLE_FOCUSED_JS):
+                    await page.keyboard.press("ArrowDown")
                     await page.wait_for_timeout(300)
-                after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, snapshot["id"])
-                rollback_ok = (
-                    after is not None
-                    and after["text"] == snapshot["text"]
-                    and after["next_id"] == snapshot["next_id"]
-                    and after["next_text"] == snapshot["next_text"]
-                )
-                if not rollback_ok:
-                    return {
-                        "status": "failed",
-                        "url": url,
-                        "inserted": inserted,
-                        "failed": failed,
-                        "rollback_unconfirmed": {
+
+                if index > 0:
+                    snapshot_pre = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                    if snapshot_pre and snapshot_pre.get("id"):
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(300)
+
+                snapshot = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                if not snapshot or not snapshot.get("id"):
+                    raise FeishuError(
+                        "无法确定光标所在的文档块，中止插入附件",
+                        hint="此时文档尚未被本次操作修改；请人工打开文档确认后重试",
+                    )
+
+                diag: dict = {}
+                if await _paste_file_at_cursor(page, file_info, diag):
+                    inserted.append(name)
+                    note(f"insert-file: 第 {index + 1}/{len(files)} 个附件已插入：{name}")
+                    cur_snap = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                    cur_bid = cur_snap.get("id") if cur_snap else ""
+                    if cur_bid:
+                        res = await page.evaluate(_ENSURE_EDITABLE_AFTER_BLOCK_JS, cur_bid)
+                        if res != "next-focused":
+                            await page.keyboard.press("ArrowDown")
+                            await page.wait_for_timeout(300)
+                else:
+                    diag_snap = await page.evaluate("""() => {
+                        const e = document.activeElement;
+                        const popups = [...document.querySelectorAll('[class*=paste], [class*=modal], [class*=dialog], [class*=upload]')]
+                            .filter(x => x.offsetWidth > 0)
+                            .map(x => (x.className || '').slice(0, 60) + ':' + (x.innerText || '').slice(0, 40));
+                        return {
+                            activeElement: e ? e.tagName + '.' + (e.className || '') : 'none',
+                            popups,
+                        };
+                    }""")
+                    shot = config.HOME / f"debug-insert-file-{int(__import__('time').time())}.png"
+                    try:
+                        await page.screenshot(path=str(shot), full_page=False)
+                        diag_snap["screenshot"] = str(shot)
+                    except Exception:
+                        pass
+                    diag["diagnostics"] = diag_snap
+                    diagnostics.append(diag)
+                    failed.append(name)
+                    note(f"insert-file: 附件未被编辑器接收，执行回退：{name}")
+                    await page.keyboard.press("Control+z")
+                    await page.wait_for_timeout(400)
+                    cur = await page.evaluate(_BLOCK_SNAPSHOT_JS)
+                    cur_id = cur.get("id") if cur else ""
+                    orig_id = snapshot.get("id") or ""
+                    next_id = snapshot.get("next_id") or ""
+                    if cur and cur_id and cur_id != orig_id and cur_id != next_id:
+                        if cur.get("text"):
+                            await page.keyboard.press("Home")
+                            await page.keyboard.press("Shift+End")
+                            await page.keyboard.press("Delete")
+                            await page.wait_for_timeout(200)
+                        await page.keyboard.press("Backspace")
+                        await page.wait_for_timeout(300)
+                    after = await page.evaluate(_BLOCK_STATE_BY_ID_JS, snapshot["id"])
+                    rollback_ok = (
+                        after is not None
+                        and after["text"] == snapshot["text"]
+                        and after["next_id"] == snapshot["next_id"]
+                        and after["next_text"] == snapshot["next_text"]
+                    )
+                    if not rollback_ok:
+                        rollback_unconfirmed = {
                             "file": name,
                             "block_id": snapshot["id"],
                             "expected": snapshot,
                             "actual": after,
                             "note": "回退未能确认恢复原样，需人工检查该块及其前后内容",
-                        },
-                    }
+                        }
+                        break
             await page.wait_for_timeout(1_500)
 
-            # 复核：重载页面滚动全文按文件名计数，应不少于 基线 + 1
+            # 复核：重载页面滚动全文按文件名计数
             reload_verified: list[str] = []
             if inserted:
                 await page.reload(wait_until="load", timeout=30_000)
                 await auth.raise_if_login_redirect(page)
                 await page.wait_for_timeout(2_000)
-                after_count = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, name)
-                if after_count >= baseline_count + len(inserted):
-                    reload_verified = list(inserted)
-                else:
-                    note(f"insert-file: 重载复核文件名块数不足（基线 {baseline_count}，"
-                         f"现 {after_count}，预期 +{len(inserted)}）")
+                for name in inserted:
+                    after_count = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, name)
+                    if after_count > baseline_counts.get(name, 0):
+                        reload_verified.append(name)
+                    else:
+                        note(f"insert-file: 重载复核文件名块数不足：{name}（基线 {baseline_counts.get(name, 0)}，现 {after_count}）")
 
-            status = "inserted" if inserted and not failed else ("partial" if inserted else "failed")
-            return {
+            status = "inserted" if (len(inserted) == len(files) and not failed) else ("partial" if inserted else "failed")
+            res_dict = {
                 "status": status,
                 "url": url,
                 "inserted": inserted,
                 "failed": failed,
                 "reload_verified": reload_verified,
                 "after_heading": after_heading,
+                "find": find_anchor,
                 "diagnostics": diagnostics,
             }
+            if rollback_unconfirmed:
+                res_dict["rollback_unconfirmed"] = rollback_unconfirmed
+            return res_dict
         finally:
             await ctx.close()
 
@@ -2414,6 +2551,35 @@ _FOCUS_BLOCK_START_JS = """(bid) => {
   const el = node && (node.nodeType === 1 ? node : node.parentElement);
   const ok = !!(el && el.closest && el.closest('[contenteditable="true"]'));
   return ok ? 'ok' : 'no-editable';
+}"""
+
+# 探测当前选区是否已在可编辑区域内
+_IS_EDITABLE_FOCUSED_JS = """() => {
+  const sel = window.getSelection();
+  const el = sel && sel.anchorNode ? (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement) : null;
+  return !!(el && el.closest && el.closest('[contenteditable="true"]'));
+}"""
+
+# 脱困辅助：若指定块后已有可编辑文本块则精确聚焦到其开头，否则返回需按 ArrowDown
+_ENSURE_EDITABLE_AFTER_BLOCK_JS = """(bid) => {
+  const block = document.querySelector('[data-block-id="' + bid + '"]');
+  if (!block) return 'missing';
+  let nxt = block.nextElementSibling;
+  while (nxt && !nxt.getAttribute('data-block-id')) nxt = nxt.nextElementSibling;
+  if (nxt) {
+    const editable = nxt.querySelector('[contenteditable="true"]') || nxt;
+    if (editable && (editable.isContentEditable || editable.getAttribute('contenteditable') === 'true')) {
+      editable.focus();
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      range.collapse(true);
+      sel.addRange(range);
+      return 'next-focused';
+    }
+  }
+  return 'need-arrow-down';
 }"""
 
 # 选中目标块可编辑区的全部内容（replace-block 用）
@@ -2598,13 +2764,14 @@ async def edit_block(
     text: str = "",
     text_file: str = "",
     images: list[str] | None = None,
+    attach: list[str] | None = None,
     confirm: str = "",
     direct: bool = False,
 ) -> dict:
     """在已有 docx 文档上做块级外科编辑（不全文替换）。
 
     op:
-      insert-after  在锚点块之后插入内容（--text/--text-file 富文本，或 --images 图片）
+      insert-after  在锚点块之后插入内容（--text/--text-file 富文本，--images 图片，或 --attach 附件）
       insert-before 在锚点块之前插入内容（同上；实现在锚点块首造空段后粘贴）
       replace       替换锚点块的正文内容（纯文本/富文本，限单个文本块）
       delete        删除锚点块（限文本块）
@@ -2623,9 +2790,31 @@ async def edit_block(
 
     markdown_text, html_body, plain_text = "", "", ""
     payload_images: list[dict] = []
+    payload_files: list[dict] = []
     content_desc = "(无)"
     if op in ("insert-after", "insert-before", "replace"):
-        if images:
+        if attach:
+            if op == "replace":
+                raise FeishuError("replace 暂不支持附件内容（请先 delete 再 insert-after）")
+            if len(attach) > MAX_INSERT_FILES:
+                raise FeishuError(f"一次最多 {MAX_INSERT_FILES} 个附件")
+            import mimetypes as _mimetypes
+            total_b64 = 0
+            for path in attach:
+                real = os.path.realpath(path)
+                if not os.path.isfile(real):
+                    raise FeishuError(f"附件不存在：{path}")
+                if os.path.getsize(real) > MAX_INSERT_FILE_BYTES:
+                    raise FeishuError(f"单文件超过 100MB 上限：{path}")
+                mime = _mimetypes.guess_type(real)[0] or "application/octet-stream"
+                with open(real, "rb") as f:
+                    b64 = _b64.b64encode(f.read()).decode("ascii")
+                total_b64 += len(b64)
+                payload_files.append({"name": os.path.basename(real), "mime": mime, "b64": b64, "size": os.path.getsize(real)})
+            if total_b64 > config.MAX_DOC_WRITE_BYTES:
+                raise FeishuError(f"附件总体积超过上限（base64 后 {total_b64} bytes）")
+            content_desc = f"{len(payload_files)} 个附件"
+        elif images:
             if len(images) > MAX_INSERT_IMAGES:
                 raise FeishuError(f"一次最多 {MAX_INSERT_IMAGES} 张图片")
             total_b64 = 0
@@ -2652,15 +2841,15 @@ async def edit_block(
             else:
                 markdown_text = text
             if not markdown_text.strip():
-                raise FeishuError(f"{op} 需要 --text/--text-file 或 --images 提供内容")
+                raise FeishuError(f"{op} 需要 --text/--text-file、--images 或 --attach 提供内容")
             html_body, plain_text = md_html.markdown_to_html(markdown_text)
             html_body = md_html.wrap_clipboard_html(html_body)
             content_desc = f"文本 {len(markdown_text)} 字符"
-    elif text or text_file or images:
+    elif text or text_file or images or attach:
         raise FeishuError(f"{op} 不接受内容参数")
 
     content_sha = hashlib.sha256(
-        (markdown_text + "|" + ",".join(i["name"] for i in payload_images)).encode()
+        (markdown_text + "|" + ",".join(i["name"] for i in payload_images) + "|" + ",".join(f["name"] for f in payload_files)).encode()
     ).hexdigest()
     draft = make_doc_edit_draft(ref, op, find, content_desc, content_sha)
     if direct:
@@ -2689,6 +2878,7 @@ async def edit_block(
             "html": html_body,
             "plain": plain_text,
             "images": payload_images,
+            "files": payload_files,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -2734,6 +2924,7 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
         html_body = str(payload.get("html") or "")
         plain_text = str(payload.get("plain") or "")
         images = payload.get("images") or []
+        files = payload.get("files") or []
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise FeishuError("block-edit payload 必须是 JSON（含 op/anchor/...）") from exc
 
@@ -2752,7 +2943,19 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
     # 核验针用渲染后首个非空块的纯文本，防止首行（如标题）不足 40 字时跨段导致单块匹配必败
     _first_lines = [l.strip() for l in (plain_text or markdown_text).splitlines() if l.strip()]
     _first_probe = _first_lines[0] if _first_lines else ""
-    new_needle = _first_probe[:min(40, len(_first_probe))] if len(_first_probe) >= 4 else re.sub(r"\s+", " ", plain_text or markdown_text).strip()[:40]
+    _clean_probe = re.sub(r"[`*#~\[\]()_]", "", _first_probe)
+    _clean_probe = re.sub(r"\s+", " ", _clean_probe).strip()
+    new_needle = _clean_probe[:min(40, len(_clean_probe))] if len(_clean_probe) >= 4 else re.sub(r"\s+", " ", plain_text or markdown_text).strip()[:40]
+
+    def _text_matched(candidate: str, block_texts: list[str]) -> bool:
+        if not candidate:
+            return False
+        if any(candidate in t for t in block_texts):
+            return True
+        cn = re.sub(r"[`*#~\[\]()_\s​‎‏﻿]+", "", candidate)
+        if len(cn) >= 4:
+            return any(cn in re.sub(r"[`*#~\[\]()_\s​‎‏﻿]+", "", t) for t in block_texts)
+        return False
 
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
@@ -2777,6 +2980,12 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
 
             diagnostics: list[dict] = []
             baseline_img_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
+            baseline_file_counts = {}
+            if files:
+                for f in files:
+                    fname = f["name"]
+                    if fname not in baseline_file_counts:
+                        baseline_file_counts[fname] = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, fname)
             block_id = await _locate_unique_block(page, anchor)
             snapshot = await page.evaluate(_BLOCK_STATE_BY_ID_JS, block_id)
             if not snapshot:
@@ -2816,6 +3025,30 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
                             "diagnostics": diagnostics,
                         }
                     detail = f"插入 {len(inserted_imgs)} 张图片"
+                elif files:
+                    inserted_files = []
+                    for f in files:
+                        diag: dict = {}
+                        if await _paste_file_at_cursor(page, f, diag):
+                            inserted_files.append(f["name"])
+                            await page.wait_for_timeout(500)
+                        else:
+                            diagnostics.append(diag)
+                            break
+                    if len(inserted_files) != len(files):
+                        for _ in range(4):
+                            await page.keyboard.press("Control+z")
+                            await page.wait_for_timeout(300)
+                        return {
+                            "status": "failed",
+                            "url": url,
+                            "op": op,
+                            "anchor": anchor,
+                            "detail": f"附件粘贴未全部被接收（{len(inserted_files)}/{len(files)}），已撤销本次编辑",
+                            "reload_verified": False,
+                            "diagnostics": diagnostics,
+                        }
+                    detail = f"插入 {len(inserted_files)} 个附件"
                 else:
                     await _paste_rich_at_cursor(page, markdown_text, html_body, plain_text)
                     await page.wait_for_timeout(800)
@@ -2868,6 +3101,45 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
                             hint="可换更小的图片重试；文档已恢复原样",
                         )
                     detail = f"在锚点前插入 {len(inserted_imgs)} 张图片"
+                elif files:
+                    prev_id = await page.evaluate(
+                        """(bid) => {
+                             const b = document.querySelector('[data-block-id="' + bid + '"]');
+                             let p = b && b.previousElementSibling;
+                             while (p && !p.getAttribute('data-block-id')) p = p.previousElementSibling;
+                             return p ? p.getAttribute('data-block-id') : '';
+                           }""",
+                        block_id,
+                    )
+                    placed = False
+                    if prev_id and await page.evaluate(_FOCUS_BLOCK_END_JS, prev_id) == "ok":
+                        placed = True
+                    else:
+                        if await page.evaluate(_FOCUS_BLOCK_START_JS, block_id) != "ok":
+                            raise FeishuError("无法在锚点区域建立文本光标（块类型不支持？）")
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(300)
+                        await page.keyboard.press("ArrowUp")
+                        await page.wait_for_timeout(200)
+                        placed = True
+                    inserted_files = []
+                    for f in files:
+                        diag: dict = {}
+                        if await _paste_file_at_cursor(page, f, diag):
+                            inserted_files.append(f["name"])
+                            await page.wait_for_timeout(500)
+                        else:
+                            diagnostics.append(diag)
+                            break
+                    if len(inserted_files) != len(files):
+                        for _ in range(4):
+                            await page.keyboard.press("Control+z")
+                            await page.wait_for_timeout(300)
+                        raise FeishuError(
+                            f"附件粘贴未全部被接收（{len(inserted_files)}/{len(files)}），已撤销本次编辑",
+                            hint="可换更小的文件重试；文档已恢复原样",
+                        )
+                    detail = f"在锚点前插入 {len(inserted_files)} 个附件"
                 else:
                     if await page.evaluate(_FOCUS_BLOCK_START_JS, block_id) != "ok":
                         raise FeishuError("无法在锚点块内建立文本光标（块类型不支持？）")
@@ -2881,8 +3153,8 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
                     detail = f"在锚点前插入文本 {len(markdown_text)} 字符"
 
             elif op == "replace":
-                if images:
-                    raise FeishuError("replace 暂不支持图片内容（先 delete-next 再 insert-after）")
+                if images or files:
+                    raise FeishuError("replace 暂不支持图片或附件内容（先 delete-next/delete 再 insert-after）")
                 if await page.evaluate(_SELECT_BLOCK_CONTENT_JS, block_id) != "ok":
                     raise FeishuError("无法在锚点块内建立选区（块类型不支持？）")
                 await _paste_rich_at_cursor(page, markdown_text, html_body, plain_text)
@@ -2921,9 +3193,11 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
             elif op in ("insert-after", "insert-before") and images:
                 count_now = await page.evaluate(_COUNT_ALL_IMAGES_JS)
                 ok = count_now >= baseline_img_count + len(images)
+            elif op in ("insert-after", "insert-before") and files:
+                ok = len(inserted_files) == len(files)
             else:  # insert-after / insert-before 文本 / replace
                 texts = await page.evaluate(_COLLECT_ALL_BLOCK_TEXTS_JS)
-                ok = any(new_needle in t for t in texts) if new_needle else False
+                ok = _text_matched(new_needle, texts)
             if not ok:
                 for _ in range(4):
                     await page.keyboard.press("Control+z")
@@ -2949,6 +3223,14 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
             if op in ("insert-after", "insert-before") and images:
                 after_count = await page.evaluate(_COUNT_ALL_IMAGES_JS)
                 reload_verified = after_count >= baseline_img_count + len(images)
+            elif op in ("insert-after", "insert-before") and files:
+                all_found = True
+                for f in files:
+                    cnt = await page.evaluate(_FILE_NAME_BLOCKS_COUNT_JS, f["name"])
+                    if cnt <= baseline_file_counts.get(f["name"], 0):
+                        all_found = False
+                        break
+                reload_verified = all_found
             else:
                 texts = await page.evaluate(_COLLECT_ALL_BLOCK_TEXTS_JS)
                 if op == "delete":
@@ -2956,7 +3238,7 @@ async def _block_edit_impl(ref: str, payload_file: str) -> dict:
                 elif op == "delete-next":
                     reload_verified = True  # 下一块无文本可比对，以操作后核验为准
                 else:
-                    reload_verified = any(new_needle in t for t in texts) if new_needle else False
+                    reload_verified = _text_matched(new_needle, texts)
             return {
                 "status": "edited" if reload_verified else "unverified",
                 "url": url,
