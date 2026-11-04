@@ -871,7 +871,7 @@ async def _run(args) -> int:
 
         if args.ref == "edit":
             if not args.file_path:
-                note("用法：feishu.py doc edit <文档链接或token> --find 锚点 --insert-after|--replace|--delete|--delete-next [--text 文本|--text-file 文件|--images 图片...]")
+                note("用法：feishu.py doc edit <文档链接或token> --find 锚点 --insert-after|--insert-before|--replace|--delete|--delete-next [--text 文本|--text-file 文件|--images 图片...|--attach 文件...]")
                 return 2
             ops = [name for name, flag in (("insert-after", args.insert_after), ("insert-before", args.insert_before),
                                            ("replace", args.edit_replace),
@@ -890,6 +890,7 @@ async def _run(args) -> int:
                     text=args.text,
                     text_file=args.text_file,
                     images=args.images,
+                    attach=args.attach,
                     confirm=args.confirm_write,
                     direct=args.direct,
                 )
@@ -936,7 +937,7 @@ async def _run(args) -> int:
 
         if args.ref == "insert-file":
             if not args.file_path:
-                note("用法：feishu.py doc insert-file <文档链接或token> --attach 本地文件 [--after-heading 文本]")
+                note("用法：feishu.py doc insert-file <文档链接或token> --attach 本地文件... [--after-heading 文本|--find 锚点 [--insert-before]]")
                 return 2
             if not args.attach:
                 note("insert-file 需要 --attach 指定本地文件")
@@ -946,6 +947,8 @@ async def _run(args) -> int:
                     ref=args.file_path,
                     file_path=args.attach,
                     after_heading=args.after_heading,
+                    find=args.find,
+                    insert_before=args.insert_before,
                     confirm=args.confirm_write,
                     direct=args.direct,
                 )
