@@ -461,25 +461,36 @@ async def _browser_send_file_impl(chat_id: str, file_path: str, text: str = "") 
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector("[data-feed-id]", timeout=30000)
 
+            # 读取会话名缓存用于精确定位
+            chat_name = ""
+            try:
+                if config.NAMES_CACHE.exists():
+                    with open(config.NAMES_CACHE, "r", encoding="utf-8") as nf:
+                        names_data = json.load(nf)
+                        chat_name = names_data.get("chats", {}).get(str(chat_id), "")
+            except Exception:
+                pass
+
             # 定位目标会话
             target_feed = page.locator(f'[data-feed-id="{chat_id}"]')
             if await target_feed.count() > 0:
                 await target_feed.first.click()
             else:
-                # 尝试用搜索框定位
+                # 尝试用搜索框定位真实群名/会话
+                search_query = chat_name if chat_name else chat_id
                 search_input = page.locator('input[placeholder*="搜索"]')
                 if await search_input.count() > 0:
                     await search_input.click()
-                    await search_input.fill(chat_id)
-                    await page.wait_for_timeout(1000)
+                    await search_input.fill(search_query)
+                    await page.wait_for_timeout(1500)
                     res = page.locator('[class*=search] [class*=item], [class*=result] [class*=item]')
                     if await res.count() > 0:
                         await res.first.click()
                     else:
                         await page.keyboard.press("Escape")
-                        await page.locator("[data-feed-id]").first.click()
+                        raise FeishuError(f"未在会话列表或搜索中找到目标会话：{chat_id} ({chat_name or '未知'})，拒绝盲发")
                 else:
-                    await page.locator("[data-feed-id]").first.click()
+                    raise FeishuError(f"未在会话列表中找到目标会话：{chat_id} ({chat_name or '未知'})，拒绝盲发")
 
             await page.wait_for_selector(".chatEditorContainer", timeout=20000)
             await page.wait_for_timeout(1000)
