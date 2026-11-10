@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentHands Console - Human Governance & Platform Manager</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <div class="brand-icon">AH</div>
+        <div class="brand-title">
+          <h1>AgentHands Console</h1>
+          <p>Personal Account Action Framework for AI Agents</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-refresh" class="btn">Refresh Status</button>
+        <button id="btn-freeze" class="btn btn-danger">Emergency Freeze</button>
+      </div>
+    </header>
+
+    <!-- Platform Cards Grid -->
+    <main>
+      <div class="section-title">Connected Platforms</div>
+      <div class="platforms-grid" id="platforms-container">
+        <!-- Rendered dynamically via JavaScript -->
+      </div>
+
+      <!-- Human Governance Section -->
+      <div class="section-title">Write Safety Gates & Human Governance</div>
+      <div class="governance-panel">
+        <table class="gates-table">
+          <thead>
+            <tr>
+              <th>Gate Identifier</th>
+              <th>Description</th>
+              <th>Authorization State</th>
+            </tr>
+          </thead>
+          <tbody id="gates-tbody">
+            <!-- Rendered dynamically via JavaScript -->
+          </tbody>
+        </table>
+      </div>
+    </main>
+  </div>
+
+  <!-- QR Code Login Modal -->
+  <div id="qr-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">QR Code Authentication</div>
+        <button class="modal-close" onclick="closeQrModal()">&times;</button>
+      </div>
+      <div class="qr-box">
+        <img id="qr-img" src="" alt="Scan QR Code">
+        <div id="qr-status-text" class="qr-status">Generating QR code...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manual Cookie Modal -->
+  <div id="manual-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div id="manual-modal-title" class="modal-title">Configure Cookies</div>
+        <button class="modal-close" onclick="closeManualModal()">&times;</button>
+      </div>
+      <input type="hidden" id="manual-platform">
+      <div class="form-group">
+        <label class="form-label" for="manual-cookies">Cookie Header String</label>
+        <textarea id="manual-cookies" class="form-textarea" rows="4" placeholder="key1=val1; key2=val2..."></textarea>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="manual-userid">User ID / MID (Optional)</label>
+        <input type="text" id="manual-userid" class="form-input" placeholder="e.g. 12345678">
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px;">
+        <button class="btn" onclick="closeManualModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitManualCookies()">Save & Verify</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
