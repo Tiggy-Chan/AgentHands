@@ -59,9 +59,9 @@ AgentHands/
 │   └── feishu/              # 飞书平台全功能接管实现
 │       ├── scripts/
 │       │   ├── _feishu/     # 核心业务实现（文档、消息、日历、加密事件池、守护）
-│       │   ├── vendor/      # lark_bridge 逆向协议底座（含 16 项工业级补丁）
+│       │   ├── vendor/      # lark_bridge 逆向协议底座（含 17 项工业级补丁）
 │       │   └── feishu.py    # 统一 CLI 与 Agent Skill 路由入口
-│       ├── tests/           # 172 项自动化离线单元测试
+│       ├── tests/           # 187 项自动化离线单元测试
 │       ├── references/      # 协议抓包分析与 Docx AST 规范
 │       └── SKILL.md         # Claude Code / Codex / Hermes 接入定义
 ├── test.sh                  # 顶层离线自动化测试套件
@@ -72,4 +72,5 @@ AgentHands/
 
 ## 📄 License
 
+This project is licensed under the [MIT License](LICENSE).  
 Copyright (c) 2026 Tiggy-Chan. All Rights Reserved.
