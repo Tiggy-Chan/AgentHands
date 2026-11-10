@@ -18,10 +18,20 @@ sys.path.insert(0, str(REPO_ROOT / "skills" / "bilibili" / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "skills" / "xianyu" / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "skills" / "xiaohongshu" / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "skills" / "feishu" / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "skills" / "qq" / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "skills" / "x" / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "skills" / "reddit" / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "skills" / "telegram" / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "skills" / "youtube" / "scripts"))
 
-from _bilibili import auth as bili_auth, user_ops as bili_user, config as bili_config
-from _xianyu import auth as xianyu_auth, user_ops as xianyu_user, config as xianyu_config
-from _xiaohongshu import auth as xhs_auth, creator_ops as xhs_creator, config as xhs_config
+from _bilibili import auth as bili_auth, user_ops as bili_user
+from _xianyu import auth as xianyu_auth
+from _xiaohongshu import auth as xhs_auth
+from _qq import auth as qq_auth
+from _x import auth as x_auth
+from _reddit import auth as reddit_auth
+from _telegram import auth as tg_auth
+from _youtube import auth as yt_auth
 
 # QR Login Session Cache
 _QR_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -33,11 +43,16 @@ _GATES_STATE: dict[str, bool] = {
     "BILIBILI_WRITE_ALLOWED": os.environ.get("BILIBILI_WRITE_ALLOWED") == "1",
     "XIANYU_WRITE_ALLOWED": os.environ.get("XIANYU_WRITE_ALLOWED") == "1",
     "XIAOHONGSHU_WRITE_ALLOWED": os.environ.get("XIAOHONGSHU_WRITE_ALLOWED") == "1",
+    "QQ_WRITE_ALLOWED": os.environ.get("QQ_WRITE_ALLOWED") == "1",
+    "X_WRITE_ALLOWED": os.environ.get("X_WRITE_ALLOWED") == "1",
+    "REDDIT_WRITE_ALLOWED": os.environ.get("REDDIT_WRITE_ALLOWED") == "1",
+    "TELEGRAM_WRITE_ALLOWED": os.environ.get("TELEGRAM_WRITE_ALLOWED") == "1",
+    "YOUTUBE_WRITE_ALLOWED": os.environ.get("YOUTUBE_WRITE_ALLOWED") == "1",
 }
 
 
 async def get_all_platforms_status() -> dict[str, Any]:
-    """Retrieve aggregate status for all four AgentHands platforms."""
+    """Retrieve aggregate status for all AgentHands platforms."""
     status = {}
 
     # 1. Feishu
@@ -144,6 +159,75 @@ async def get_all_platforms_status() -> dict[str, Any]:
             "details": {},
         }
 
+    # 5. QQ (OneBot 11)
+    try:
+        qq_c = qq_auth.load_credentials()
+        status["qq"] = {
+            "name": "QQ (OneBot 11)",
+            "key": "qq",
+            "authenticated": bool(qq_c.get("url")),
+            "status_text": f"Connected to {qq_c['url']}" if qq_c.get("url") else "Not Configured",
+            "details": {"url": qq_c.get("url")},
+        }
+    except Exception:
+        status["qq"] = {"name": "QQ (OneBot 11)", "key": "qq", "authenticated": False, "status_text": "Error"}
+
+    # 6. X (Twitter)
+    try:
+        xc = x_auth.load_credentials()
+        x_has_auth = bool(xc.get("auth_token") and xc.get("ct0"))
+        status["x"] = {
+            "name": "X (Twitter)",
+            "key": "x",
+            "authenticated": x_has_auth,
+            "status_text": "Session Ready" if x_has_auth else "Not Logged In",
+            "details": {"features": ["Post Tweets", "Replies", "Likes/Retweets", "Bookmarks"]},
+        }
+    except Exception:
+        status["x"] = {"name": "X (Twitter)", "key": "x", "authenticated": False, "status_text": "Error"}
+
+    # 7. Reddit
+    try:
+        rc = reddit_auth.load_credentials()
+        r_auth = bool(rc.get("session") or rc.get("token"))
+        status["reddit"] = {
+            "name": "Reddit",
+            "key": "reddit",
+            "authenticated": r_auth,
+            "status_text": "Authenticated" if r_auth else "Public Read Only",
+            "details": {"features": ["Subreddit Posts", "Comments", "Submissions", "Voting"]},
+        }
+    except Exception:
+        status["reddit"] = {"name": "Reddit", "key": "reddit", "authenticated": False, "status_text": "Error"}
+
+    # 8. Telegram
+    try:
+        tc = tg_auth.load_credentials()
+        tg_auth_ready = bool(tc.get("session_string") or tc.get("bot_token") or tc.get("bridge_url"))
+        status["telegram"] = {
+            "name": "Telegram",
+            "key": "telegram",
+            "authenticated": tg_auth_ready,
+            "status_text": "Ready" if tg_auth_ready else "Not Configured",
+            "details": {"features": ["Direct Messaging", "Channel Broadcasts", "History"]},
+        }
+    except Exception:
+        status["telegram"] = {"name": "Telegram", "key": "telegram", "authenticated": False, "status_text": "Error"}
+
+    # 9. YouTube
+    try:
+        yc = yt_auth.load_credentials()
+        yt_ready = bool(yc.get("cookies") or yc.get("sapisid"))
+        status["youtube"] = {
+            "name": "YouTube",
+            "key": "youtube",
+            "authenticated": yt_ready,
+            "status_text": "Session Active" if yt_ready else "Not Logged In",
+            "details": {"features": ["Metadata Updates", "Video Interactions", "Community Posts"]},
+        }
+    except Exception:
+        status["youtube"] = {"name": "YouTube", "key": "youtube", "authenticated": False, "status_text": "Error"}
+
     return status
 
 
@@ -157,7 +241,6 @@ async def start_qr_login(platform: str) -> dict[str, Any]:
         await login.generate_qrcode()
         pic = login.get_qrcode_picture()
 
-        # Convert picture to base64 data URI
         buf = io.BytesIO()
         pic.image.save(buf, format="PNG")
         b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -172,35 +255,7 @@ async def start_qr_login(platform: str) -> dict[str, Any]:
         }
         return {"session_id": session_id, "platform": platform, "qr_image": data_uri}
 
-    elif platform == "feishu":
-        # Placeholder for Feishu QR flow
-        _QR_SESSIONS[session_id] = {
-            "platform": "feishu",
-            "status": "waiting",
-            "start_time": time.time(),
-            "image": "",
-        }
-        return {"session_id": session_id, "platform": platform, "qr_image": ""}
-
-    elif platform == "xianyu":
-        _QR_SESSIONS[session_id] = {
-            "platform": "xianyu",
-            "status": "waiting",
-            "start_time": time.time(),
-            "image": "",
-        }
-        return {"session_id": session_id, "platform": platform, "qr_image": ""}
-
-    elif platform == "xiaohongshu":
-        _QR_SESSIONS[session_id] = {
-            "platform": "xiaohongshu",
-            "status": "waiting",
-            "start_time": time.time(),
-            "image": "",
-        }
-        return {"session_id": session_id, "platform": platform, "qr_image": ""}
-
-    raise ValueError(f"Unsupported platform: {platform}")
+    raise ValueError(f"QR Login not supported for platform: {platform}")
 
 
 async def poll_qr_status(session_id: str) -> dict[str, Any]:
@@ -244,7 +299,6 @@ async def poll_qr_status(session_id: str) -> dict[str, Any]:
 def save_manual_cookies(platform: str, cookies: str, user_id: str = "") -> dict[str, Any]:
     """Save manual cookie string for a target platform."""
     if platform == "bilibili":
-        # Parse sessdata and bili_jct
         items = dict(item.strip().split("=", 1) for item in cookies.split(";") if "=" in item)
         creds = {
             "sessdata": items.get("SESSDATA", ""),
@@ -261,6 +315,32 @@ def save_manual_cookies(platform: str, cookies: str, user_id: str = "") -> dict[
 
     elif platform == "xiaohongshu":
         xhs_auth.save_credentials(cookies)
+        return {"status": "ok", "platform": platform}
+
+    elif platform == "qq":
+        qq_auth.save_credentials(url=cookies, token=user_id)
+        return {"status": "ok", "platform": platform}
+
+    elif platform == "x":
+        ct0 = user_id
+        auth_token = cookies
+        if ";" in cookies:
+            items = dict(item.strip().split("=", 1) for item in cookies.split(";") if "=" in item)
+            auth_token = items.get("auth_token", cookies)
+            ct0 = items.get("ct0", user_id)
+        x_auth.save_credentials(auth_token, ct0)
+        return {"status": "ok", "platform": platform}
+
+    elif platform == "reddit":
+        reddit_auth.save_credentials({"session": cookies, "token": user_id})
+        return {"status": "ok", "platform": platform}
+
+    elif platform == "telegram":
+        tg_auth.save_credentials({"bot_token": cookies, "bridge_url": user_id})
+        return {"status": "ok", "platform": platform}
+
+    elif platform == "youtube":
+        yt_auth.save_credentials(cookies)
         return {"status": "ok", "platform": platform}
 
     raise ValueError(f"Unknown platform: {platform}")
