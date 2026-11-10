@@ -22,11 +22,12 @@ from .output import note
 from lark_bridge import drive
 
 _URL_RE = re.compile(
-    r"https?://[^/]+/(?P<kind>docx|docs|wiki|sheets|file|folder)/(?P<token>[A-Za-z0-9_-]+)"
+    r"https?://[^/]+/(?:(?:space|drive)/)?(?P<kind>docx|docs|doc|wiki|sheets|sheet|file|folder)/(?P<token>[A-Za-z0-9_-]+)"
 )
 _EXPORTABLE = {
     "docx": ("docx", ["markdown", "docx", "pdf"]),
     "doc": ("doc", ["docx", "pdf"]),
+    "docs": ("doc", ["docx", "pdf"]),
     "wiki": (None, []),  # resolved first
     # 2026-09-10 实测:内网导出端点对 sheet 只认 xlsx,csv 报
     # "export file extension mismatch"(vendor docstring 里的 csv 是错的)。
@@ -36,14 +37,18 @@ _EXPORTABLE = {
 
 
 def parse_doc_ref(ref: str) -> tuple[str, str]:
-    """URL or bare token → (kind, token). kind ∈ docx|doc|wiki|sheet."""
+    """URL or bare token → (kind, token). kind ∈ docx|doc|wiki|sheet|file|folder."""
     m = _URL_RE.search(ref.strip())
     if m:
         kind = m.group("kind")
-        return ({"sheets": "sheet"}.get(kind, kind), m.group("token"))
+        norm_kind = {
+            "sheets": "sheet",
+            "docs": "doc",
+        }.get(kind, kind)
+        return (norm_kind, m.group("token"))
     token = ref.strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", token):
-        raise FeishuError(f"认不出这个文档引用：{ref!r}", hint="支持 docx/wiki/sheets 链接或裸 token")
+        raise FeishuError(f"认不出这个文档引用：{ref!r}", hint="支持 docx/wiki/sheets/file/folder 链接或裸 token")
     # bare tokens: docx is the common case; export errors will say otherwise
     return "docx", token
 
@@ -209,6 +214,129 @@ async def walk(max_nodes: int = 5000) -> dict:
         "complete": not errors and len(nodes) < max_nodes,
         "incomplete": bool(errors) or len(nodes) >= max_nodes,
         "truncated": len(nodes) >= max_nodes,
+    }
+
+
+async def list_folder_children(folder_ref: str) -> dict:
+    """List direct children of a folder by URL or folder token.
+
+    Returns {"folder_token": str, "children": list[dict], "total": int}
+    """
+    cookie, cookies, domain = _creds()
+    kind, token = parse_doc_ref(folder_ref)
+    children = await drive.list_children(cookie, cookies, token, domain)
+    return {
+        "folder_token": token,
+        "children": children,
+        "total": len(children),
+    }
+
+
+async def download_drive_file(
+    file_ref: str,
+    out: str = "",
+    allow_overwrite: bool = False,
+) -> dict:
+    """Download a raw file from Feishu Drive by URL or file token.
+
+    Returns {"file_token": str, "file_name": str, "out_path": str, "size": int, "sha256": str}
+    """
+    cookie, cookies, domain = _creds()
+    kind, token = parse_doc_ref(file_ref)
+    meta = await drive.download_file_with_meta(cookie, cookies, token, domain)
+    if not meta or not meta.get("content"):
+        raise FeishuError(f"云盘文件下载失败：{file_ref}")
+
+    content = meta["content"]
+    file_name = meta.get("filename") or f"file_{token[:12]}"
+    if out:
+        if os.path.isdir(out):
+            target_path = os.path.join(out, file_name)
+        else:
+            target_path = out
+    else:
+        target_path = file_name
+
+    target_path = os.path.abspath(target_path)
+    if os.path.exists(target_path) and not allow_overwrite:
+        raise FeishuError(
+            f"目标文件已存在：{target_path}",
+            hint="指定不同的输出路径或文件名，避免意外覆盖已有文件",
+        )
+
+    parent_dir = os.path.dirname(target_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    with open(target_path, "wb") as f:
+        f.write(content)
+
+    sha256 = hashlib.sha256(content).hexdigest()
+    return {
+        "file_token": token,
+        "file_name": file_name,
+        "out_path": target_path,
+        "size": len(content),
+        "sha256": sha256,
+        "content_type": meta.get("content_type", "application/octet-stream"),
+    }
+
+
+async def download_folder(
+    folder_ref: str,
+    out_dir: str,
+    allow_overwrite: bool = False,
+) -> dict:
+    """Download all files from a Feishu Drive folder into out_dir.
+
+    Returns summary of downloaded files.
+    """
+    cookie, cookies, domain = _creds()
+    kind, token = parse_doc_ref(folder_ref)
+    children = await drive.list_children(cookie, cookies, token, domain)
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    downloaded = []
+    failed = []
+    skipped = []
+
+    for item in children:
+        item_name = item.get("name") or "unnamed"
+        item_token = item.get("obj_token") or item.get("token")
+        target_path = os.path.join(out_dir, item_name)
+
+        if os.path.exists(target_path) and not allow_overwrite:
+            skipped.append({"name": item_name, "token": item_token, "reason": "already_exists"})
+            continue
+
+        try:
+            meta = await drive.download_file_with_meta(cookie, cookies, item_token, domain)
+            if not meta or not meta.get("content"):
+                failed.append({"name": item_name, "token": item_token, "error": "download_failed"})
+                continue
+            with open(target_path, "wb") as f:
+                f.write(meta["content"])
+            downloaded.append({
+                "name": item_name,
+                "token": item_token,
+                "out_path": target_path,
+                "size": len(meta["content"]),
+                "sha256": hashlib.sha256(meta["content"]).hexdigest(),
+            })
+        except Exception as exc:
+            failed.append({"name": item_name, "token": item_token, "error": str(exc)})
+
+    return {
+        "folder_token": token,
+        "out_dir": out_dir,
+        "total_children": len(children),
+        "downloaded_count": len(downloaded),
+        "failed_count": len(failed),
+        "skipped_count": len(skipped),
+        "downloaded": downloaded,
+        "failed": failed,
+        "skipped": skipped,
     }
 
 

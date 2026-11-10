@@ -595,6 +595,17 @@ async def _download_file_browser_impl(msg_id: str, chat_id: str, file_name: str,
                     return []
 
             async def click_download_targets(active_page) -> str:
+                # Direct download button on file card (e.g. data-icon="DownloadOutlined")
+                direct_dl = card.locator('button:has([data-icon*="Download"]), [data-icon*="Download"], [data-icon*="download"]').first
+                if await direct_dl.count():
+                    try:
+                        if await direct_dl.is_visible():
+                            await direct_dl.click(timeout=2500)
+                            clicked_log.append('card-direct-download-icon')
+                            return 'card-direct-download-icon'
+                    except Exception:
+                        pass
+
                 # File cards carry ud__button--icon actions (options/download)
                 # at their right edge; the global navItem-download is the
                 # download-the-app button — never click that.

@@ -2,6 +2,8 @@
 
 import json
 import logging
+import re
+import urllib.parse
 import zlib
 
 from lark_bridge import _http
@@ -243,6 +245,29 @@ async def download_file(cookie: str, cookies: dict[str, str], file_token: str, d
 
     Returns file bytes on success, None on failure.
     """
+    res = await download_file_with_meta(cookie, cookies, file_token, domain)
+    return res["content"] if res else None
+
+
+def _parse_content_disposition_filename(header: str) -> str:
+    if not header:
+        return ""
+    m = re.search(r"filename\*=(?:UTF-8''|utf-8'')([^;]+)", header, re.IGNORECASE)
+    if m:
+        return urllib.parse.unquote(m.group(1).strip("\"' "))
+    m = re.search(r'filename="?([^";]+)"?', header, re.IGNORECASE)
+    if m:
+        return m.group(1).strip("\"' ")
+    return ""
+
+
+async def download_file_with_meta(
+    cookie: str, cookies: dict[str, str], file_token: str, domain: str = ""
+) -> dict | None:
+    """Download a file from Drive by its file_token, returning content and response metadata.
+
+    Returns {"content": bytes, "filename": str, "content_type": str, "size": int} or None.
+    """
     headers = {
         "Cookie": cookie,
         "user-agent": USER_AGENT,
@@ -260,7 +285,13 @@ async def download_file(cookie: str, cookies: dict[str, str], file_token: str, d
             if resp.status_code != 200:
                 logger.error(f"Download file failed: {resp.status_code}")
                 return None
-            return resp.content
+            filename = _parse_content_disposition_filename(resp.headers.get("content-disposition", ""))
+            return {
+                "content": resp.content,
+                "filename": filename,
+                "content_type": resp.headers.get("content-type", "application/octet-stream"),
+                "size": len(resp.content),
+            }
     except Exception as e:
         logger.error(f"Download file error: {e}")
         return None
@@ -509,14 +540,20 @@ def _parse_node_list(data: dict) -> list[dict]:
         if not node:
             continue
         type_code = node.get("type", -1)
+        node_url = node.get("url", "")
+        # Resolve human-readable type; if url points to /file/ or obj_biz_type is file, classify as file
+        if "/file/" in node_url or node.get("obj_biz_type") == 1:
+            item_type = "file"
+        else:
+            item_type = _TYPE_NAMES.get(type_code, f"type_{type_code}")
         items.append(
             {
                 "token": node.get("token", token),
                 "obj_token": node.get("obj_token", ""),
                 "name": node.get("name", ""),
-                "type": _TYPE_NAMES.get(type_code, f"type_{type_code}"),
+                "type": item_type,
                 "type_code": type_code,
-                "url": node.get("url", ""),
+                "url": node_url,
                 "edit_time": node.get("edit_time", 0),
             }
         )

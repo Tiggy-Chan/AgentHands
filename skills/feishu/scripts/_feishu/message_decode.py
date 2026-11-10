@@ -607,7 +607,87 @@ def _card_details(body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, 
     return details, resources, sorted(set(mentions))
 
 
+def _parse_post_image_descriptor(chunk: bytes) -> dict[str, Any] | None:
+    """Parse a structured image descriptor wire chunk:
+    f1: key (img_v3_...)
+    f2: region
+    f3: nested crypto {f1: algo, f2: {f1: 32B key, f2: 12B nonce}}
+    f4: repeated size variant {f1: slot, f2: {f1: width, f2: height}}
+    """
+    key = region = ""
+    crypto = {}
+    width = height = 0
+    for fn, wt, val in _wire_fields(chunk):
+        if fn == 1 and wt == 2:
+            key = _try_str(val)
+        elif fn == 2 and wt == 2:
+            region = _try_str(val)
+        elif fn == 3 and wt == 2:
+            for cfn, cwt, cval in _wire_fields(bytes(val)):
+                if cfn == 2 and cwt == 2:
+                    raw_key = raw_nonce = b""
+                    for kfn, kwt, kval in _wire_fields(bytes(cval)):
+                        if kfn == 1 and kwt == 2 and len(bytes(kval)) == 32:
+                            raw_key = bytes(kval)
+                        elif kfn == 2 and kwt == 2 and len(bytes(kval)) == 12:
+                            raw_nonce = bytes(kval)
+                    if raw_key and raw_nonce:
+                        crypto = {
+                            "algo": "aes-256-gcm",
+                            "key": raw_key.hex(),
+                            "nonce": raw_nonce.hex(),
+                        }
+        elif fn == 4 and wt == 2:
+            for vfn, vwt, vval in _wire_fields(bytes(val)):
+                if vfn == 2 and vwt == 2:
+                    for dfn, dwt, dval in _wire_fields(bytes(vval)):
+                        if dfn == 1 and dwt == 0 and not width:
+                            width = int(dval)
+                        elif dfn == 2 and dwt == 0 and not height:
+                            height = int(dval)
+    if key.startswith("img_v3_") and crypto:
+        res = _resource("image", key, source="content.post_image")
+        res["_crypto"] = crypto
+        if width and height:
+            res["width"] = width
+            res["height"] = height
+        return res
+    return None
+
+
+def _post_structured_images(content: bytes) -> list[dict[str, Any]]:
+    """Discover modern img_v3_ descriptors with AES-GCM crypto in post wire fields."""
+    results: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def walk(data: bytes, depth: int = 0) -> None:
+        if depth > 10 or not data:
+            return
+        for fn, wt, val in _wire_fields(data):
+            if wt == 2:
+                bval = bytes(val)
+                if b"img_v3_" in bval:
+                    desc = _parse_post_image_descriptor(bval)
+                    if desc:
+                        k = desc.get("_key") or ""
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            results.append(desc)
+                    else:
+                        walk(bval, depth + 1)
+
+    walk(content)
+    return results
+
+
 def _post_resources(content: bytes) -> list[dict[str, Any]]:
+    # Modern rich-text post messages encode images as structured descriptors
+    # with real img_v3_ keys and AES-256-GCM crypto. These MUST take priority
+    # over legacy HTML post.img URLs (such as dead p*.pstatp.com domains).
+    structured_images = _post_structured_images(content)
+    if structured_images:
+        return structured_images
+
     resources: list[dict[str, Any]] = []
     html = ""
     for field_number, wire_type, value in _wire_fields(content):

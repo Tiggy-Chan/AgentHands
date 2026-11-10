@@ -46,7 +46,8 @@ skills/feishu/scripts/feishu.py <子命令>     # 数据走 stdout，进度走 s
 | `media <msg_id> --action metadata\|download\|inspect\|ocr\|transcribe` | 按需下载或在本机处理消息资源；多资源时必须带 `--resource-id` |
 | `media-cache status\|purge --confirm-purge` | 查看或把加密媒体缓存移动到可恢复归档 |
 | `chats [--from-events]` | 列 Messenger 会话（网页 DOM provider；--from-events 是历史事件降级视图） |
-| `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档，wiki 自动解析 |
+| `doc <链接或token> [--export markdown\|docx\|pdf\|xlsx] [--out 文件]` | 读/导出文档（wiki 自动解析）；若输入为云盘文件（`/file/`）则直接下载二进制原文件；若输入为云盘文件夹（`/drive/folder/`）则展示子文件列表 |
+| `doc <文件夹链接或token> --out\|--download <本地目录> [--overwrite]` | **一键下载飞书云盘文件夹**中的全部文件到指定目录；支持已存在跳过与 `--overwrite` 强制覆盖 |
 | `doc import <本地文件> [--folder …] [--title …]` | 导入本地文件（md/docx/xlsx）为新的在线云文档；默认双重闸门，`--direct` 免确认直写 |
 | `doc replace <文档链接或token> <本地Markdown> [--direct]` | 保持原 token/链接，原地替换已有 docx 正文；md 先本地转 HTML 再走富文本剪贴板粘贴（表格/代码块/任务列表保真），粘贴后自动导出逐行校验（`verified` 字段）。语法对照见 `references/docx-format.md` |
 | `doc block-map <文档链接或token>` | 只读：滚动全文输出叶块顺序图（index/block-id/类型/文本预览，图片块标 `image`），给 `doc edit` 选锚点用 |
@@ -105,6 +106,18 @@ sheet 只能导出 xlsx（`--export xlsx --out xx.xlsx`）。
 
 远程搜索当前通过受控 Browser Worker 读取“云文档”结果卡片；可用的离线路径是：
 `feishu.py doc --walk` 建本地索引（标题/路径级）→ `feishu.py docs-search XX --local`。导出过的文档正文也在缓存里能被搜到。别把消息搜索当文档搜索用。
+
+### 「下载飞书云盘中的文件或整个文件夹」
+
+- **查看文件夹内容**：
+  `feishu.py doc <文件夹URL或token>`
+  输出文件夹内的文件列表、类型及对应 token。
+- **一键下载文件夹全部文件**：
+  `feishu.py doc <文件夹URL或token> --download <本地目录> [--overwrite]`
+  （也可以用 `--out <本地目录>` 代替 `--download`）。已存在的文件默认自动跳过，加 `--overwrite` 强制覆盖。
+- **下载单个云盘文件（如 .bin/.pdf/.zip 等）**：
+  `feishu.py doc <文件URL或token> [--out <文件路径或目录>] [--overwrite]`
+  自动从响应中提取真实文件名并落盘。
 
 ### 「Command Agent 飞书指令网关与端到端助手」
 

@@ -57,6 +57,9 @@
    `--no-proxy-server` 的姿势对齐）；附带避免未装 `socksio` 时
    `all_proxy=socks://…` 把 client 构造直接打崩。
 16. **`_http.make_client` 的 `trust_env` 可选参数**：默认保持 `False`；仅供无 Cookie 的公开媒体资源下载（如 legacy `post.img`）按需继承环境中的代理。
+17. **`drive.py` 增强下载元数据与云盘节点类型解析**：
+   - 新增 `download_file_with_meta`，从响应标头解析真实文件名（`Content-Disposition`，含 `filename*=` UTF-8 编码支持）、MIME 类型与尺寸；
+   - `_parse_node_list` 支持自动识别云盘中类型为二进制文件（`obj_biz_type=1` 或 URL 带 `/file/`）的项目，类型正确标注为 `file`，避免误标为 `mindnote`。
 
 ## 升级步骤
 

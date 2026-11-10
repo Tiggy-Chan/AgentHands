@@ -60,7 +60,7 @@ denylist 与同名 ≥3 用户规则自动清除。
 | 种类 | 路由 | 状态 |
 |---|---|---|
 | image/audio/video (img_v3_/audio_v3_/media_v3_ key) | `GET https://internal-api-lark-file.feishu.cn/static-resource/v1/<完整 key 含前缀>~` | **已验证**：200 + image/jpeg，下载后 AES-256-GCM 解密得到与声明尺寸一致的 JPEG |
-| legacy 富文本图片 (type=2 `post.img`) | `GET https://pN.pstatp.com/origin/<token>` | **已登记严格适配**：仅允许 `p`+数字分片，`/origin/` 无 query/fragment，强制 HTTPS；请求不带 Cookie。当前历史消息样本返回 404，资源有效期/存续未取得 200 样本 |
+| 富文本图片 (type=2 post.img / 现代 post 图片) | 优先提取 wire 内部结构化 `img_v3_` key + AES-256-GCM 密钥，走 `static-resource` 路由下载；若无结构化描述符，降级为 HTML 提取的 `pN.pstatp.com/origin/<token>` | **2026-11-10 实测验证**：当前富文本消息（type=2）在 field 6 携带完整的 `img_v3_` 描述符和加密材料，成功解密得到原始 JPEG 图片；淘汰了对已失效的 `p*.pstatp.com` 域名的依赖 |
 | sticker/头像 | 同路由，query 带 `format/image_size/sticker_format` | 已观察到，未登记（sticker 下载仍失败关闭） |
 | 消息文件 (file_v3_ key) | 静态路由全灭（static-resource 400/404，drive-stream 404）；真实下载 URL 由网页端一次性签发（疑似 service worker，页面钩子看不到） | **已落地 UI 路径**：`media-file-download` 用受限浏览器点文件卡片下载按钮捕获真实 download 事件（2026-09-10 验证，mime/size 对账一致） |
 | CDN 变体 | `s1-imfile.feishucdn.com/static-resource/v1/...` | 已观察到（免登录 CDN），未使用 |

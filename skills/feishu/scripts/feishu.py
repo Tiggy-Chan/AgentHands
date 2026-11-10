@@ -166,13 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-purge", action="store_true", help="确认把媒体缓存移动到可恢复归档")
 
     p = sub.add_parser("doc", help="读/导出文档，--list/--walk 云空间，或 import/replace 写文档")
-    p.add_argument("ref", nargs="?", help="docx/wiki/sheets 链接、裸 token 或 import/replace 操作")
+    p.add_argument("ref", nargs="?", help="docx/wiki/sheets/file/folder 链接、裸 token 或 import/replace 操作")
     p.add_argument("file_path", nargs="?", help="导入文件，或 replace 时的目标文档引用")
     p.add_argument("replacement_file", nargs="?", help="replace 时用于覆盖正文的本地 Markdown 文件")
     p.add_argument("--import-file", "--import", dest="import_file", default="", help="要导入的本地文件路径")
     p.add_argument("--export", dest="fmt", default="markdown",
                    choices=["markdown", "docx", "pdf", "xlsx"])
-    p.add_argument("--out", default="", help="二进制导出必须写文件；markdown 默认 stdout")
+    p.add_argument("--out", default="", help="下载目标文件路径（单文件）或输出目录（文件夹下载）；二进制导出必须写文件；markdown 默认 stdout")
+    p.add_argument("--download", dest="download_dir", default="", help="针对文件夹链接，一键将其中所有文件下载到指定本地目录")
+    p.add_argument("--overwrite", action="store_true", help="下载云盘文件时允许覆盖本地已有文件")
     p.add_argument("--strict", action="store_true", help="导出失败时直接报错，不降级为浏览器 DOM 文本")
     p.add_argument("--screenshot-dir", default="", help="抓取文档正文全部图片到指定目录（受限浏览器滚动渲染，原图优先）")
     p.add_argument("--list", action="store_true", help="列我的空间+共享空间根节点")
@@ -1049,6 +1051,70 @@ async def _run(args) -> int:
         if not args.ref:
             note("doc 需要一个文档链接/token，或 --list / --walk")
             return 2
+
+        kind, token = documents.parse_doc_ref(args.ref)
+
+        if kind == "folder":
+            dl_dir = getattr(args, "download_dir", "") or getattr(args, "out", "")
+            if dl_dir:
+                with query_lock.acquire("doc-folder-download"):
+                    res = await asyncio.wait_for(
+                        documents.download_folder(
+                            args.ref,
+                            out_dir=dl_dir,
+                            allow_overwrite=getattr(args, "overwrite", False),
+                        ),
+                        timeout=config.WALK_TIMEOUT_SECONDS,
+                    )
+                if fmt == "json":
+                    emit_json(res)
+                else:
+                    emit(
+                        f"✅ 文件夹下载完成：共 {res['total_children']} 个项目，成功下载 {res['downloaded_count']} 个"
+                        + (f"，跳过 {res['skipped_count']} 个" if res["skipped_count"] else "")
+                        + (f"，失败 {res['failed_count']} 个" if res["failed_count"] else "")
+                        + f" → {res['out_dir']}"
+                    )
+                    for item in res.get("downloaded", []):
+                        emit(f"  - {item['name']} ({item['size']} 字节)")
+                    for item in res.get("skipped", []):
+                        emit(f"  - [跳过已存在] {item['name']}")
+                    for item in res.get("failed", []):
+                        emit(f"  - ✗ [失败] {item['name']}: {item.get('error')}")
+                return 0 if not res["failed_count"] else 1
+            else:
+                with query_lock.acquire("doc-folder-list"):
+                    res = await asyncio.wait_for(
+                        documents.list_folder_children(args.ref),
+                        timeout=config.QUERY_TIMEOUT_SECONDS,
+                    )
+                if fmt == "json":
+                    emit_json(res)
+                else:
+                    from _feishu.output import safe_label
+                    emit(f"📁 文件夹内容（Token: `{res['folder_token']}`，共 {res['total']} 项）：")
+                    for c in res["children"]:
+                        emit(f"- [{c.get('type','?')}] {safe_label(c.get('name') or '?')} `{c.get('obj_token') or c.get('token')}` {c.get('url','')}")
+                    note("提示：添加 --out <目录> 或 --download <目录> 可一键将文件夹内所有文件下载至本地。")
+                return 0
+
+        if kind == "file":
+            with query_lock.acquire("doc-file-download"):
+                res = await asyncio.wait_for(
+                    documents.download_drive_file(
+                        args.ref,
+                        out=getattr(args, "out", ""),
+                        allow_overwrite=getattr(args, "overwrite", False),
+                    ),
+                    timeout=config.QUERY_TIMEOUT_SECONDS,
+                )
+            if fmt == "json":
+                emit_json(res)
+            else:
+                emit(f"✅ 文件下载成功：{res['file_name']}（{res['size']} 字节）→ {res['out_path']}")
+                emit(f"  SHA256: {res['sha256']}")
+            return 0
+
         with query_lock.acquire("doc-export"):
             data = await asyncio.wait_for(
                 documents.export_document(args.ref, args.fmt, fallback=not getattr(args, "strict", False)),

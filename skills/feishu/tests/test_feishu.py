@@ -964,6 +964,45 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(out["text"], "普通富文本")
         self.assertEqual(out["decode_status"], "ok")
 
+    def test_post_structured_image_descriptor_extraction(self):
+        from _feishu.message_decode import decode_message
+        from lark_bridge.search import _ev
+
+        # Build nested image descriptor chunk: f1=img_v3_..., f2=region, f3={f2={f1=key, f2=nonce}}, f4={f2={f1=w, f2=h}}
+        key = "img_v3_02179_test_descriptor_key_1234567890"
+        crypto_sub = (
+            b"\x0a\x20" + b"k" * 32
+            + b"\x12\x0c" + b"n" * 12
+        )
+        crypto_blk = b"\x08\x01\x12" + _ev(len(crypto_sub)) + crypto_sub
+        dim_sub = b"\x08" + _ev(500) + b"\x10" + _ev(350)  # 500 x 350
+        dim_blk = b"\x08\x01\x12" + _ev(len(dim_sub)) + dim_sub
+        img_desc = (
+            b"\x0a" + _ev(len(key)) + key.encode()
+            + b"\x12\x09eu_nc-cdn"
+            + b"\x1a" + _ev(len(crypto_blk)) + crypto_blk
+            + b"\x22" + _ev(len(dim_blk)) + dim_blk
+        )
+        nested_f6 = b"\x1a" + _ev(len(img_desc)) + img_desc
+        wrapper_f6 = b"\x32" + _ev(len(nested_f6)) + nested_f6
+
+        # Field 2 has legacy dead pstatp html; Field 6 has modern structured descriptor
+        legacy_html = b'<p>\xe6\x96\x87\xe5\xad\x97</p><figure><img src="http://p6.pstatp.com/origin/dead123"/></figure>'
+        content = (
+            b"\x12" + _ev(len(legacy_html)) + legacy_html
+            + b"\x32" + _ev(len(wrapper_f6)) + wrapper_f6
+        )
+        out = decode_message({"type": 2, "content": content})
+        self.assertEqual(len(out["resources"]), 1)
+        res = out["resources"][0]
+        self.assertEqual(res["_key"], key)
+        self.assertEqual(res["source"], "content.post_image")
+        self.assertEqual(res["_crypto"]["algo"], "aes-256-gcm")
+        self.assertEqual(res["_crypto"]["key"], (b"k" * 32).hex())
+        self.assertEqual(res["_crypto"]["nonce"], (b"n" * 12).hex())
+        self.assertEqual(res["width"], 500)
+        self.assertEqual(res["height"], 350)
+
     def test_nontext_type(self):
         from _feishu.message_decode import decode_message
         out = decode_message({"type": 5, "content": b"\x00\xff"})
@@ -2597,6 +2636,87 @@ class TestLinkifyUrlValidation(unittest.TestCase):
         urls = [f"https://sample-tenant.feishu.cn/docx/Tok{i:04d}" for i in range(documents.MAX_LINKIFY_URLS + 1)]
         with self.assertRaises(FeishuError):
             _asyncio.run(documents.linkify_document("Abc123", urls, direct=True))
+
+
+class TestDriveFolderAndFileOperations(unittest.TestCase):
+    def test_parse_doc_ref_folder_and_file_shapes(self):
+        from _feishu.documents import parse_doc_ref
+
+        cases = [
+            ("https://tenant.feishu.cn/drive/folder/fldcn123456", ("folder", "fldcn123456")),
+            ("https://tenant.feishu.cn/folder/fldcn123456", ("folder", "fldcn123456")),
+            ("https://tenant.feishu.cn/drive/folder/fldcn123456?from=from_copylink", ("folder", "fldcn123456")),
+            ("https://tenant.feishu.cn/file/boxcn123456", ("file", "boxcn123456")),
+            ("https://tenant.feishu.cn/drive/file/boxcn123456", ("file", "boxcn123456")),
+            ("https://tenant.feishu.cn/docx/doxcn123456", ("docx", "doxcn123456")),
+            ("https://tenant.feishu.cn/docs/doccn123456", ("doc", "doccn123456")),
+            ("https://tenant.feishu.cn/sheets/shtcn123456", ("sheet", "shtcn123456")),
+            ("fldcn123456", ("docx", "fldcn123456")),
+        ]
+        for url, expected in cases:
+            self.assertEqual(parse_doc_ref(url), expected, f"Failed on {url}")
+
+    def test_download_drive_file_saves_content_and_metadata(self):
+        import asyncio
+        import tempfile
+        from _feishu import documents
+
+        async def fake_download(cookie, cookies, file_token, domain=""):
+            return {
+                "content": b"fake-firmware-binary",
+                "filename": "firmware.bin",
+                "content_type": "application/octet-stream",
+                "size": 20,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = os.path.join(tmp, "sub", "custom.bin")
+            with patch.object(documents, "_creds", lambda: ("c", {}, "www.feishu.cn")), \
+                 patch.object(documents.drive, "download_file_with_meta", fake_download):
+                res = asyncio.run(documents.download_drive_file("boxcn12345", out=out_file))
+
+            self.assertEqual(res["file_token"], "boxcn12345")
+            self.assertEqual(res["size"], 20)
+            self.assertEqual(res["file_name"], "firmware.bin")
+            self.assertTrue(os.path.exists(out_file))
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), b"fake-firmware-binary")
+
+    def test_download_folder_batch_saves_all_files(self):
+        import asyncio
+        import tempfile
+        from _feishu import documents
+
+        async def fake_list_children(cookie, cookies, folder_token, domain=""):
+            return [
+                {"name": "fw1.bin", "obj_token": "obj1", "type": "file"},
+                {"name": "fw2.bin", "obj_token": "obj2", "type": "file"},
+            ]
+
+        async def fake_download(cookie, cookies, file_token, domain=""):
+            return {
+                "content": f"content-{file_token}".encode(),
+                "filename": f"{file_token}.bin",
+                "content_type": "application/octet-stream",
+                "size": len(f"content-{file_token}"),
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(documents, "_creds", lambda: ("c", {}, "www.feishu.cn")), \
+                 patch.object(documents.drive, "list_children", fake_list_children), \
+                 patch.object(documents.drive, "download_file_with_meta", fake_download):
+                res = asyncio.run(documents.download_folder("fldcn123", out_dir=tmp))
+
+            self.assertEqual(res["total_children"], 2)
+            self.assertEqual(res["downloaded_count"], 2)
+            self.assertEqual(res["failed_count"], 0)
+            self.assertEqual(res["skipped_count"], 0)
+            f1 = os.path.join(tmp, "fw1.bin")
+            f2 = os.path.join(tmp, "fw2.bin")
+            self.assertTrue(os.path.exists(f1))
+            self.assertTrue(os.path.exists(f2))
+            with open(f1, "rb") as f:
+                self.assertEqual(f.read(), b"content-obj1")
 
 
 if __name__ == "__main__":
