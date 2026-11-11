@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient: Subtle Slate Grey / Platinum Baseline -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+
+    <!-- Metallic Edge Stroke -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+
+    <!-- Articulated Joint Shading -->
+    <linearGradient id="jointGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+
+    <linearGradient id="fingerGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+
+    <!-- Drop Shadow Filter for Icon Surface -->
+    <filter id="subtleGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="16" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle Canvas (Apple Icon Baseline) -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="4" filter="url(#subtleGlow)"/>
+
+  <!-- Geometric Blueprint Circuit Lines (Background Substrate) -->
+  <g opacity="0.12" stroke="#94a3b8" stroke-width="2" fill="none">
+    <circle cx="256" cy="256" r="180" stroke-dasharray="6 8"/>
+    <circle cx="256" cy="256" r="130"/>
+    <line x1="76" y1="256" x2="436" y2="256" stroke-dasharray="4 6"/>
+    <line x1="256" y1="76" x2="256" y2="436" stroke-dasharray="4 6"/>
+  </g>
+
+  <!-- Precision Cybernetic Hand Articulation -->
+  <g filter="url(#subtleGlow)">
+    <!-- Palm Core Chassis -->
+    <path d="M190 280 L180 370 C180 395 200 415 225 415 L287 415 C312 415 332 395 332 370 L322 280 Z"
+          fill="#1e293b" stroke="#64748b" stroke-width="3.5" stroke-linejoin="round"/>
+
+    <!-- Wrist Anchor Connector -->
+    <path d="M216 415 L216 445 C216 450 220 454 225 454 L287 454 C292 454 296 450 296 445 L296 415 Z"
+          fill="#0f172a" stroke="#475569" stroke-width="3"/>
+
+    <!-- Thumb Phalanges -->
+    <path d="M185 320 L135 285 C122 276 122 258 135 249 C144 243 156 245 163 254 L190 292 Z"
+          fill="url(#fingerGrad)" stroke="#475569" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="135" cy="267" r="7" fill="url(#jointGrad)"/>
+
+    <!-- Index Finger -->
+    <path d="M196 270 L196 145 C196 130 216 130 216 145 L216 270 Z"
+          fill="url(#fingerGrad)" stroke="#475569" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="206" cy="195" r="5" fill="url(#jointGrad)"/>
+    <line x1="198" y1="225" x2="214" y2="225" stroke="#94a3b8" stroke-width="2"/>
+
+    <!-- Middle Finger (Leader Node) -->
+    <path d="M236 260 L236 105 C236 90 256 90 256 105 L256 260 Z"
+          fill="url(#fingerGrad)" stroke="#475569" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="246" cy="165" r="5" fill="url(#jointGrad)"/>
+    <line x1="238" y1="205" x2="254" y2="205" stroke="#94a3b8" stroke-width="2"/>
+
+    <!-- Ring Finger -->
+    <path d="M276 270 L276 135 C276 120 296 120 296 135 L296 270 Z"
+          fill="url(#fingerGrad)" stroke="#475569" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="286" cy="188" r="5" fill="url(#jointGrad)"/>
+    <line x1="278" y1="222" x2="294" y2="222" stroke="#94a3b8" stroke-width="2"/>
+
+    <!-- Little Finger -->
+    <path d="M316 285 L316 185 C316 172 334 172 334 185 L334 285 Z"
+          fill="url(#fingerGrad)" stroke="#475569" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="325" cy="225" r="4.5" fill="url(#jointGrad)"/>
+    <line x1="318" y1="248" x2="332" y2="248" stroke="#94a3b8" stroke-width="2"/>
+
+    <!-- Palm Neural Nexus / Monogram "AH" Embedded Geometry -->
+    <g transform="translate(256, 345)">
+      <!-- Hexagonal Core Anchor -->
+      <polygon points="0,-32 28,-16 28,16 0,32 -28,16 -28,-16"
+               fill="#0f172a" stroke="url(#accentGrad)" stroke-width="3"/>
+      <!-- Inner Pulse Center -->
+      <circle cx="0" cy="0" r="10" fill="url(#accentGrad)"/>
+
+      <!-- Integrated Kinetic Signal Lines -->
+      <line x1="0" y1="-32" x2="0" y2="-68" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="-28" y1="-16" x2="-54" y2="-45" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="28" y1="-16" x2="54" y2="-45" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>
